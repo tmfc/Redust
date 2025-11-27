@@ -24,7 +24,7 @@
 
 ---
 
-## 阶段 1：核心协议与基础命令集（进行中）
+## 阶段 1：核心协议与基础命令集（接近完成）
 
 目标：
 - 将 Redust 从“演示性质”推进到“可以被普通 Redis 客户端（如 redis-cli）稳定使用”的程度。
@@ -77,35 +77,35 @@
 
 ### 1.3 阶段 1 详细 TODO
 
-> 下列任务按推荐顺序排列，便于一步步演进；每一步完成都应保持 `cargo test` / `cargo run` 可用。
+> 下列任务按推荐顺序排列；当前大部分已落地，后续可根据需要继续细化或补充。
 
 1. **抽离库 crate 结构**
-   - [ ] 新建 `src/lib.rs`，将当前 `main.rs` 中“与 Tokio 启动无关”的逻辑移动到 `lib.rs`。
-   - [ ] 在 `lib.rs` 中定义对外暴露的入口，例如：`pub async fn run_server(addr: &str) -> Result<(), Error>`（具体签名可按现有实现调整）。
-   - [ ] 修改 `main.rs`：
-     - [ ] 仅保留 `#[tokio::main] async fn main()` 和配置解析。
-     - [ ] 调用 `redust::run_server(addr).await` 启动服务。
+   - [x] 新建 `src/lib.rs`，将 `main.rs` 中“与 Tokio 启动无关”的逻辑移动到 `lib.rs`。
+   - [x] 在 `lib.rs` 中定义对外暴露的入口（当前为 `run_server`）。
+   - [x] 修改 `main.rs`：
+     - [x] 仅保留 `#[tokio::main] async fn main()` 和配置解析。
+     - [x] 调用 `redust::run_server(addr, shutdown).await` 启动服务。
 
 2. **按职责拆分模块**
-   - [ ] 从 `lib.rs` 中抽取 RESP 相关代码到 `src/resp.rs`，并在 `lib.rs` 中 `pub mod resp;`。
-   - [ ] 从 `lib.rs` 中抽取命令解析/执行代码到 `src/command.rs`，并在 `lib.rs` 中 `pub mod command;`。
-   - [ ] 从 `lib.rs` 中抽取网络与连接处理逻辑到 `src/server.rs`，并在 `lib.rs` 中 `pub mod server;`，同时通过 `pub use server::run_server;` 对外统一导出。
+   - [x] 从 `lib.rs` 中抽取 RESP 相关代码到 `src/resp.rs`，并在 `lib.rs` 中 `pub mod resp;`。
+   - [x] 从 `lib.rs` 中抽取命令解析/执行代码到 `src/command.rs`，并在 `lib.rs` 中 `pub mod command;`。
+   - [x] 从 `lib.rs` 中抽取网络与连接处理逻辑到 `src/server.rs`，并在 `lib.rs` 中 `pub mod server;`，同时通过 `pub use server::run_server;` 对外统一导出。
+   - [x] 新增 `src/storage.rs`，提供线程安全内存存储引擎。
 
 3. **整理测试布局**
-   - [ ] 将 `main.rs` 中与协议/命令相关的测试迁移到对应模块的 `#[cfg(test)] mod tests` 中（例如 `resp.rs` / `command.rs`）。
-   - [ ] 保持测试覆盖当前支持的所有命令（至少 PING/ECHO/QUIT）。
-   - [ ] 视需要在 `tests/` 目录中新增 1–2 个集成测试，用 redis-cli 行为作为参考进行端到端验证。
+   - [x] 将协议/命令相关的测试迁移到对应模块的 `#[cfg(test)] mod tests` 中（例如 `resp.rs` / `command.rs`）。
+   - [x] 在 `tests/` 目录中新增集成测试 `tests/server_basic.rs`，用真实 TCP 连接进行端到端验证（包含性能基线）。
 
 4. **扩展基础命令集（字符串 + 键空间）**
-   - [ ] 设计并实现内存存储引擎 `storage` 模块（可以暂时只支持字符串类型）。
-   - [ ] 在 `command` 模块中增加并实现：`SET`、`GET`、`DEL`、`EXISTS` 基本行为，与 Redis 尽量保持兼容（包含返回值与错误）。
-   - [ ] 视情况增加 `INCR`/`DECR`，并处理非数字值的错误场景。
-   - [ ] 增加 `TYPE`、`KEYS`（并在 README/roadmap 中注明 `KEYS` 的性能注意事项）。
+   - [x] 设计并实现内存存储引擎 `storage` 模块（目前支持字符串类型）。
+   - [x] 在 `command` / `server` 模块中实现：`SET`、`GET`、`DEL`、`EXISTS` 基本行为，与 Redis 尽量保持兼容（包含返回值与错误）。
+   - [x] 增加 `INCR`/`DECR`，并在解析失败或溢出时返回 `-ERR value is not an integer or out of range`。
+   - [x] 增加 `TYPE`、`KEYS`（当前 `KEYS` 支持 `*` 与精确匹配，后续可逐步强化性能与匹配规则）。
 
 5. **文档与约定同步**
-   - [ ] 更新 `README.md`：
-     - [ ] 描述当前支持的命令列表与使用示例。
-     - [ ] 简要描述项目当前的模块划分（入口、协议、命令、存储）。
+   - [x] 更新 `README.md`：
+     - [x] 描述当前支持的命令列表与使用示例。
+     - [x] 简要描述项目当前的模块划分（入口、协议、命令、存储、集成测试位置）。
    - [ ] 更新 `AGENTS.md` 或新增开发文档：
      - [ ] 说明测试的推荐位置（模块内单元测试 + `tests/` 集成测试）。
      - [ ] 说明新增命令的基本流程（修改哪些模块、如何补测试）。
@@ -144,4 +144,4 @@
 
 ---
 
-> 本文件会随着实现推进持续更新。当前优先级集中在 **阶段 1：核心协议与基础命令集**，建议每次变更都在此文件中更新对应条目的完成状态与后续计划。
+> 本文件会随着实现推进持续更新。当前优先级仍主要集中在 **阶段 1：核心协议与基础命令集** 的收尾工作与稳定性提升，同时可开始为 **阶段 2：数据结构与持久化雏形** 预研细化计划。

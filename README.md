@@ -1,11 +1,14 @@
 # Redust
 
-Redust 是一个使用 Rust 编写的、兼容 Redis 协议的轻量级服务。项目目标是提供一个国产、自主可控的 Redis 替代，支持基础的 PING/ECHO/QUIT 指令。
+Redust 是一个使用 Rust 编写的、兼容 Redis 协议的轻量级服务。项目目标是提供一个国产、自主可控的 Redis 替代，目前已支持一组基础的 Redis 命令，并保持与 Redis 协议（RESP2）尽量一致的行为。
 
 ## 功能特点
 
-- **兼容 Redis 协议**：当前实现了 `PING`、`ECHO`、`QUIT` 三个常用命令。
-- **异步高并发**：基于 Tokio 运行时，处理多连接时每个连接都会在独立任务中执行。
+- **兼容 Redis 协议**：
+  - 当前支持命令：`PING`、`ECHO`、`QUIT`、`SET`、`GET`、`DEL`、`EXISTS`、`INCR`、`DECR`、`TYPE`、`KEYS`。
+  - 协议层基于 RESP2，实现了数组解析与 Bulk String 编解码。
+- **异步高并发**：基于 Tokio 运行时，每个 TCP 连接在独立任务中处理，支持多客户端并发访问同一存储。
+- **内存键值存储**：提供内置内存存储引擎（字符串类型），支持整数自增/自减以及简单的键空间查询。
 - **可配置监听地址**：通过 `REDUST_ADDR` 环境变量即可调整监听地址与端口。
 
 ## 快速开始
@@ -35,36 +38,54 @@ Redust 是一个使用 Rust 编写的、兼容 Redis 协议的轻量级服务。
 使用 `redis-cli` 或 `nc` 都可以进行测试：
 
 ```bash
-# PING
-printf "*1\r\n$4\r\nPING\r\n" | nc 127.0.0.1 6379
-# 返回
-# +PONG
+# 使用 redis-cli
+redis-cli -h 127.0.0.1 -p 6379 PING
+# => PONG
 
-# ECHO
-printf "*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n" | nc 127.0.0.1 6379
-# 返回
-# $5
-# hello
+redis-cli -h 127.0.0.1 -p 6379 ECHO hello
+# => "hello"
+
+redis-cli -h 127.0.0.1 -p 6379 SET foo bar
+redis-cli -h 127.0.0.1 -p 6379 GET foo
+# => "bar"
+
+redis-cli -h 127.0.0.1 -p 6379 INCR cnt
+redis-cli -h 127.0.0.1 -p 6379 TYPE cnt
+redis-cli -h 127.0.0.1 -p 6379 KEYS "*"
+
+# 或使用 nc 直接发送 RESP：
+printf "*1\r\n$4\r\nPING\r\n" | nc 127.0.0.1 6379
 ```
 
 ## 运行测试
 
-项目包含功能测试与简单的性能回归测试：
+项目包含协议/命令层单元测试，以及针对服务器行为的集成测试和简单性能回归测试：
 
 ```bash
 cargo test
 ```
 
-- 功能测试覆盖 `PING`、`ECHO`、`QUIT` 指令。
-- 性能测试会在本地循环发送多次 `PING` 来检测基础延迟，默认要求 200 次往返在 2 秒内完成。
+- 单元测试：
+  - `src/resp.rs`：RESP 协议解析与编码测试。
+  - `src/command.rs`：命令解析（包括未知命令处理）。
+- 集成测试：
+  - `tests/server_basic.rs`：使用真实 TCP 连接验证 PING/ECHO/QUIT/SET/GET/DEL/EXISTS/INCR/DECR/TYPE/KEYS 等命令行为，以及多客户端共享存储与基本性能（默认 200 次 PING 往返需在 2 秒内完成）。
 
 ## 目录结构
 
-- `src/main.rs`：服务主入口及协议处理逻辑。
+- `src/main.rs`：服务主入口，只负责读取配置并调用库的 `run_server`。
+- `src/lib.rs`：库 crate 入口，导出主要模块和 `run_server` API。
+- `src/resp.rs`：RESP 协议解析与编码实现。
+- `src/command.rs`：命令枚举与从 RESP 到命令的解析逻辑。
+- `src/server.rs`：TCP 监听、连接处理和命令执行调度。
+- `src/storage.rs`：简单的内存存储引擎（基于 `HashMap<String, String>`）。
+- `tests/server_basic.rs`：端到端集成测试。
 - `Cargo.toml`：依赖与构建配置。
 
 ## 后续规划
 
-- 支持更多 Redis 指令（如 SET/GET）。
-- 持久化及高可用能力。
-- 更完善的性能与压力测试工具。
+更详细的规划见 `roadmap.md`，当前重点集中在：
+
+- 完善键空间与字符串命令的行为和错误处理，使之更贴近 Redis。
+- 规划并实现列表、集合等常见数据结构，以及最小可用的持久化雏形。
+- 逐步补充性能与压力测试，以及基础可观测性支持。
