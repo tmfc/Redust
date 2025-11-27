@@ -160,6 +160,109 @@ async fn responds_to_basic_commands() {
 }
 
 #[tokio::test]
+async fn lists_basic_behaviour() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // LRANGE on missing key -> empty array
+    write_half
+        .write_all(b"*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$1\r\n0\r\n$2\r\n-1\r\n")
+        .await
+        .unwrap();
+    let mut header = String::new();
+    reader.read_line(&mut header).await.unwrap();
+    assert_eq!(header, "*0\r\n");
+
+    // RPUSH mylist a b c -> 3
+    write_half
+        .write_all(b"*5\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n")
+        .await
+        .unwrap();
+    let mut rpush_resp = String::new();
+    reader.read_line(&mut rpush_resp).await.unwrap();
+    assert_eq!(rpush_resp, ":3\r\n");
+
+    // LPUSH mylist x -> 4 (list: x a b c)
+    write_half
+        .write_all(b"*3\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$1\r\nx\r\n")
+        .await
+        .unwrap();
+    let mut lpush_resp = String::new();
+    reader.read_line(&mut lpush_resp).await.unwrap();
+    assert_eq!(lpush_resp, ":4\r\n");
+
+    // LRANGE mylist 0 -1 -> [x, a, b, c]
+    write_half
+        .write_all(b"*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$1\r\n0\r\n$2\r\n-1\r\n")
+        .await
+        .unwrap();
+    let mut arr_header = String::new();
+    reader.read_line(&mut arr_header).await.unwrap();
+    assert_eq!(arr_header, "*4\r\n");
+
+    let mut bulk_header = String::new();
+    let mut value = String::new();
+
+    // x
+    reader.read_line(&mut bulk_header).await.unwrap();
+    assert_eq!(bulk_header, "$1\r\n");
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(value, "x\r\n");
+    bulk_header.clear();
+    value.clear();
+
+    // a
+    reader.read_line(&mut bulk_header).await.unwrap();
+    assert_eq!(bulk_header, "$1\r\n");
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(value, "a\r\n");
+    bulk_header.clear();
+    value.clear();
+
+    // b
+    reader.read_line(&mut bulk_header).await.unwrap();
+    assert_eq!(bulk_header, "$1\r\n");
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(value, "b\r\n");
+    bulk_header.clear();
+    value.clear();
+
+    // c
+    reader.read_line(&mut bulk_header).await.unwrap();
+    assert_eq!(bulk_header, "$1\r\n");
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(value, "c\r\n");
+
+    // LRANGE mylist 1 2 -> [a, b]
+    write_half
+        .write_all(b"*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$1\r\n1\r\n$1\r\n2\r\n")
+        .await
+        .unwrap();
+    let mut sub_header = String::new();
+    reader.read_line(&mut sub_header).await.unwrap();
+    assert_eq!(sub_header, "*2\r\n");
+
+    bulk_header.clear();
+    value.clear();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    assert_eq!(bulk_header, "$1\r\n");
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(value, "a\r\n");
+
+    bulk_header.clear();
+    value.clear();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    assert_eq!(bulk_header, "$1\r\n");
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(value, "b\r\n");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn multiple_clients_share_storage() {
     let (addr, shutdown, handle) = spawn_server().await;
 

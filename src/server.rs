@@ -71,6 +71,24 @@ async fn handle_connection(stream: TcpStream, storage: Storage) -> io::Result<()
                 let response = format!(":{}\r\n", count);
                 write_half.write_all(response.as_bytes()).await?;
             }
+            Command::Lpush { key, values } => {
+                let len = storage.lpush(&key, &values);
+                let response = format!(":{}\r\n", len);
+                write_half.write_all(response.as_bytes()).await?;
+            }
+            Command::Rpush { key, values } => {
+                let len = storage.rpush(&key, &values);
+                let response = format!(":{}\r\n", len);
+                write_half.write_all(response.as_bytes()).await?;
+            }
+            Command::Lrange { key, start, stop } => {
+                let items = storage.lrange(&key, start, stop);
+                let mut response = format!("*{}\r\n", items.len());
+                for item in items {
+                    response.push_str(&format!("${}\r\n{}\r\n", item.len(), item));
+                }
+                write_half.write_all(response.as_bytes()).await?;
+            }
             Command::Type { key } => {
                 let t = storage.type_of(&key);
                 let response = format!("+{}\r\n", t);

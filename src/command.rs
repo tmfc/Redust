@@ -15,6 +15,9 @@ pub enum Command {
     Decr { key: String },
     Type { key: String },
     Keys { pattern: String },
+    Lpush { key: String, values: Vec<String> },
+    Rpush { key: String, values: Vec<String> },
+    Lrange { key: String, start: isize, stop: isize },
     Unknown(Vec<String>),
 }
 
@@ -90,6 +93,46 @@ pub async fn read_command(
             };
             Command::Keys { pattern }
         }
+        "LPUSH" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Unknown(std::iter::once(command).chain(iter).collect())));
+            };
+            let values: Vec<String> = iter.collect();
+            if values.is_empty() {
+                Command::Unknown(vec![command, key])
+            } else {
+                Command::Lpush { key, values }
+            }
+        }
+        "RPUSH" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Unknown(std::iter::once(command).chain(iter).collect())));
+            };
+            let values: Vec<String> = iter.collect();
+            if values.is_empty() {
+                Command::Unknown(vec![command, key])
+            } else {
+                Command::Rpush { key, values }
+            }
+        }
+        "LRANGE" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Unknown(std::iter::once(command).chain(iter).collect())));
+            };
+            let Some(start_s) = iter.next() else {
+                return Ok(Some(Command::Unknown(std::iter::once(command).chain(std::iter::once(key)).chain(iter).collect())));
+            };
+            let Some(stop_s) = iter.next() else {
+                return Ok(Some(Command::Unknown(std::iter::once(command).chain(std::iter::once(key)).chain(std::iter::once(start_s)).chain(iter).collect())));
+            };
+            let Ok(start) = start_s.parse::<isize>() else {
+                return Ok(Some(Command::Unknown(std::iter::once(command).chain(std::iter::once(key)).chain(std::iter::once(start_s)).chain(std::iter::once(stop_s)).chain(iter).collect())));
+            };
+            let Ok(stop) = stop_s.parse::<isize>() else {
+                return Ok(Some(Command::Unknown(std::iter::once(command).chain(std::iter::once(key)).chain(std::iter::once(start_s)).chain(std::iter::once(stop_s)).chain(iter).collect())));
+            };
+            Command::Lrange { key, start, stop }
+        }
         _ => Command::Unknown(std::iter::once(command).chain(iter).collect()),
     };
 
@@ -161,6 +204,74 @@ mod tests {
             }
         } else {
             panic!("expected Unknown command");
+        }
+
+        client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn parses_list_commands() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            // LPUSH mylist a b
+            stream
+                .write_all(b"*4\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$1\r\na\r\n$1\r\nb\r\n")
+                .await
+                .unwrap();
+            // RPUSH mylist c
+            stream
+                .write_all(b"*3\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$1\r\nc\r\n")
+                .await
+                .unwrap();
+            // LRANGE mylist 0 -1
+            stream
+                .write_all(b"*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$1\r\n0\r\n$2\r\n-1\r\n")
+                .await
+                .unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read_half, _) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        if let Some(cmd) = read_command(&mut reader).await.unwrap() {
+            match cmd {
+                Command::Lpush { key, values } => {
+                    assert_eq!(key, "mylist");
+                    assert_eq!(values, vec!["a".to_string(), "b".to_string()]);
+                }
+                _ => panic!("expected LPUSH"),
+            }
+        } else {
+            panic!("expected LPUSH command");
+        }
+
+        if let Some(cmd) = read_command(&mut reader).await.unwrap() {
+            match cmd {
+                Command::Rpush { key, values } => {
+                    assert_eq!(key, "mylist");
+                    assert_eq!(values, vec!["c".to_string()]);
+                }
+                _ => panic!("expected RPUSH"),
+            }
+        } else {
+            panic!("expected RPUSH command");
+        }
+
+        if let Some(cmd) = read_command(&mut reader).await.unwrap() {
+            match cmd {
+                Command::Lrange { key, start, stop } => {
+                    assert_eq!(key, "mylist");
+                    assert_eq!(start, 0);
+                    assert_eq!(stop, -1);
+                }
+                _ => panic!("expected LRANGE"),
+            }
+        } else {
+            panic!("expected LRANGE command");
         }
 
         client.await.unwrap();
