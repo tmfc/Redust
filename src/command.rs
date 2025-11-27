@@ -18,6 +18,8 @@ pub enum Command {
     Lpush { key: String, values: Vec<String> },
     Rpush { key: String, values: Vec<String> },
     Lrange { key: String, start: isize, stop: isize },
+    Lpop { key: String },
+    Rpop { key: String },
     Sadd { key: String, members: Vec<String> },
     Srem { key: String, members: Vec<String> },
     Smembers { key: String },
@@ -119,6 +121,18 @@ pub async fn read_command(
             } else {
                 Command::Rpush { key, values }
             }
+        }
+        "LPOP" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Unknown(std::iter::once(command).chain(iter).collect())));
+            };
+            Command::Lpop { key }
+        }
+        "RPOP" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Unknown(std::iter::once(command).chain(iter).collect())));
+            };
+            Command::Rpop { key }
         }
         "LRANGE" => {
             let Some(key) = iter.next() else {

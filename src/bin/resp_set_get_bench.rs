@@ -195,6 +195,16 @@ impl RespClient {
         }
         items
     }
+
+    async fn lpop(&mut self, key: &str) -> Option<String> {
+        self.send_array(&["LPOP", key]).await;
+        self.read_bulk().await
+    }
+
+    async fn rpop(&mut self, key: &str) -> Option<String> {
+        self.send_array(&["RPOP", key]).await;
+        self.read_bulk().await
+    }
 }
 
 async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
@@ -333,6 +343,50 @@ async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
             println!("[bench] total ops: {}", total_ops as u64);
             println!("[bench] ops/sec: {:.2}", qps);
         }
+        "list_pops" => {
+            // 功能校验：LPOP/RPOP 行为
+            let key = "bench_list_pop";
+            client.del(&[key]).await;
+            let len = client.rpush(key, &["a", "b", "c"]).await;
+            if len != 3 {
+                panic!("unexpected RPUSH length in list_pops: {}", len);
+            }
+            let v1 = client.lpop(key).await;
+            let v2 = client.rpop(key).await;
+            let v3 = client.rpop(key).await;
+            let v4 = client.rpop(key).await;
+            if v1.as_deref() != Some("a")
+                || v2.as_deref() != Some("c")
+                || v3.as_deref() != Some("b")
+                || v4.is_some()
+            {
+                panic!(
+                    "unexpected LPOP/RPOP sequence: v1={:?}, v2={:?}, v3={:?}, v4={:?}",
+                    v1, v2, v3, v4
+                );
+            }
+
+            // LPOP/RPOP 回环性能测试：在一个有限长度的列表上进行弹入+弹出组合
+            let key = "bench_list_pop_loop";
+            client.del(&[key]).await;
+            client.rpush(key, &["x"]).await; // 保证列表非空
+
+            let start = std::time::Instant::now();
+            for i in 0..iterations {
+                let v = format!("v{}", i);
+                let _ = client.lpush(key, &[&v]).await;
+                let _ = client.rpop(key).await;
+            }
+            let elapsed = start.elapsed();
+
+            let total_ops = (iterations * 2) as f64; // 每轮 LPUSH + RPOP
+            let secs = elapsed.as_secs_f64();
+            let qps = if secs > 0.0 { total_ops / secs } else { 0.0 };
+
+            println!("[bench] total time: {:?}", elapsed);
+            println!("[bench] total ops: {}", total_ops as u64);
+            println!("[bench] ops/sec: {:.2}", qps);
+        }
         other => {
             panic!("unknown bench group: {}", other);
         }
@@ -383,7 +437,7 @@ async fn main() {
     }
 
     if group == "all" {
-        for g in ["set_get", "incr_decr", "exists_del", "list_ops"] {
+        for g in ["set_get", "incr_decr", "exists_del", "list_ops", "list_pops"] {
             println!("[bench] ==== group: {} ====", g);
             run_group(&mut client, g, iterations).await;
         }

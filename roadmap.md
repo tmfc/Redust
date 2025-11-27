@@ -24,11 +24,20 @@
 
 ---
 
-## 阶段 1：核心协议与基础命令集（接近完成）
+## 阶段 1：核心协议与基础命令集（已完成，持续打磨中）
 
 目标：
 - 将 Redust 从“演示性质”推进到“可以被普通 Redis 客户端（如 redis-cli）稳定使用”的程度。
 - 代码结构从单文件演进为清晰的多模块架构，便于扩展新命令。
+  
+当前状态：
+- 已有较完整的 RESP2 解析与编码工具，支持基础错误处理。
+- 代码已拆分为 `lib.rs` + `resp.rs` + `command.rs` + `server.rs` + `storage.rs` 等模块。
+- 命令层覆盖：
+  - 连接与元信息：`PING`、`ECHO`、`QUIT`。
+  - 字符串与键空间：`SET`、`GET`、`DEL`、`EXISTS`、`INCR`/`DECR`、`TYPE`、`KEYS`。
+- 集成测试：`tests/server_basic.rs`、`tests/standard_set_get.rs` 覆盖常见命令与性能基线。
+- Benchmark：`src/bin/resp_set_get_bench.rs` 提供以 RESP 客户端驱动的简单 QPS 测试（包含 SET/GET、INCR/DECR、EXISTS/DEL、列表操作分组）。
 
 ### 1.1 协议与架构目标
 
@@ -75,9 +84,9 @@
   - 简单的内存存储引擎（比如基于 `HashMap<String, Value>`）。
   - 提供线程安全访问接口（如基于 `Arc<RwLock<...>>`）。
 
-### 1.3 阶段 1 详细 TODO
+### 1.3 阶段 1 详细 TODO（已基本完成）
 
-> 下列任务按推荐顺序排列；当前大部分已落地，后续可根据需要继续细化或补充。
+> 下列任务按推荐顺序排列；当前绝大部分已落地，后续只需在行为兼容性和性能上持续微调即可。
 
 1. **抽离库 crate 结构**
    - [x] 新建 `src/lib.rs`，将 `main.rs` 中“与 Tokio 启动无关”的逻辑移动到 `lib.rs`。
@@ -109,23 +118,48 @@
    - [ ] 更新 `AGENTS.md` 或新增开发文档：
      - [ ] 说明测试的推荐位置（模块内单元测试 + `tests/` 集成测试）。
      - [ ] 说明新增命令的基本流程（修改哪些模块、如何补测试）。
+   - [ ] 补充与 Benchmark 相关的开发建议（如何运行 `resp_set_get_bench`、各 group 的含义等）。
 
 ---
 
-## 阶段 2：数据结构与持久化雏形（规划中）
+## 阶段 2：数据结构与持久化雏形（进行中）
 
 目标：在基础命令集之上，逐步支持 Redis 常见数据结构和最简单形式的持久化。
 
-- **数据结构**：
-  - 列表：`LPUSH`/`RPUSH`/`LPOP`/`RPOP`/`LRANGE`（可从子集开始）。
-  - 集合：`SADD`/`SREM`/`SMEMBERS` 等。
-  - 有序集合、哈希等可以后置。
+当前状态：
+- 已实现的数据结构子集：
+  - **列表（List）**：
+    - 存储层：`storage.rs` 中维护 `lists: HashMap<String, VecDeque<String>>`，并提供 `lpush` / `rpush` / `lrange` 等操作。
+    - 命令层：`LPUSH`、`RPUSH`、`LRANGE` 已在 `command.rs` 和 `server.rs` 中打通。
+    - 行为验证：
+      - `tests/server_basic.rs::lists_basic_behaviour` 覆盖基础列表操作语义（含下标和负索引）。
+      - `resp_set_get_bench.rs` 中的 `list_ops` group 对列表操作做简单性能/功能回归。
+  - **集合（Set）**：
+    - 存储层：`storage.rs` 中维护 `sets: HashMap<String, HashSet<String>>`，并提供 `sadd` / `srem` / `smembers` / `scard` / `sismember` 等操作。
+    - 命令层：`SADD`、`SREM`、`SMEMBERS`、`SCARD`、`SISMEMBER` 已在 `command.rs` 和 `server.rs` 中实现。
+    - 行为验证：`tests/server_basic.rs::sets_basic_behaviour` 覆盖集合的基础语义与去重行为。
+- 尚未实现：
+  - 列表的弹出类操作（如 `LPOP` / `RPOP`）。
+  - 哈希、有序集合等更复杂数据结构。
+  - 任何形式的持久化（当前仍为纯内存）。
 
-- **持久化雏形**：
-  - 简单 RDB 类似快照或 append-only log 的最小实现版本（可先做内存快照到文件的简化版本）。
-  - 文档中明确说明一致性/持久化语义与 Redis 可能存在的差异。
+阶段 2 计划拆分（草案）：
+- **2.1 列表能力补全**
+  - [ ] 为 `Storage` 增加 `lpop` / `rpop` 等接口，并在 `command` / `server` 中接线。
+  - [ ] 补充列表边界条件测试（空列表弹出、多客户端并发等）。
 
-（本阶段 TODO 将在阶段 1 完成一定比例后细化补充。）
+- **2.2 集合能力增强（可选）**
+  - [ ] 视需要增加 `SUNION` / `SINTER` 等读操作（可只做子集）。
+  - [ ] 为集合操作补充更多交叉测试用例。
+
+- **2.3 其他数据结构预研**
+  - [ ] 设计哈希（`HSET`/`HGET` 等）在现有 `Storage` 里的表示方式。
+  - [ ] 预估有序集合（Sorted Set）的最小实现成本，暂不急于落地。
+
+- **2.4 持久化雏形**
+  - [ ] 选定最小可行的持久化方式（例如：周期性内存快照到本地文件）。
+  - [ ] 实现一个简化版的“保存/加载”接口，用于开发环境下的状态保留（不追求 Redis 完整语义）。
+  - [ ] 在 README 中明确记录持久化语义与 Redis 的差异和限制。
 
 ---
 
@@ -144,4 +178,4 @@
 
 ---
 
-> 本文件会随着实现推进持续更新。当前优先级仍主要集中在 **阶段 1：核心协议与基础命令集** 的收尾工作与稳定性提升，同时可开始为 **阶段 2：数据结构与持久化雏形** 预研细化计划。
+> 本文件会随着实现推进持续更新。当前优先级已经逐步转向 **阶段 2：数据结构与持久化雏形**，在保持阶段 1 命令稳定性的前提下，优先补齐列表/集合等基础数据结构，再循序渐进探索最小持久化方案。

@@ -89,6 +89,20 @@ async fn handle_connection(stream: TcpStream, storage: Storage) -> io::Result<()
                 }
                 write_half.write_all(response.as_bytes()).await?;
             }
+            Command::Lpop { key } => {
+                if let Some(value) = storage.lpop(&key) {
+                    respond_bulk_string(&mut write_half, &value).await?;
+                } else {
+                    write_half.write_all(b"$-1\r\n").await?;
+                }
+            }
+            Command::Rpop { key } => {
+                if let Some(value) = storage.rpop(&key) {
+                    respond_bulk_string(&mut write_half, &value).await?;
+                } else {
+                    write_half.write_all(b"$-1\r\n").await?;
+                }
+            }
             Command::Sadd { key, members } => {
                 let added = storage.sadd(&key, &members);
                 let response = format!(":{}\r\n", added);

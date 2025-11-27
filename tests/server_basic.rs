@@ -160,6 +160,80 @@ async fn responds_to_basic_commands() {
 }
 
 #[tokio::test]
+async fn lists_pop_behaviour() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // LPOP on missing key -> nil
+    write_half
+        .write_all(b"*2\r\n$4\r\nLPOP\r\n$6\r\nmylist\r\n")
+        .await
+        .unwrap();
+    let mut header = String::new();
+    reader.read_line(&mut header).await.unwrap();
+    assert_eq!(header, "$-1\r\n");
+
+    // RPUSH mylist a b c -> 3
+    write_half
+        .write_all(b"*5\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n")
+        .await
+        .unwrap();
+    let mut rpush_resp = String::new();
+    reader.read_line(&mut rpush_resp).await.unwrap();
+    assert_eq!(rpush_resp, ":3\r\n");
+
+    // LPOP -> a
+    write_half
+        .write_all(b"*2\r\n$4\r\nLPOP\r\n$6\r\nmylist\r\n")
+        .await
+        .unwrap();
+    let mut bulk_header = String::new();
+    let mut value = String::new();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(bulk_header, "$1\r\n");
+    assert_eq!(value, "a\r\n");
+
+    // RPOP -> c （现在列表只剩 b, c）
+    write_half
+        .write_all(b"*2\r\n$4\r\nRPOP\r\n$6\r\nmylist\r\n")
+        .await
+        .unwrap();
+    bulk_header.clear();
+    value.clear();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(bulk_header, "$1\r\n");
+    assert_eq!(value, "c\r\n");
+
+    // RPOP -> b （最后一个元素）
+    write_half
+        .write_all(b"*2\r\n$4\r\nRPOP\r\n$6\r\nmylist\r\n")
+        .await
+        .unwrap();
+    bulk_header.clear();
+    value.clear();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(bulk_header, "$1\r\n");
+    assert_eq!(value, "b\r\n");
+
+    // RPOP on empty list -> nil
+    write_half
+        .write_all(b"*2\r\n$4\r\nRPOP\r\n$6\r\nmylist\r\n")
+        .await
+        .unwrap();
+    header.clear();
+    reader.read_line(&mut header).await.unwrap();
+    assert_eq!(header, "$-1\r\n");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn sets_basic_behaviour() {
     let (addr, shutdown, handle) = spawn_server().await;
     let stream = TcpStream::connect(addr).await.unwrap();

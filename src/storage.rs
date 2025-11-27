@@ -210,6 +210,26 @@ impl Storage {
             .collect()
     }
 
+    pub fn lpop(&self, key: &str) -> Option<String> {
+        let mut guard = match self.inner.write() {
+            Ok(g) => g,
+            Err(_) => return None,
+        };
+
+        let list = guard.lists.get_mut(key)?;
+        list.pop_front()
+    }
+
+    pub fn rpop(&self, key: &str) -> Option<String> {
+        let mut guard = match self.inner.write() {
+            Ok(g) => g,
+            Err(_) => return None,
+        };
+
+        let list = guard.lists.get_mut(key)?;
+        list.pop_back()
+    }
+
     pub fn sadd(&self, key: &str, members: &[String]) -> usize {
         let mut guard = match self.inner.write() {
             Ok(g) => g,
