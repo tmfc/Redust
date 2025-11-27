@@ -1,5 +1,4 @@
 use std::env;
-use std::time::Instant;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -84,6 +83,260 @@ impl RespClient {
         self.send_array(&["GET", key]).await;
         self.read_bulk().await
     }
+
+    async fn incr(&mut self, key: &str) -> i64 {
+        self.send_array(&["INCR", key]).await;
+        let line = self.read_simple_line().await;
+        if !line.starts_with(':') || !line.ends_with("\r\n") {
+            panic!("unexpected INCR response: {:?}", line);
+        }
+        let num_str = &line[1..line.len() - 2];
+        num_str
+            .parse::<i64>()
+            .unwrap_or_else(|e| panic!("invalid INCR integer {:?}: {}", line, e))
+    }
+
+    async fn decr(&mut self, key: &str) -> i64 {
+        self.send_array(&["DECR", key]).await;
+        let line = self.read_simple_line().await;
+        if !line.starts_with(':') || !line.ends_with("\r\n") {
+            panic!("unexpected DECR response: {:?}", line);
+        }
+        let num_str = &line[1..line.len() - 2];
+        num_str
+            .parse::<i64>()
+            .unwrap_or_else(|e| panic!("invalid DECR integer {:?}: {}", line, e))
+    }
+
+    async fn exists(&mut self, keys: &[&str]) -> i64 {
+        let mut parts = Vec::with_capacity(1 + keys.len());
+        parts.push("EXISTS");
+        parts.extend_from_slice(keys);
+        self.send_array(&parts).await;
+        let line = self.read_simple_line().await;
+        if !line.starts_with(':') || !line.ends_with("\r\n") {
+            panic!("unexpected EXISTS response: {:?}", line);
+        }
+        let num_str = &line[1..line.len() - 2];
+        num_str
+            .parse::<i64>()
+            .unwrap_or_else(|e| panic!("invalid EXISTS integer {:?}: {}", line, e))
+    }
+
+    async fn del(&mut self, keys: &[&str]) -> i64 {
+        let mut parts = Vec::with_capacity(1 + keys.len());
+        parts.push("DEL");
+        parts.extend_from_slice(keys);
+        self.send_array(&parts).await;
+        let line = self.read_simple_line().await;
+        if !line.starts_with(':') || !line.ends_with("\r\n") {
+            panic!("unexpected DEL response: {:?}", line);
+        }
+        let num_str = &line[1..line.len() - 2];
+        num_str
+            .parse::<i64>()
+            .unwrap_or_else(|e| panic!("invalid DEL integer {:?}: {}", line, e))
+    }
+
+    async fn lpush(&mut self, key: &str, values: &[&str]) -> i64 {
+        let mut parts = Vec::with_capacity(2 + values.len());
+        parts.push("LPUSH");
+        parts.push(key);
+        parts.extend_from_slice(values);
+        self.send_array(&parts).await;
+        let line = self.read_simple_line().await;
+        if !line.starts_with(':') || !line.ends_with("\r\n") {
+            panic!("unexpected LPUSH response: {:?}", line);
+        }
+        let num_str = &line[1..line.len() - 2];
+        num_str
+            .parse::<i64>()
+            .unwrap_or_else(|e| panic!("invalid LPUSH integer {:?}: {}", line, e))
+    }
+
+    async fn rpush(&mut self, key: &str, values: &[&str]) -> i64 {
+        let mut parts = Vec::with_capacity(2 + values.len());
+        parts.push("RPUSH");
+        parts.push(key);
+        parts.extend_from_slice(values);
+        self.send_array(&parts).await;
+        let line = self.read_simple_line().await;
+        if !line.starts_with(':') || !line.ends_with("\r\n") {
+            panic!("unexpected RPUSH response: {:?}", line);
+        }
+        let num_str = &line[1..line.len() - 2];
+        num_str
+            .parse::<i64>()
+            .unwrap_or_else(|e| panic!("invalid RPUSH integer {:?}: {}", line, e))
+    }
+
+    async fn lrange(&mut self, key: &str, start: isize, stop: isize) -> Vec<String> {
+        self.send_array(&["LRANGE", key, &start.to_string(), &stop.to_string()])
+            .await;
+
+        // 读取 array header
+        let mut header = String::new();
+        self.reader.read_line(&mut header).await.unwrap();
+        if !header.starts_with('*') || !header.ends_with("\r\n") {
+            panic!("unexpected LRANGE header: {:?}", header);
+        }
+        let len_str = &header[1..header.len() - 2];
+        let len: usize = len_str
+            .parse()
+            .unwrap_or_else(|e| panic!("invalid LRANGE array len {:?}: {}", header, e));
+
+        let mut items = Vec::with_capacity(len);
+        for _ in 0..len {
+            if let Some(v) = self.read_bulk().await {
+                items.push(v);
+            } else {
+                panic!("LRANGE returned nil bulk inside array");
+            }
+        }
+        items
+    }
+}
+
+async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
+    match group {
+        "set_get" => {
+            // 先做一次功能校验，确保两端语义一致
+            client.set("bench_foo", "bar").await;
+            let v = client.get("bench_foo").await;
+            assert_eq!(v.as_deref(), Some("bar"));
+
+            // SET/GET 回环性能测试
+            let start = std::time::Instant::now();
+            for i in 0..iterations {
+                let key = "bench_key"; // 固定 key，更接近常见热点场景
+                let value = format!("value-{}", i);
+                client.set(key, &value).await;
+                let got = client.get(key).await;
+                if got.as_deref() != Some(&value) {
+                    panic!(
+                        "mismatched value at iter {}: expected {:?}, got {:?}",
+                        i, value, got
+                    );
+                }
+            }
+            let elapsed = start.elapsed();
+
+            let total_ops = (iterations * 2) as f64; // 每轮一个 SET + 一个 GET
+            let secs = elapsed.as_secs_f64();
+            let qps = if secs > 0.0 { total_ops / secs } else { 0.0 };
+
+            println!("[bench] total time: {:?}", elapsed);
+            println!("[bench] total ops: {}", total_ops as u64);
+            println!("[bench] ops/sec: {:.2}", qps);
+        }
+        "incr_decr" => {
+            // 功能校验：INCR/DECR 在两端行为一致
+            let key = "bench_counter";
+            let v1 = client.incr(key).await;
+            let v2 = client.incr(key).await;
+            let v3 = client.decr(key).await;
+            if v2 != v1 + 1 || v3 != v2 - 1 {
+                panic!(
+                    "unexpected INCR/DECR sequence: v1={}, v2={}, v3={}",
+                    v1, v2, v3
+                );
+            }
+
+            // INCR/DECR 回环性能测试
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                let _ = client.incr(key).await;
+                let _ = client.decr(key).await;
+            }
+            let elapsed = start.elapsed();
+
+            let total_ops = (iterations * 2) as f64; // 每轮一个 INCR + 一个 DECR
+            let secs = elapsed.as_secs_f64();
+            let qps = if secs > 0.0 { total_ops / secs } else { 0.0 };
+
+            println!("[bench] total time: {:?}", elapsed);
+            println!("[bench] total ops: {}", total_ops as u64);
+            println!("[bench] ops/sec: {:.2}", qps);
+        }
+        "exists_del" => {
+            // 功能校验：EXISTS/DEL 在两端行为一致
+            let k1 = "bench_exists_1";
+            let k2 = "bench_exists_2";
+            client.set(k1, "v1").await;
+            client.set(k2, "v2").await;
+            let e = client.exists(&[k1, k2, "bench_missing"]).await;
+            if e != 2 {
+                panic!("unexpected EXISTS count: {}", e);
+            }
+            let removed = client.del(&[k1, k2, "bench_missing"]).await;
+            if removed != 2 {
+                panic!("unexpected DEL removed: {}", removed);
+            }
+
+            // EXISTS/DEL 回环性能测试：不断创建和删除一批 key
+            let base = "bench_exists_key";
+            let start = std::time::Instant::now();
+            for i in 0..iterations {
+                let k = format!("{}:{}", base, i);
+                client.set(&k, "x").await;
+                let c = client.exists(&[&k]).await;
+                if c != 1 {
+                    panic!("EXISTS should be 1 for key {} but was {}", k, c);
+                }
+                let d = client.del(&[&k]).await;
+                if d != 1 {
+                    panic!("DEL should remove 1 for key {} but was {}", k, d);
+                }
+            }
+            let elapsed = start.elapsed();
+
+            let total_ops = (iterations * 3) as f64; // 每轮 SET + EXISTS + DEL
+            let secs = elapsed.as_secs_f64();
+            let qps = if secs > 0.0 { total_ops / secs } else { 0.0 };
+
+            println!("[bench] total time: {:?}", elapsed);
+            println!("[bench] total ops: {}", total_ops as u64);
+            println!("[bench] ops/sec: {:.2}", qps);
+        }
+        "list_ops" => {
+            // 功能校验：LPUSH/RPUSH/LRANGE
+            let key = "bench_list";
+            client.del(&[key]).await;
+            let len = client.rpush(key, &["a", "b", "c"]).await;
+            if len != 3 {
+                panic!("unexpected RPUSH length: {}", len);
+            }
+            let len2 = client.lpush(key, &["x"]).await;
+            if len2 != 4 {
+                panic!("unexpected LPUSH length: {}", len2);
+            }
+            let items = client.lrange(key, 0, -1).await;
+            if items != vec!["x", "a", "b", "c"] {
+                panic!("unexpected LRANGE items: {:?}", items);
+            }
+
+            // 列表操作回环性能测试：交替 LPUSH/RPUSH + LRANGE
+            let start = std::time::Instant::now();
+            for i in 0..iterations {
+                let v = format!("v{}", i);
+                let _ = client.lpush(key, &[&v]).await;
+                let _ = client.rpush(key, &[&v]).await;
+                let _ = client.lrange(key, 0, 10).await;
+            }
+            let elapsed = start.elapsed();
+
+            let total_ops = (iterations * 3) as f64; // 每轮 LPUSH + RPUSH + LRANGE
+            let secs = elapsed.as_secs_f64();
+            let qps = if secs > 0.0 { total_ops / secs } else { 0.0 };
+
+            println!("[bench] total time: {:?}", elapsed);
+            println!("[bench] total ops: {}", total_ops as u64);
+            println!("[bench] ops/sec: {:.2}", qps);
+        }
+        other => {
+            panic!("unknown bench group: {}", other);
+        }
+    }
 }
 
 #[tokio::main]
@@ -105,6 +358,12 @@ async fn main() {
         .parse()
         .unwrap_or(1000);
 
+    let group = args
+        .iter()
+        .find(|a| a.starts_with("--group="))
+        .map(|a| a[8..].to_string())
+        .unwrap_or_else(|| "all".to_string());
+
     let auth_password = args
         .iter()
         .find(|a| a.starts_with("--auth="))
@@ -112,6 +371,7 @@ async fn main() {
 
     println!("[bench] target addr = {}", addr);
     println!("[bench] iterations = {}", iterations);
+    println!("[bench] group = {}", group);
     if let Some(_) = auth_password.as_ref() {
         println!("[bench] using AUTH");
     }
@@ -122,32 +382,12 @@ async fn main() {
         client.auth(password).await;
     }
 
-    // 先做一次功能校验，确保两端语义一致
-    client.set("bench_foo", "bar").await;
-    let v = client.get("bench_foo").await;
-    assert_eq!(v.as_deref(), Some("bar"));
-
-    // SET/GET 回环性能测试
-    let start = Instant::now();
-    for i in 0..iterations {
-        let key = "bench_key"; // 固定 key，更接近常见热点场景
-        let value = format!("value-{}", i);
-        client.set(key, &value).await;
-        let got = client.get(key).await;
-        if got.as_deref() != Some(&value) {
-            panic!(
-                "mismatched value at iter {}: expected {:?}, got {:?}",
-                i, value, got
-            );
+    if group == "all" {
+        for g in ["set_get", "incr_decr", "exists_del", "list_ops"] {
+            println!("[bench] ==== group: {} ====", g);
+            run_group(&mut client, g, iterations).await;
         }
+    } else {
+        run_group(&mut client, &group, iterations).await;
     }
-    let elapsed = start.elapsed();
-
-    let total_ops = (iterations * 2) as f64; // 每轮一个 SET + 一个 GET
-    let secs = elapsed.as_secs_f64();
-    let qps = if secs > 0.0 { total_ops / secs } else { 0.0 };
-
-    println!("[bench] total time: {:?}", elapsed);
-    println!("[bench] total ops: {}", total_ops as u64);
-    println!("[bench] ops/sec: {:.2}", qps);
 }
