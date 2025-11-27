@@ -233,6 +233,34 @@ impl RespClient {
         }
         items
     }
+
+    async fn sinter(&mut self, keys: &[&str]) -> Vec<String> {
+        let mut parts = Vec::with_capacity(1 + keys.len());
+        parts.push("SINTER");
+        parts.extend_from_slice(keys);
+        self.send_array(&parts).await;
+
+        // 读取 array header
+        let mut header = String::new();
+        self.reader.read_line(&mut header).await.unwrap();
+        if !header.starts_with('*') || !header.ends_with("\r\n") {
+            panic!("unexpected SINTER header: {:?}", header);
+        }
+        let len_str = &header[1..header.len() - 2];
+        let len: usize = len_str
+            .parse()
+            .unwrap_or_else(|e| panic!("invalid SINTER array len {:?}: {}", header, e));
+
+        let mut items = Vec::with_capacity(len);
+        for _ in 0..len {
+            if let Some(v) = self.read_bulk().await {
+                items.push(v);
+            } else {
+                panic!("SINTER returned nil bulk inside array");
+            }
+        }
+        items
+    }
 }
 
 async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
@@ -473,6 +501,81 @@ async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
             println!("[bench] total ops: {}", total_ops as u64);
             println!("[bench] ops/sec: {:.2}", qps);
         }
+        "set_intersection" => {
+            // 功能校验：SINTER 行为
+            client.del(&["bench_si_1", "bench_si_2", "bench_si_3"]).await;
+
+            client
+                .send_array(&["SADD", "bench_si_1", "a", "b"])
+                .await;
+            let _ = client.read_simple_line().await; // :2
+
+            client
+                .send_array(&["SADD", "bench_si_2", "b", "c"])
+                .await;
+            let _ = client.read_simple_line().await; // :2
+
+            client
+                .send_array(&["SADD", "bench_si_3", "b", "d"])
+                .await;
+            let _ = client.read_simple_line().await; // :2
+
+            let mut items = client.sinter(&["bench_si_1", "bench_si_2", "bench_si_3"]).await;
+            items.sort();
+            if items != vec!["b".to_string()] {
+                panic!("unexpected SINTER items: {:?}", items);
+            }
+
+            // SINTER 回环性能测试：在三个集合上交替添加元素并做 SINTER
+            let base1 = "bench_si_loop_1";
+            let base2 = "bench_si_loop_2";
+            let base3 = "bench_si_loop_3";
+            client.del(&[base1, base2, base3]).await;
+
+            client
+                .send_array(&["SADD", base1, "x"])
+                .await;
+            let _ = client.read_simple_line().await;
+            client
+                .send_array(&["SADD", base2, "x"])
+                .await;
+            let _ = client.read_simple_line().await;
+            client
+                .send_array(&["SADD", base3, "x"])
+                .await;
+            let _ = client.read_simple_line().await;
+
+            let start = std::time::Instant::now();
+            for i in 0..iterations {
+                let v1 = format!("i{}", i);
+                let v2 = format!("j{}", i);
+                let v3 = format!("k{}", i);
+
+                client
+                    .send_array(&["SADD", base1, &v1])
+                    .await;
+                let _ = client.read_simple_line().await;
+                client
+                    .send_array(&["SADD", base2, &v2])
+                    .await;
+                let _ = client.read_simple_line().await;
+                client
+                    .send_array(&["SADD", base3, &v3])
+                    .await;
+                let _ = client.read_simple_line().await;
+
+                let _ = client.sinter(&[base1, base2, base3]).await;
+            }
+            let elapsed = start.elapsed();
+
+            let total_ops = (iterations * 4) as f64; // 每轮三次 SADD + 一次 SINTER
+            let secs = elapsed.as_secs_f64();
+            let qps = if secs > 0.0 { total_ops / secs } else { 0.0 };
+
+            println!("[bench] total time: {:?}", elapsed);
+            println!("[bench] total ops: {}", total_ops as u64);
+            println!("[bench] ops/sec: {:.2}", qps);
+        }
         other => {
             panic!("unknown bench group: {}", other);
         }
@@ -523,7 +626,15 @@ async fn main() {
     }
 
     if group == "all" {
-        for g in ["set_get", "incr_decr", "exists_del", "list_ops", "list_pops", "set_union"] {
+        for g in [
+            "set_get",
+            "incr_decr",
+            "exists_del",
+            "list_ops",
+            "list_pops",
+            "set_union",
+            "set_intersection",
+        ] {
             println!("[bench] ==== group: {} ====", g);
             run_group(&mut client, g, iterations).await;
         }

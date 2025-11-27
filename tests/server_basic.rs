@@ -160,6 +160,184 @@ async fn responds_to_basic_commands() {
 }
 
 #[tokio::test]
+async fn lists_lrange_boundaries() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // RPUSH mylist a b c -> 3
+    write_half
+        .write_all(b"*5\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n")
+        .await
+        .unwrap();
+    let mut resp = String::new();
+    reader.read_line(&mut resp).await.unwrap();
+    assert_eq!(resp, ":3\r\n");
+
+    // LRANGE with start > end -> empty array
+    write_half
+        .write_all(b"*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$1\r\n2\r\n$1\r\n1\r\n")
+        .await
+        .unwrap();
+    let mut header = String::new();
+    reader.read_line(&mut header).await.unwrap();
+    assert_eq!(header, "*0\r\n");
+
+    // LRANGE far out of range positive indexes -> empty array
+    write_half
+        .write_all(b"*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$2\r\n10\r\n$2\r\n20\r\n")
+        .await
+        .unwrap();
+    header.clear();
+    reader.read_line(&mut header).await.unwrap();
+    assert_eq!(header, "*0\r\n");
+
+    // LRANGE with very wide range should still return full list
+    write_half
+        .write_all(b"*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$4\r\n-100\r\n$3\r\n100\r\n")
+        .await
+        .unwrap();
+    header.clear();
+    reader.read_line(&mut header).await.unwrap();
+    assert_eq!(header, "*3\r\n");
+
+    let mut bulk_header = String::new();
+    let mut value = String::new();
+
+    // a
+    reader.read_line(&mut bulk_header).await.unwrap();
+    assert_eq!(bulk_header, "$1\r\n");
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(value, "a\r\n");
+    bulk_header.clear();
+    value.clear();
+
+    // b
+    reader.read_line(&mut bulk_header).await.unwrap();
+    assert_eq!(bulk_header, "$1\r\n");
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(value, "b\r\n");
+    bulk_header.clear();
+    value.clear();
+
+    // c
+    reader.read_line(&mut bulk_header).await.unwrap();
+    assert_eq!(bulk_header, "$1\r\n");
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(value, "c\r\n");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn lists_multi_client_visibility() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    // client 1: push elements into list
+    let stream1 = TcpStream::connect(addr).await.unwrap();
+    let (_r1, mut w1) = stream1.into_split();
+    w1.write_all(b"*5\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n")
+        .await
+        .unwrap();
+
+    // client 2: read list contents via LRANGE
+    let stream2 = TcpStream::connect(addr).await.unwrap();
+    let (r2, mut w2) = stream2.into_split();
+    let mut reader2 = BufReader::new(r2);
+
+    w2.write_all(b"*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$1\r\n0\r\n$2\r\n-1\r\n")
+        .await
+        .unwrap();
+
+    let mut header = String::new();
+    reader2.read_line(&mut header).await.unwrap();
+    assert_eq!(header, "*3\r\n");
+
+    let mut bulk_header = String::new();
+    let mut value = String::new();
+    let mut items = Vec::new();
+    for _ in 0..3 {
+        bulk_header.clear();
+        value.clear();
+        reader2.read_line(&mut bulk_header).await.unwrap();
+        reader2.read_line(&mut value).await.unwrap();
+        assert_eq!(bulk_header, "$1\r\n");
+        items.push(value.trim_end_matches("\r\n").to_string());
+    }
+
+    assert_eq!(items, vec!["a", "b", "c"]);
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn sets_intersection_behaviour() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // SINTER on all-missing keys -> empty array
+    write_half
+        .write_all(b"*3\r\n$6\r\nSINTER\r\n$3\r\nfoo\r\n$3\r\nbar\r\n")
+        .await
+        .unwrap();
+    let mut header = String::new();
+    reader.read_line(&mut header).await.unwrap();
+    assert_eq!(header, "*0\r\n");
+
+    // SADD set1 a b
+    write_half
+        .write_all(b"*4\r\n$4\r\nSADD\r\n$4\r\nset1\r\n$1\r\na\r\n$1\r\nb\r\n")
+        .await
+        .unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":2\r\n");
+
+    // SADD set2 b c
+    write_half
+        .write_all(b"*4\r\n$4\r\nSADD\r\n$4\r\nset2\r\n$1\r\nb\r\n$1\r\nc\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":2\r\n");
+
+    // SADD set3 b d
+    write_half
+        .write_all(b"*4\r\n$4\r\nSADD\r\n$4\r\nset3\r\n$1\r\nb\r\n$1\r\nd\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":2\r\n");
+
+    // SINTER set1 set2 set3 -> [b]
+    write_half
+        .write_all(b"*4\r\n$6\r\nSINTER\r\n$4\r\nset1\r\n$4\r\nset2\r\n$4\r\nset3\r\n")
+        .await
+        .unwrap();
+
+    header.clear();
+    reader.read_line(&mut header).await.unwrap();
+    assert_eq!(header, "*1\r\n");
+
+    let mut bulk_header = String::new();
+    let mut value = String::new();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(bulk_header, "$1\r\n");
+    assert_eq!(value, "b\r\n");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn sets_union_behaviour() {
     let (addr, shutdown, handle) = spawn_server().await;
     let stream = TcpStream::connect(addr).await.unwrap();

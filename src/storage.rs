@@ -319,4 +319,48 @@ impl Storage {
         members.sort();
         members
     }
+
+    pub fn sinter(&self, keys: &[String]) -> Vec<String> {
+        let guard = match self.inner.read() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+
+        if keys.is_empty() {
+            return Vec::new();
+        }
+
+        // 收集所有存在的集合引用，如果有任意一个 key 不存在，则交集为空。
+        let mut existing_sets = Vec::with_capacity(keys.len());
+        for key in keys {
+            match guard.sets.get(key) {
+                Some(set) => existing_sets.push(set),
+                None => return Vec::new(),
+            }
+        }
+
+        // 选择元素最少的集合作为基准集合，降低整体扫描量。
+        let (min_index, min_set) = existing_sets
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, set)| set.len())
+            .unwrap();
+
+        let mut result: HashSet<String> = HashSet::new();
+        'outer: for member in min_set.iter() {
+            for (idx, set) in existing_sets.iter().enumerate() {
+                if idx == min_index {
+                    continue;
+                }
+                if !set.contains(member) {
+                    continue 'outer;
+                }
+            }
+            result.insert(member.clone());
+        }
+
+        let mut members: Vec<String> = result.into_iter().collect();
+        members.sort();
+        members
+    }
 }
