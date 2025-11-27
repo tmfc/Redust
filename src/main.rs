@@ -46,16 +46,21 @@ async fn handle_connection(stream: TcpStream, store: SharedStore) -> io::Result<
             Command::Ping => write_half.write_all(b"+PONG\r\n").await?,
             Command::Echo(value) => respond_bulk_string(&mut write_half, &value).await?,
             Command::Set(key, value) => {
-                let mut store = store.lock().await;
-                store.insert(key, value);
+                {
+                    let mut store = store.lock().await;
+                    store.insert(key, value);
+                }
                 write_half.write_all(b"+OK\r\n").await?;
             }
             Command::Get(key) => {
-                let store = store.lock().await;
-                if let Some(value) = store.get(&key) {
-                    respond_bulk_string(&mut write_half, value).await?;
-                } else {
-                    respond_null_bulk(&mut write_half).await?;
+                let value = {
+                    let store = store.lock().await;
+                    store.get(&key).cloned()
+                };
+
+                match value {
+                    Some(value) => respond_bulk_string(&mut write_half, &value).await?,
+                    None => respond_null_bulk(&mut write_half).await?,
                 }
             }
             Command::Quit => {
