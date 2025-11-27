@@ -35,6 +35,32 @@ async fn handle_connection(stream: TcpStream, storage: Storage) -> io::Result<()
                     write_half.write_all(b"$-1\r\n").await?;
                 }
             }
+            Command::Incr { key } => {
+                match storage.incr(&key) {
+                    Ok(value) => {
+                        let response = format!(":{}\r\n", value);
+                        write_half.write_all(response.as_bytes()).await?;
+                    }
+                    Err(_) => {
+                        write_half
+                            .write_all(b"-ERR value is not an integer or out of range\r\n")
+                            .await?;
+                    }
+                }
+            }
+            Command::Decr { key } => {
+                match storage.decr(&key) {
+                    Ok(value) => {
+                        let response = format!(":{}\r\n", value);
+                        write_half.write_all(response.as_bytes()).await?;
+                    }
+                    Err(_) => {
+                        write_half
+                            .write_all(b"-ERR value is not an integer or out of range\r\n")
+                            .await?;
+                    }
+                }
+            }
             Command::Del { keys } => {
                 let removed = storage.del(&keys);
                 let response = format!(":{}\r\n", removed);
@@ -43,6 +69,19 @@ async fn handle_connection(stream: TcpStream, storage: Storage) -> io::Result<()
             Command::Exists { keys } => {
                 let count = storage.exists(&keys);
                 let response = format!(":{}\r\n", count);
+                write_half.write_all(response.as_bytes()).await?;
+            }
+            Command::Type { key } => {
+                let t = storage.type_of(&key);
+                let response = format!("+{}\r\n", t);
+                write_half.write_all(response.as_bytes()).await?;
+            }
+            Command::Keys { pattern } => {
+                let keys = storage.keys(&pattern);
+                let mut response = format!("*{}\r\n", keys.len());
+                for k in keys {
+                    response.push_str(&format!("${}\r\n{}\r\n", k.len(), k));
+                }
                 write_half.write_all(response.as_bytes()).await?;
             }
             Command::Unknown(parts) => {
@@ -188,6 +227,66 @@ mod tests {
         let mut nil_resp = String::new();
         reader.read_line(&mut nil_resp).await.unwrap();
         assert_eq!(nil_resp, "$-1\r\n");
+
+        // INCR on new key -> 1
+        write_half
+            .write_all(b"*2\r\n$4\r\nINCR\r\n$3\r\ncnt\r\n")
+            .await
+            .unwrap();
+        let mut incr_resp = String::new();
+        reader.read_line(&mut incr_resp).await.unwrap();
+        assert_eq!(incr_resp, ":1\r\n");
+
+        // INCR again -> 2
+        write_half
+            .write_all(b"*2\r\n$4\r\nINCR\r\n$3\r\ncnt\r\n")
+            .await
+            .unwrap();
+        let mut incr_resp2 = String::new();
+        reader.read_line(&mut incr_resp2).await.unwrap();
+        assert_eq!(incr_resp2, ":2\r\n");
+
+        // DECR -> 1
+        write_half
+            .write_all(b"*2\r\n$4\r\nDECR\r\n$3\r\ncnt\r\n")
+            .await
+            .unwrap();
+        let mut decr_resp = String::new();
+        reader.read_line(&mut decr_resp).await.unwrap();
+        assert_eq!(decr_resp, ":1\r\n");
+
+        // TYPE existing key -> string
+        write_half
+            .write_all(b"*2\r\n$4\r\nTYPE\r\n$3\r\ncnt\r\n")
+            .await
+            .unwrap();
+        let mut type_resp = String::new();
+        reader.read_line(&mut type_resp).await.unwrap();
+        assert_eq!(type_resp, "+string\r\n");
+
+        // TYPE missing key -> none
+        write_half
+            .write_all(b"*2\r\n$4\r\nTYPE\r\n$7\r\nmissing\r\n")
+            .await
+            .unwrap();
+        let mut type_none = String::new();
+        reader.read_line(&mut type_none).await.unwrap();
+        assert_eq!(type_none, "+none\r\n");
+
+        // KEYS exact match pattern
+        write_half
+            .write_all(b"*2\r\n$4\r\nKEYS\r\n$3\r\ncnt\r\n")
+            .await
+            .unwrap();
+        let mut array_header = String::new();
+        reader.read_line(&mut array_header).await.unwrap();
+        assert_eq!(array_header, "*1\r\n");
+        let mut bulk_header = String::new();
+        reader.read_line(&mut bulk_header).await.unwrap();
+        assert_eq!(bulk_header, "$3\r\n");
+        let mut key_value = String::new();
+        reader.read_line(&mut key_value).await.unwrap();
+        assert_eq!(key_value, "cnt\r\n");
 
         shutdown.send(()).unwrap();
         handle.await.unwrap().unwrap();

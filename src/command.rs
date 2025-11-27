@@ -11,6 +11,10 @@ pub enum Command {
     Get { key: String },
     Del { keys: Vec<String> },
     Exists { keys: Vec<String> },
+    Incr { key: String },
+    Decr { key: String },
+    Type { key: String },
+    Keys { pattern: String },
     Unknown(Vec<String>),
 }
 
@@ -46,6 +50,18 @@ pub async fn read_command(
             };
             Command::Get { key }
         }
+        "INCR" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Unknown(std::iter::once(command).chain(iter).collect())));
+            };
+            Command::Incr { key }
+        }
+        "DECR" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Unknown(std::iter::once(command).chain(iter).collect())));
+            };
+            Command::Decr { key }
+        }
         "DEL" => {
             let keys: Vec<String> = iter.collect();
             if keys.is_empty() {
@@ -61,6 +77,18 @@ pub async fn read_command(
             } else {
                 Command::Exists { keys }
             }
+        }
+        "TYPE" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Unknown(std::iter::once(command).chain(iter).collect())));
+            };
+            Command::Type { key }
+        }
+        "KEYS" => {
+            let Some(pattern) = iter.next() else {
+                return Ok(Some(Command::Unknown(std::iter::once(command).chain(iter).collect())));
+            };
+            Command::Keys { pattern }
         }
         _ => Command::Unknown(std::iter::once(command).chain(iter).collect()),
     };
