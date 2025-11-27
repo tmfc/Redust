@@ -299,4 +299,24 @@ impl Storage {
             .map(|s| s.contains(member))
             .unwrap_or(false)
     }
+
+    pub fn sunion(&self, keys: &[String]) -> Vec<String> {
+        let guard = match self.inner.read() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut result: HashSet<String> = HashSet::new();
+        for key in keys {
+            if let Some(set) = guard.sets.get(key) {
+                for m in set {
+                    result.insert(m.clone());
+                }
+            }
+        }
+
+        let mut members: Vec<String> = result.into_iter().collect();
+        members.sort();
+        members
+    }
 }

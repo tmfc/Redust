@@ -129,23 +129,22 @@
 当前状态：
 - 已实现的数据结构子集：
   - **列表（List）**：
-    - 存储层：`storage.rs` 中维护 `lists: HashMap<String, VecDeque<String>>`，并提供 `lpush` / `rpush` / `lrange` 等操作。
-    - 命令层：`LPUSH`、`RPUSH`、`LRANGE` 已在 `command.rs` 和 `server.rs` 中打通。
+    - 存储层：`storage.rs` 中维护 `lists: HashMap<String, VecDeque<String>>`，并提供 `lpush` / `rpush` / `lrange` / `lpop` / `rpop` 等操作。
+    - 命令层：`LPUSH`、`RPUSH`、`LRANGE`、`LPOP`、`RPOP` 已在 `command.rs` 和 `server.rs` 中打通。
     - 行为验证：
-      - `tests/server_basic.rs::lists_basic_behaviour` 覆盖基础列表操作语义（含下标和负索引）。
-      - `resp_set_get_bench.rs` 中的 `list_ops` group 对列表操作做简单性能/功能回归。
+      - `tests/server_basic.rs::lists_basic_behaviour` / `lists_pop_behaviour` 覆盖基础列表操作语义（含下标、负索引和弹出行为）。
+      - `resp_set_get_bench.rs` 中的 `list_ops` / `list_pops` group 对列表操作和弹出操作做简单性能/功能回归。
   - **集合（Set）**：
     - 存储层：`storage.rs` 中维护 `sets: HashMap<String, HashSet<String>>`，并提供 `sadd` / `srem` / `smembers` / `scard` / `sismember` 等操作。
     - 命令层：`SADD`、`SREM`、`SMEMBERS`、`SCARD`、`SISMEMBER` 已在 `command.rs` 和 `server.rs` 中实现。
     - 行为验证：`tests/server_basic.rs::sets_basic_behaviour` 覆盖集合的基础语义与去重行为。
 - 尚未实现：
-  - 列表的弹出类操作（如 `LPOP` / `RPOP`）。
   - 哈希、有序集合等更复杂数据结构。
   - 任何形式的持久化（当前仍为纯内存）。
 
 阶段 2 计划拆分（草案）：
 - **2.1 列表能力补全**
-  - [ ] 为 `Storage` 增加 `lpop` / `rpop` 等接口，并在 `command` / `server` 中接线。
+  - [x] 为 `Storage` 增加 `lpop` / `rpop` 等接口，并在 `command` / `server` 中接线。
   - [ ] 补充列表边界条件测试（空列表弹出、多客户端并发等）。
 
 - **2.2 集合能力增强（可选）**

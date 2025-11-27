@@ -25,6 +25,7 @@ pub enum Command {
     Smembers { key: String },
     Scard { key: String },
     Sismember { key: String, member: String },
+    Sunion { keys: Vec<String> },
     Unknown(Vec<String>),
 }
 
@@ -194,6 +195,14 @@ pub async fn read_command(
                 return Ok(Some(Command::Unknown(std::iter::once(command).chain(std::iter::once(key)).chain(iter).collect())));
             };
             Command::Sismember { key, member }
+        }
+        "SUNION" => {
+            let keys: Vec<String> = iter.collect();
+            if keys.is_empty() {
+                Command::Unknown(vec![command])
+            } else {
+                Command::Sunion { keys }
+            }
         }
         _ => Command::Unknown(std::iter::once(command).chain(iter).collect()),
     };

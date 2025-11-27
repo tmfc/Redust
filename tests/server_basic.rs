@@ -160,6 +160,69 @@ async fn responds_to_basic_commands() {
 }
 
 #[tokio::test]
+async fn sets_union_behaviour() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // SUNION on all-missing keys -> empty array
+    write_half
+        .write_all(b"*3\r\n$6\r\nSUNION\r\n$3\r\nfoo\r\n$3\r\nbar\r\n")
+        .await
+        .unwrap();
+    let mut header = String::new();
+    reader.read_line(&mut header).await.unwrap();
+    assert_eq!(header, "*0\r\n");
+
+    // SADD set1 a b
+    write_half
+        .write_all(b"*4\r\n$4\r\nSADD\r\n$4\r\nset1\r\n$1\r\na\r\n$1\r\nb\r\n")
+        .await
+        .unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":2\r\n");
+
+    // SADD set2 b c
+    write_half
+        .write_all(b"*4\r\n$4\r\nSADD\r\n$4\r\nset2\r\n$1\r\nb\r\n$1\r\nc\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":2\r\n");
+
+    // SUNION set1 set2 missing -> [a, b, c] （顺序由存储排序保证）
+    write_half
+        .write_all(b"*4\r\n$6\r\nSUNION\r\n$4\r\nset1\r\n$4\r\nset2\r\n$7\r\nmissing\r\n")
+        .await
+        .unwrap();
+
+    header.clear();
+    reader.read_line(&mut header).await.unwrap();
+    assert_eq!(header, "*3\r\n");
+
+    let mut bulk_header = String::new();
+    let mut value = String::new();
+    let mut members = Vec::new();
+    for _ in 0..3 {
+        bulk_header.clear();
+        value.clear();
+        reader.read_line(&mut bulk_header).await.unwrap();
+        reader.read_line(&mut value).await.unwrap();
+        assert_eq!(bulk_header, "$1\r\n");
+        members.push(value.trim_end_matches("\r\n").to_string());
+    }
+
+    members.sort();
+    assert_eq!(members, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn lists_pop_behaviour() {
     let (addr, shutdown, handle) = spawn_server().await;
     let stream = TcpStream::connect(addr).await.unwrap();

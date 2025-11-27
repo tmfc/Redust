@@ -205,6 +205,34 @@ impl RespClient {
         self.send_array(&["RPOP", key]).await;
         self.read_bulk().await
     }
+
+    async fn sunion(&mut self, keys: &[&str]) -> Vec<String> {
+        let mut parts = Vec::with_capacity(1 + keys.len());
+        parts.push("SUNION");
+        parts.extend_from_slice(keys);
+        self.send_array(&parts).await;
+
+        // 读取 array header
+        let mut header = String::new();
+        self.reader.read_line(&mut header).await.unwrap();
+        if !header.starts_with('*') || !header.ends_with("\r\n") {
+            panic!("unexpected SUNION header: {:?}", header);
+        }
+        let len_str = &header[1..header.len() - 2];
+        let len: usize = len_str
+            .parse()
+            .unwrap_or_else(|e| panic!("invalid SUNION array len {:?}: {}", header, e));
+
+        let mut items = Vec::with_capacity(len);
+        for _ in 0..len {
+            if let Some(v) = self.read_bulk().await {
+                items.push(v);
+            } else {
+                panic!("SUNION returned nil bulk inside array");
+            }
+        }
+        items
+    }
 }
 
 async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
@@ -387,6 +415,64 @@ async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
             println!("[bench] total ops: {}", total_ops as u64);
             println!("[bench] ops/sec: {:.2}", qps);
         }
+        "set_union" => {
+            // 功能校验：SUNION 行为
+            client.del(&["bench_su_1", "bench_su_2"]).await;
+            let added1 = client
+                .send_array(&["SADD", "bench_su_1", "a", "b"])
+                .await;
+            let _ = added1; // 我们不检查返回值，这里只依赖服务器自身行为
+            // 读取 :2
+            let _ = client.read_simple_line().await;
+
+            client
+                .send_array(&["SADD", "bench_su_2", "b", "c"])
+                .await;
+            let _ = client.read_simple_line().await; // :2
+
+            let mut items = client.sunion(&["bench_su_1", "bench_su_2", "missing"]).await;
+            items.sort();
+            if items != vec!["a".to_string(), "b".to_string(), "c".to_string()] {
+                panic!("unexpected SUNION items: {:?}", items);
+            }
+
+            // SUNION 回环性能测试：在两个集合上交替添加元素并做 SUNION
+            let base1 = "bench_su_loop_1";
+            let base2 = "bench_su_loop_2";
+            client.del(&[base1, base2]).await;
+            client
+                .send_array(&["SADD", base1, "a"])
+                .await;
+            let _ = client.read_simple_line().await;
+            client
+                .send_array(&["SADD", base2, "b"])
+                .await;
+            let _ = client.read_simple_line().await;
+
+            let start = std::time::Instant::now();
+            for i in 0..iterations {
+                let v1 = format!("x{}", i);
+                let v2 = format!("y{}", i);
+                client
+                    .send_array(&["SADD", base1, &v1])
+                    .await;
+                let _ = client.read_simple_line().await;
+                client
+                    .send_array(&["SADD", base2, &v2])
+                    .await;
+                let _ = client.read_simple_line().await;
+                let _ = client.sunion(&[base1, base2]).await;
+            }
+            let elapsed = start.elapsed();
+
+            let total_ops = (iterations * 3) as f64; // 每轮 两次 SADD + 一次 SUNION
+            let secs = elapsed.as_secs_f64();
+            let qps = if secs > 0.0 { total_ops / secs } else { 0.0 };
+
+            println!("[bench] total time: {:?}", elapsed);
+            println!("[bench] total ops: {}", total_ops as u64);
+            println!("[bench] ops/sec: {:.2}", qps);
+        }
         other => {
             panic!("unknown bench group: {}", other);
         }
@@ -437,7 +523,7 @@ async fn main() {
     }
 
     if group == "all" {
-        for g in ["set_get", "incr_decr", "exists_del", "list_ops", "list_pops"] {
+        for g in ["set_get", "incr_decr", "exists_del", "list_ops", "list_pops", "set_union"] {
             println!("[bench] ==== group: {} ====", g);
             run_group(&mut client, g, iterations).await;
         }
