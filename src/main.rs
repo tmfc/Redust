@@ -23,10 +23,15 @@ async fn main() -> io::Result<()> {
 }
 
 async fn handle_connection(stream: TcpStream) -> io::Result<()> {
+    let peer_addr = stream.peer_addr().ok();
+    println!("[conn] new connection from {:?}", peer_addr);
+
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
     while let Some(cmd) = read_command(&mut reader).await? {
+        println!("[conn] received command: {:?}", cmd);
+
         match cmd {
             Command::Ping => write_half.write_all(b"+PONG\r\n").await?,
             Command::Echo(value) => respond_bulk_string(&mut write_half, &value).await?,
@@ -36,7 +41,7 @@ async fn handle_connection(stream: TcpStream) -> io::Result<()> {
             }
             Command::Unknown(parts) => {
                 let joined = parts.join(" ");
-                let response = format!("-ERR unknown command '{}'\\r\\n", joined);
+                let response = format!("-ERR unknown command '{}'\r\n", joined);
                 write_half.write_all(response.as_bytes()).await?;
             }
         }
@@ -78,6 +83,7 @@ async fn read_resp_array(
     }
 
     let header = header.trim_end();
+    println!("[resp] header line: {:?}", header);
     if !header.starts_with('*') {
         return Ok(Some(vec![header.to_string()]));
     }
@@ -92,6 +98,7 @@ async fn read_resp_array(
         }
 
         let bulk_header = bulk_header.trim_end();
+        println!("[resp] bulk header line: {:?}", bulk_header);
         let Some(stripped) = bulk_header.strip_prefix('$') else {
             return Ok(None);
         };
@@ -104,9 +111,12 @@ async fn read_resp_array(
         let mut crlf = [0u8; 2];
         reader.read_exact(&mut crlf).await?;
 
-        parts.push(String::from_utf8_lossy(&buf).into_owned());
+        let value = String::from_utf8_lossy(&buf).into_owned();
+        println!("[resp] bulk value: {:?}", value);
+        parts.push(value);
     }
 
+    println!("[resp] parsed array parts: {:?}", parts);
     Ok(Some(parts))
 }
 
@@ -188,6 +198,34 @@ mod tests {
         let mut bulk_value = String::new();
         reader.read_line(&mut bulk_value).await.unwrap();
         assert_eq!(bulk_value, "hello\r\n");
+
+        shutdown.send(()).unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn continues_after_unknown_command() {
+        let (addr, shutdown, handle) = spawn_server().await;
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        write_half
+            .write_all(b"*2\r\n$7\r\nCOMMAND\r\n$4\r\nDOCS\r\n")
+            .await
+            .unwrap();
+
+        let mut error_line = String::new();
+        reader.read_line(&mut error_line).await.unwrap();
+        assert_eq!(error_line, "-ERR unknown command 'COMMAND DOCS'\r\n");
+
+        write_half
+            .write_all(b"*1\r\n$4\r\nPING\r\n")
+            .await
+            .unwrap();
+        let mut pong = String::new();
+        reader.read_line(&mut pong).await.unwrap();
+        assert_eq!(pong, "+PONG\r\n");
 
         shutdown.send(()).unwrap();
         handle.await.unwrap().unwrap();
