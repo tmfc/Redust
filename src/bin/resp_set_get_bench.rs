@@ -261,6 +261,34 @@ impl RespClient {
         }
         items
     }
+
+    async fn sdiff(&mut self, keys: &[&str]) -> Vec<String> {
+        let mut parts = Vec::with_capacity(1 + keys.len());
+        parts.push("SDIFF");
+        parts.extend_from_slice(keys);
+        self.send_array(&parts).await;
+
+        // 读取 array header
+        let mut header = String::new();
+        self.reader.read_line(&mut header).await.unwrap();
+        if !header.starts_with('*') || !header.ends_with("\r\n") {
+            panic!("unexpected SDIFF header: {:?}", header);
+        }
+        let len_str = &header[1..header.len() - 2];
+        let len: usize = len_str
+            .parse()
+            .unwrap_or_else(|e| panic!("invalid SDIFF array len {:?}: {}", header, e));
+
+        let mut items = Vec::with_capacity(len);
+        for _ in 0..len {
+            if let Some(v) = self.read_bulk().await {
+                items.push(v);
+            } else {
+                panic!("SDIFF returned nil bulk inside array");
+            }
+        }
+        items
+    }
 }
 
 async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
@@ -576,6 +604,61 @@ async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
             println!("[bench] total ops: {}", total_ops as u64);
             println!("[bench] ops/sec: {:.2}", qps);
         }
+        "set_difference" => {
+            // 功能校验：SDIFF 行为
+            client.del(&["bench_sd_1", "bench_sd_2"]).await;
+
+            client
+                .send_array(&["SADD", "bench_sd_1", "a", "b", "c"])
+                .await;
+            let _ = client.read_simple_line().await; // :3
+
+            client
+                .send_array(&["SADD", "bench_sd_2", "b", "d"])
+                .await;
+            let _ = client.read_simple_line().await; // :2
+
+            let mut items = client.sdiff(&["bench_sd_1", "bench_sd_2"]).await;
+            items.sort();
+            if items != vec!["a".to_string(), "c".to_string()] {
+                panic!("unexpected SDIFF items: {:?}", items);
+            }
+
+            // SDIFF 回环性能测试：不断往第一个集合追加元素，并与第二个集合做差集
+            let base1 = "bench_sd_loop_1";
+            let base2 = "bench_sd_loop_2";
+            client.del(&[base1, base2]).await;
+
+            client
+                .send_array(&["SADD", base1, "x", "y", "z"])
+                .await;
+            let _ = client.read_simple_line().await;
+            client
+                .send_array(&["SADD", base2, "y"])
+                .await;
+            let _ = client.read_simple_line().await;
+
+            let start = std::time::Instant::now();
+            for i in 0..iterations {
+                let v = format!("v{}", i);
+
+                client
+                    .send_array(&["SADD", base1, &v])
+                    .await;
+                let _ = client.read_simple_line().await;
+
+                let _ = client.sdiff(&[base1, base2]).await;
+            }
+            let elapsed = start.elapsed();
+
+            let total_ops = (iterations * 2) as f64; // 每轮一次 SADD + 一次 SDIFF
+            let secs = elapsed.as_secs_f64();
+            let qps = if secs > 0.0 { total_ops / secs } else { 0.0 };
+
+            println!("[bench] total time: {:?}", elapsed);
+            println!("[bench] total ops: {}", total_ops as u64);
+            println!("[bench] ops/sec: {:.2}", qps);
+        }
         other => {
             panic!("unknown bench group: {}", other);
         }
@@ -634,6 +717,7 @@ async fn main() {
             "list_pops",
             "set_union",
             "set_intersection",
+            "set_difference",
         ] {
             println!("[bench] ==== group: {} ====", g);
             run_group(&mut client, g, iterations).await;

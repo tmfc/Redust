@@ -363,4 +363,35 @@ impl Storage {
         members.sort();
         members
     }
+
+    pub fn sdiff(&self, keys: &[String]) -> Vec<String> {
+        let guard = match self.inner.read() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+
+        if keys.is_empty() {
+            return Vec::new();
+        }
+
+        let first_key = &keys[0];
+        let first_set = match guard.sets.get(first_key) {
+            Some(set) => set,
+            None => return Vec::new(),
+        };
+
+        let mut result: HashSet<String> = first_set.iter().cloned().collect();
+
+        for key in &keys[1..] {
+            if let Some(set) = guard.sets.get(key) {
+                for member in set.iter() {
+                    result.remove(member);
+                }
+            }
+        }
+
+        let mut members: Vec<String> = result.into_iter().collect();
+        members.sort();
+        members
+    }
 }

@@ -147,6 +147,14 @@ async fn handle_connection(stream: TcpStream, storage: Storage) -> io::Result<()
                 }
                 write_half.write_all(response.as_bytes()).await?;
             }
+            Command::Sdiff { keys } => {
+                let members = storage.sdiff(&keys);
+                let mut response = format!("*{}\r\n", members.len());
+                for m in members {
+                    response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
+                }
+                write_half.write_all(response.as_bytes()).await?;
+            }
             Command::Type { key } => {
                 let t = storage.type_of(&key);
                 let response = format!("+{}\r\n", t);

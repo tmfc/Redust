@@ -160,6 +160,108 @@ async fn responds_to_basic_commands() {
 }
 
 #[tokio::test]
+async fn sets_difference_behaviour() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // SADD set1 a b c
+    write_half
+        .write_all(b"*5\r\n$4\r\nSADD\r\n$4\r\nset1\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n")
+        .await
+        .unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":3\r\n");
+
+    // SADD set2 b d
+    write_half
+        .write_all(b"*4\r\n$4\r\nSADD\r\n$4\r\nset2\r\n$1\r\nb\r\n$1\r\nd\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":2\r\n");
+
+    // SDIFF set1 set2 -> [a, c]
+    write_half
+        .write_all(b"*3\r\n$5\r\nSDIFF\r\n$4\r\nset1\r\n$4\r\nset2\r\n")
+        .await
+        .unwrap();
+
+    let mut header = String::new();
+    reader.read_line(&mut header).await.unwrap();
+    assert_eq!(header, "*2\r\n");
+
+    let mut bulk_header = String::new();
+    let mut value = String::new();
+    let mut members = Vec::new();
+    for _ in 0..2 {
+        bulk_header.clear();
+        value.clear();
+        reader.read_line(&mut bulk_header).await.unwrap();
+        reader.read_line(&mut value).await.unwrap();
+        assert_eq!(bulk_header, "$1\r\n");
+        members.push(value.trim_end_matches("\r\n").to_string());
+    }
+    members.sort();
+    assert_eq!(members, vec!["a".to_string(), "c".to_string()]);
+
+    // SDIFF set2 set1 -> [d]
+    write_half
+        .write_all(b"*3\r\n$5\r\nSDIFF\r\n$4\r\nset2\r\n$4\r\nset1\r\n")
+        .await
+        .unwrap();
+
+    header.clear();
+    reader.read_line(&mut header).await.unwrap();
+    assert_eq!(header, "*1\r\n");
+
+    bulk_header.clear();
+    value.clear();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(bulk_header, "$1\r\n");
+    assert_eq!(value, "d\r\n");
+
+    // SDIFF set1 missing -> [a, b, c]
+    write_half
+        .write_all(b"*3\r\n$5\r\nSDIFF\r\n$4\r\nset1\r\n$7\r\nmissing\r\n")
+        .await
+        .unwrap();
+
+    header.clear();
+    reader.read_line(&mut header).await.unwrap();
+    assert_eq!(header, "*3\r\n");
+
+    members.clear();
+    for _ in 0..3 {
+        bulk_header.clear();
+        value.clear();
+        reader.read_line(&mut bulk_header).await.unwrap();
+        reader.read_line(&mut value).await.unwrap();
+        assert_eq!(bulk_header, "$1\r\n");
+        members.push(value.trim_end_matches("\r\n").to_string());
+    }
+    members.sort();
+    assert_eq!(members, vec!["a", "b", "c"]);
+
+    // SDIFF missing set1 -> empty array
+    write_half
+        .write_all(b"*3\r\n$5\r\nSDIFF\r\n$7\r\nmissing\r\n$4\r\nset1\r\n")
+        .await
+        .unwrap();
+
+    header.clear();
+    reader.read_line(&mut header).await.unwrap();
+    assert_eq!(header, "*0\r\n");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn lists_lrange_boundaries() {
     let (addr, shutdown, handle) = spawn_server().await;
     let stream = TcpStream::connect(addr).await.unwrap();

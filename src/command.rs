@@ -27,6 +27,7 @@ pub enum Command {
     Sismember { key: String, member: String },
     Sunion { keys: Vec<String> },
     Sinter { keys: Vec<String> },
+    Sdiff { keys: Vec<String> },
     Unknown(Vec<String>),
 }
 
@@ -211,6 +212,14 @@ pub async fn read_command(
                 Command::Unknown(vec![command])
             } else {
                 Command::Sinter { keys }
+            }
+        }
+        "SDIFF" => {
+            let keys: Vec<String> = iter.collect();
+            if keys.is_empty() {
+                Command::Unknown(vec![command])
+            } else {
+                Command::Sdiff { keys }
             }
         }
         _ => Command::Unknown(std::iter::once(command).chain(iter).collect()),
