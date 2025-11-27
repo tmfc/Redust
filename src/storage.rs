@@ -1,10 +1,11 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 
 #[derive(Default)]
 struct Inner {
     strings: HashMap<String, String>,
     lists: HashMap<String, VecDeque<String>>,
+    sets: HashMap<String, HashSet<String>>,
 }
 
 #[derive(Clone, Default)]
@@ -39,6 +40,9 @@ impl Storage {
                     if inner.lists.remove(key).is_some() {
                         deleted = true;
                     }
+                    if inner.sets.remove(key).is_some() {
+                        deleted = true;
+                    }
                     if deleted {
                         removed += 1;
                     }
@@ -55,7 +59,9 @@ impl Storage {
                 .iter()
                 .filter(|k| {
                     let k = k.as_str();
-                    inner.strings.contains_key(k) || inner.lists.contains_key(k)
+                    inner.strings.contains_key(k)
+                        || inner.lists.contains_key(k)
+                        || inner.sets.contains_key(k)
                 })
                 .count(),
             Err(_) => 0,
@@ -92,6 +98,8 @@ impl Storage {
                     "string".to_string()
                 } else if inner.lists.contains_key(key) {
                     "list".to_string()
+                } else if inner.sets.contains_key(key) {
+                    "set".to_string()
                 } else {
                     "none".to_string()
                 }
@@ -109,6 +117,7 @@ impl Storage {
                         .strings
                         .keys()
                         .chain(inner.lists.keys())
+                        .chain(inner.sets.keys())
                         .cloned()
                         .collect();
                     all.sort();
@@ -116,7 +125,10 @@ impl Storage {
                     all
                 } else {
                     let mut result = Vec::new();
-                    if inner.strings.contains_key(pattern) || inner.lists.contains_key(pattern) {
+                    if inner.strings.contains_key(pattern)
+                        || inner.lists.contains_key(pattern)
+                        || inner.sets.contains_key(pattern)
+                    {
                         result.push(pattern.to_string());
                     }
                     result
@@ -196,5 +208,75 @@ impl Storage {
             .take(end_idx - start_idx + 1)
             .cloned()
             .collect()
+    }
+
+    pub fn sadd(&self, key: &str, members: &[String]) -> usize {
+        let mut guard = match self.inner.write() {
+            Ok(g) => g,
+            Err(_) => return 0,
+        };
+
+        let set = guard.sets.entry(key.to_string()).or_insert_with(HashSet::new);
+        let mut added = 0;
+        for m in members {
+            if set.insert(m.clone()) {
+                added += 1;
+            }
+        }
+        added
+    }
+
+    pub fn srem(&self, key: &str, members: &[String]) -> usize {
+        let mut guard = match self.inner.write() {
+            Ok(g) => g,
+            Err(_) => return 0,
+        };
+
+        let Some(set) = guard.sets.get_mut(key) else {
+            return 0;
+        };
+
+        let mut removed = 0;
+        for m in members {
+            if set.remove(m) {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    pub fn smembers(&self, key: &str) -> Vec<String> {
+        let guard = match self.inner.read() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+
+        let Some(set) = guard.sets.get(key) else {
+            return Vec::new();
+        };
+
+        let mut members: Vec<String> = set.iter().cloned().collect();
+        members.sort();
+        members
+    }
+
+    pub fn scard(&self, key: &str) -> usize {
+        let guard = match self.inner.read() {
+            Ok(g) => g,
+            Err(_) => return 0,
+        };
+        guard.sets.get(key).map(|s| s.len()).unwrap_or(0)
+    }
+
+    pub fn sismember(&self, key: &str, member: &str) -> bool {
+        let guard = match self.inner.read() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        guard
+            .sets
+            .get(key)
+            .map(|s| s.contains(member))
+            .unwrap_or(false)
     }
 }

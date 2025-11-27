@@ -89,6 +89,34 @@ async fn handle_connection(stream: TcpStream, storage: Storage) -> io::Result<()
                 }
                 write_half.write_all(response.as_bytes()).await?;
             }
+            Command::Sadd { key, members } => {
+                let added = storage.sadd(&key, &members);
+                let response = format!(":{}\r\n", added);
+                write_half.write_all(response.as_bytes()).await?;
+            }
+            Command::Srem { key, members } => {
+                let removed = storage.srem(&key, &members);
+                let response = format!(":{}\r\n", removed);
+                write_half.write_all(response.as_bytes()).await?;
+            }
+            Command::Smembers { key } => {
+                let members = storage.smembers(&key);
+                let mut response = format!("*{}\r\n", members.len());
+                for m in members {
+                    response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
+                }
+                write_half.write_all(response.as_bytes()).await?;
+            }
+            Command::Scard { key } => {
+                let card = storage.scard(&key);
+                let response = format!(":{}\r\n", card);
+                write_half.write_all(response.as_bytes()).await?;
+            }
+            Command::Sismember { key, member } => {
+                let is_member = storage.sismember(&key, &member);
+                let response = if is_member { ":1\r\n" } else { ":0\r\n" };
+                write_half.write_all(response.as_bytes()).await?;
+            }
             Command::Type { key } => {
                 let t = storage.type_of(&key);
                 let response = format!("+{}\r\n", t);

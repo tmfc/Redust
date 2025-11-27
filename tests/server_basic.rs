@@ -160,6 +160,99 @@ async fn responds_to_basic_commands() {
 }
 
 #[tokio::test]
+async fn sets_basic_behaviour() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // SADD myset a b a -> 2
+    write_half
+        .write_all(b"*5\r\n$4\r\nSADD\r\n$5\r\nmyset\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\na\r\n")
+        .await
+        .unwrap();
+    let mut sadd_resp = String::new();
+    reader.read_line(&mut sadd_resp).await.unwrap();
+    assert_eq!(sadd_resp, ":2\r\n");
+
+    // SCARD myset -> 2
+    write_half
+        .write_all(b"*2\r\n$5\r\nSCARD\r\n$5\r\nmyset\r\n")
+        .await
+        .unwrap();
+    let mut scard_resp = String::new();
+    reader.read_line(&mut scard_resp).await.unwrap();
+    assert_eq!(scard_resp, ":2\r\n");
+
+    // SISMEMBER myset a -> 1
+    write_half
+        .write_all(b"*3\r\n$9\r\nSISMEMBER\r\n$5\r\nmyset\r\n$1\r\na\r\n")
+        .await
+        .unwrap();
+    let mut sismem_a = String::new();
+    reader.read_line(&mut sismem_a).await.unwrap();
+    assert_eq!(sismem_a, ":1\r\n");
+
+    // SISMEMBER myset c -> 0
+    write_half
+        .write_all(b"*3\r\n$9\r\nSISMEMBER\r\n$5\r\nmyset\r\n$1\r\nc\r\n")
+        .await
+        .unwrap();
+    let mut sismem_c = String::new();
+    reader.read_line(&mut sismem_c).await.unwrap();
+    assert_eq!(sismem_c, ":0\r\n");
+
+    // SMEMBERS myset -> [a, b] (order not guaranteed, but we sorted in storage)
+    write_half
+        .write_all(b"*2\r\n$8\r\nSMEMBERS\r\n$5\r\nmyset\r\n")
+        .await
+        .unwrap();
+    let mut arr_header = String::new();
+    reader.read_line(&mut arr_header).await.unwrap();
+    assert_eq!(arr_header, "*2\r\n");
+
+    let mut bulk_header = String::new();
+    let mut value = String::new();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(bulk_header, "$1\r\n");
+    let first = value.trim_end_matches("\r\n").to_string();
+
+    bulk_header.clear();
+    value.clear();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(bulk_header, "$1\r\n");
+    let second = value.trim_end_matches("\r\n").to_string();
+
+    // Members should be exactly a and b in some order
+    let mut members = vec![first, second];
+    members.sort();
+    assert_eq!(members, vec!["a".to_string(), "b".to_string()]);
+
+    // SREM myset a -> 1
+    write_half
+        .write_all(b"*3\r\n$4\r\nSREM\r\n$5\r\nmyset\r\n$1\r\na\r\n")
+        .await
+        .unwrap();
+    let mut srem_resp = String::new();
+    reader.read_line(&mut srem_resp).await.unwrap();
+    assert_eq!(srem_resp, ":1\r\n");
+
+    // SCARD myset -> 1
+    write_half
+        .write_all(b"*2\r\n$5\r\nSCARD\r\n$5\r\nmyset\r\n")
+        .await
+        .unwrap();
+    scard_resp.clear();
+    reader.read_line(&mut scard_resp).await.unwrap();
+    assert_eq!(scard_resp, ":1\r\n");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn lists_basic_behaviour() {
     let (addr, shutdown, handle) = spawn_server().await;
     let stream = TcpStream::connect(addr).await.unwrap();

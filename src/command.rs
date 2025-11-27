@@ -18,6 +18,11 @@ pub enum Command {
     Lpush { key: String, values: Vec<String> },
     Rpush { key: String, values: Vec<String> },
     Lrange { key: String, start: isize, stop: isize },
+    Sadd { key: String, members: Vec<String> },
+    Srem { key: String, members: Vec<String> },
+    Smembers { key: String },
+    Scard { key: String },
+    Sismember { key: String, member: String },
     Unknown(Vec<String>),
 }
 
@@ -132,6 +137,49 @@ pub async fn read_command(
                 return Ok(Some(Command::Unknown(std::iter::once(command).chain(std::iter::once(key)).chain(std::iter::once(start_s)).chain(std::iter::once(stop_s)).chain(iter).collect())));
             };
             Command::Lrange { key, start, stop }
+        }
+        "SADD" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Unknown(std::iter::once(command).chain(iter).collect())));
+            };
+            let members: Vec<String> = iter.collect();
+            if members.is_empty() {
+                Command::Unknown(vec![command, key])
+            } else {
+                Command::Sadd { key, members }
+            }
+        }
+        "SREM" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Unknown(std::iter::once(command).chain(iter).collect())));
+            };
+            let members: Vec<String> = iter.collect();
+            if members.is_empty() {
+                Command::Unknown(vec![command, key])
+            } else {
+                Command::Srem { key, members }
+            }
+        }
+        "SMEMBERS" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Unknown(std::iter::once(command).chain(iter).collect())));
+            };
+            Command::Smembers { key }
+        }
+        "SCARD" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Unknown(std::iter::once(command).chain(iter).collect())));
+            };
+            Command::Scard { key }
+        }
+        "SISMEMBER" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Unknown(std::iter::once(command).chain(iter).collect())));
+            };
+            let Some(member) = iter.next() else {
+                return Ok(Some(Command::Unknown(std::iter::once(command).chain(std::iter::once(key)).chain(iter).collect())));
+            };
+            Command::Sismember { key, member }
         }
         _ => Command::Unknown(std::iter::once(command).chain(iter).collect()),
     };
@@ -272,6 +320,72 @@ mod tests {
             }
         } else {
             panic!("expected LRANGE command");
+        }
+
+        client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn parses_set_commands() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            // SADD myset a b
+            stream
+                .write_all(b"*4\r\n$4\r\nSADD\r\n$5\r\nmyset\r\n$1\r\na\r\n$1\r\nb\r\n")
+                .await
+                .unwrap();
+            // SCARD myset
+            stream
+                .write_all(b"*2\r\n$5\r\nSCARD\r\n$5\r\nmyset\r\n")
+                .await
+                .unwrap();
+            // SISMEMBER myset a
+            stream
+                .write_all(b"*3\r\n$9\r\nSISMEMBER\r\n$5\r\nmyset\r\n$1\r\na\r\n")
+                .await
+                .unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read_half, _) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        if let Some(cmd) = read_command(&mut reader).await.unwrap() {
+            match cmd {
+                Command::Sadd { key, members } => {
+                    assert_eq!(key, "myset");
+                    assert_eq!(members, vec!["a".to_string(), "b".to_string()]);
+                }
+                _ => panic!("expected SADD"),
+            }
+        } else {
+            panic!("expected SADD command");
+        }
+
+        if let Some(cmd) = read_command(&mut reader).await.unwrap() {
+            match cmd {
+                Command::Scard { key } => {
+                    assert_eq!(key, "myset");
+                }
+                _ => panic!("expected SCARD"),
+            }
+        } else {
+            panic!("expected SCARD command");
+        }
+
+        if let Some(cmd) = read_command(&mut reader).await.unwrap() {
+            match cmd {
+                Command::Sismember { key, member } => {
+                    assert_eq!(key, "myset");
+                    assert_eq!(member, "a");
+                }
+                _ => panic!("expected SISMEMBER"),
+            }
+        } else {
+            panic!("expected SISMEMBER command");
         }
 
         client.await.unwrap();
