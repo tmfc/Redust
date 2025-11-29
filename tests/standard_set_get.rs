@@ -100,6 +100,104 @@ async fn standard_set_get_roundtrip() {
 }
 
 #[tokio::test]
+async fn pexpire_and_pttl_roundtrip() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let mut client = TestClient::connect(addr).await;
+
+    // SET foo bar
+    client.set("foo", "bar").await;
+
+    // PEXPIRE foo 500
+    client.send_array(&["PEXPIRE", "foo", "500"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, ":1\r\n");
+
+    // 立刻 PTTL foo，应返回非负值
+    client.send_array(&["PTTL", "foo"]).await;
+    let pttl_line = client.read_simple_line().await;
+    assert!(pttl_line.starts_with(":"));
+
+    // 等待超过 500ms 后，key 应该过期
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    let v = client.get("foo").await;
+    assert_eq!(v, None);
+
+    client.send_array(&["PTTL", "foo"]).await;
+    let pttl_after = client.read_simple_line().await;
+    assert_eq!(pttl_after, ":-2\r\n");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn persist_clears_expiration() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let mut client = TestClient::connect(addr).await;
+
+    // SET foo bar EX 10
+    client
+        .send_array(&["SET", "foo", "bar", "EX", "10"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "+OK\r\n");
+
+    // TTL foo 应为非负
+    client.send_array(&["TTL", "foo"]).await;
+    let ttl_before = client.read_simple_line().await;
+    assert!(ttl_before.starts_with(":"));
+
+    // PERSIST foo -> 1
+    client.send_array(&["PERSIST", "foo"]).await;
+    let persist_resp = client.read_simple_line().await;
+    assert_eq!(persist_resp, ":1\r\n");
+
+    // 现在 TTL foo -> -1（存在但无过期）
+    client.send_array(&["TTL", "foo"]).await;
+    let ttl_after = client.read_simple_line().await;
+    assert_eq!(ttl_after, ":-1\r\n");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn ttl_and_expire_roundtrip() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let mut client = TestClient::connect(addr).await;
+
+    // SET foo bar EX 1
+    client
+        .send_array(&["SET", "foo", "bar", "EX", "1"]) // 1 秒过期
+        .await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "+OK\r\n");
+
+    // 立即 TTL foo，应该 >=0
+    client.send_array(&["TTL", "foo"]).await;
+    let ttl_line = client.read_simple_line().await;
+    assert!(ttl_line.starts_with(":"));
+
+    // 等待超过 1 秒后，key 应该过期
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    // GET foo -> nil
+    let v = client.get("foo").await;
+    assert_eq!(v, None);
+
+    // TTL foo -> -2
+    client.send_array(&["TTL", "foo"]).await;
+    let ttl_after = client.read_simple_line().await;
+    assert_eq!(ttl_after, ":-2\r\n");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn standard_set_overwrite() {
     let (addr, shutdown, handle) = spawn_server().await;
 

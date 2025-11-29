@@ -160,6 +160,47 @@ async fn responds_to_basic_commands() {
 }
 
 #[tokio::test]
+async fn info_basic_fields() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    write_half
+        .write_all(b"*1\r\n$4\r\nINFO\r\n")
+        .await
+        .unwrap();
+
+    let mut buf = String::new();
+    // 读取若干行，直到 EOF 或已经包含我们关心的 Keyspace 行
+    for _ in 0..32 {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        buf.push_str(&line);
+        if line.starts_with("db0:keys=") {
+            break;
+        }
+    }
+
+    assert!(buf.contains("# Server"));
+    assert!(buf.contains("redust_version:"));
+    assert!(buf.contains("tcp_port:"));
+    assert!(buf.contains("uptime_in_seconds:"));
+    assert!(buf.contains("# Clients"));
+    assert!(buf.contains("connected_clients:"));
+    assert!(buf.contains("# Stats"));
+    assert!(buf.contains("total_commands_processed:"));
+    assert!(buf.contains("# Keyspace"));
+    assert!(buf.contains("db0:keys="));
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn sets_difference_behaviour() {
     let (addr, shutdown, handle) = spawn_server().await;
     let stream = TcpStream::connect(addr).await.unwrap();

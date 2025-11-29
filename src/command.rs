@@ -34,7 +34,11 @@ pub enum Command {
     Ping,
     Echo(String),
     Quit,
-    Set { key: String, value: String },
+    Set {
+        key: String,
+        value: String,
+        expire_millis: Option<i64>,
+    },
     Get { key: String },
     Del { keys: Vec<String> },
     Exists { keys: Vec<String> },
@@ -55,6 +59,12 @@ pub enum Command {
     Sunion { keys: Vec<String> },
     Sinter { keys: Vec<String> },
     Sdiff { keys: Vec<String> },
+    Expire { key: String, seconds: i64 },
+    Pexpire { key: String, millis: i64 },
+    Ttl { key: String },
+    Pttl { key: String },
+    Persist { key: String },
+    Info,
     Unknown(Vec<String>),
     /// Represents an error that should be sent back to the client.
     Error(String),
@@ -102,10 +112,43 @@ pub async fn read_command(
             let Some(value) = iter.next() else {
                 return Ok(Some(Command::Error("ERR wrong number of arguments for 'set' command".to_string())));
             };
-            if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'set' command".to_string())));
+            // 解析可选参数，目前只支持 EX seconds / PX milliseconds，忽略大小写
+            let mut expire_millis: Option<i64> = None;
+
+            while let Some(opt) = iter.next() {
+                let opt_upper = opt.to_ascii_uppercase();
+                match opt_upper.as_str() {
+                    "EX" => {
+                        let Some(sec_str) = iter.next() else {
+                            return Ok(Some(Command::Error("ERR syntax error".to_string())));
+                        };
+                        let Ok(sec) = sec_str.parse::<i64>() else {
+                            return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+                        };
+                        if sec < 0 {
+                            return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+                        }
+                        expire_millis = Some(sec.saturating_mul(1000));
+                    }
+                    "PX" => {
+                        let Some(ms_str) = iter.next() else {
+                            return Ok(Some(Command::Error("ERR syntax error".to_string())));
+                        };
+                        let Ok(ms) = ms_str.parse::<i64>() else {
+                            return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+                        };
+                        if ms < 0 {
+                            return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+                        }
+                        expire_millis = Some(ms);
+                    }
+                    _ => {
+                        return Ok(Some(Command::Error("ERR syntax error".to_string())));
+                    }
+                }
             }
-            Command::Set { key, value }
+
+            Command::Set { key, value, expire_millis }
         }
         "GET" => {
             let Some(key) = iter.next() else {
@@ -295,6 +338,69 @@ pub async fn read_command(
                 return Ok(Some(Command::Error("ERR wrong number of arguments for 'sdiff' command".to_string())));
             }
             Command::Sdiff { keys }
+        }
+        "EXPIRE" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'expire' command".to_string())));
+            };
+            let Some(sec_str) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'expire' command".to_string())));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'expire' command".to_string())));
+            }
+            let Ok(seconds) = sec_str.parse::<i64>() else {
+                return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+            };
+            Command::Expire { key, seconds }
+        }
+        "PEXPIRE" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'pexpire' command".to_string())));
+            };
+            let Some(ms_str) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'pexpire' command".to_string())));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'pexpire' command".to_string())));
+            }
+            let Ok(millis) = ms_str.parse::<i64>() else {
+                return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+            };
+            Command::Pexpire { key, millis }
+        }
+        "TTL" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'ttl' command".to_string())));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'ttl' command".to_string())));
+            }
+            Command::Ttl { key }
+        }
+        "PTTL" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'pttl' command".to_string())));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'pttl' command".to_string())));
+            }
+            Command::Pttl { key }
+        }
+        "PERSIST" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'persist' command".to_string())));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'persist' command".to_string())));
+            }
+            Command::Persist { key }
+        }
+        "INFO" => {
+            if iter.next().is_some() {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'info' command".to_string())));
+            }
+            Command::Info
         }
         _ => Command::Unknown(std::iter::once(command).chain(iter).collect()),
     };

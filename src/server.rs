@@ -1,4 +1,6 @@
 use std::future::Future;
+use std::sync::{Arc, atomic::{AtomicU64, AtomicUsize, Ordering}};
+use std::time::Instant;
 
 use tokio::io::{self, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -7,9 +9,18 @@ use crate::command::{read_command, Command, CommandError}; // Import CommandErro
 use crate::resp::respond_bulk_string;
 use crate::storage::Storage;
 
-async fn handle_connection(stream: TcpStream, storage: Storage) -> io::Result<()> {
+struct Metrics {
+    start_time: Instant,
+    connected_clients: AtomicUsize,
+    total_commands: AtomicU64,
+    tcp_port: u16,
+}
+
+async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Metrics>) -> io::Result<()> {
     let peer_addr = stream.peer_addr().ok();
     println!("[conn] new connection from {:?}", peer_addr);
+
+    metrics.connected_clients.fetch_add(1, Ordering::Relaxed);
 
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -32,6 +43,8 @@ async fn handle_connection(stream: TcpStream, storage: Storage) -> io::Result<()
             }
         };
 
+        metrics.total_commands.fetch_add(1, Ordering::Relaxed);
+
         println!("[conn] received command: {:?}", cmd);
 
         match cmd {
@@ -41,8 +54,11 @@ async fn handle_connection(stream: TcpStream, storage: Storage) -> io::Result<()
                 write_half.write_all(b"+OK\r\n").await?;
                 break;
             }
-            Command::Set { key, value } => {
-                storage.set(key, value);
+            Command::Set { key, value, expire_millis } => {
+                storage.set(key.clone(), value);
+                if let Some(ms) = expire_millis {
+                    storage.expire_millis(&key, ms);
+                }
                 write_half.write_all(b"+OK\r\n").await?;
             }
             Command::Get { key } => {
@@ -172,6 +188,52 @@ async fn handle_connection(stream: TcpStream, storage: Storage) -> io::Result<()
                 }
                 write_half.write_all(response.as_bytes()).await?;
             }
+            Command::Expire { key, seconds } => {
+                let res = storage.expire_seconds(&key, seconds);
+                let response = if res { ":1\r\n" } else { ":0\r\n" };
+                write_half.write_all(response.as_bytes()).await?;
+            }
+            Command::Pexpire { key, millis } => {
+                let res = storage.expire_millis(&key, millis);
+                let response = if res { ":1\r\n" } else { ":0\r\n" };
+                write_half.write_all(response.as_bytes()).await?;
+            }
+            Command::Ttl { key } => {
+                let ttl = storage.ttl_seconds(&key);
+                let response = format!(":{}\r\n", ttl);
+                write_half.write_all(response.as_bytes()).await?;
+            }
+            Command::Pttl { key } => {
+                let ttl = storage.pttl_millis(&key);
+                let response = format!(":{}\r\n", ttl);
+                write_half.write_all(response.as_bytes()).await?;
+            }
+            Command::Persist { key } => {
+                let changed = storage.persist(&key);
+                let response = if changed { ":1\r\n" } else { ":0\r\n" };
+                write_half.write_all(response.as_bytes()).await?;
+            }
+            Command::Info => {
+                let uptime = Instant::now().duration_since(metrics.start_time).as_secs();
+                let connected = metrics.connected_clients.load(Ordering::Relaxed);
+                let total_cmds = metrics.total_commands.load(Ordering::Relaxed);
+                let keys = storage.keys("*").len();
+
+                let mut info = String::new();
+                info.push_str("# Server\r\n");
+                info.push_str(&format!("redust_version:0.1.0\r\n"));
+                info.push_str(&format!("tcp_port:{}\r\n", metrics.tcp_port));
+                info.push_str(&format!("uptime_in_seconds:{}\r\n", uptime));
+                info.push_str("\r\n# Clients\r\n");
+                info.push_str(&format!("connected_clients:{}\r\n", connected));
+                info.push_str("\r\n# Stats\r\n");
+                info.push_str(&format!("total_commands_processed:{}\r\n", total_cmds));
+                info.push_str("\r\n# Keyspace\r\n");
+                info.push_str(&format!("db0:keys={}\r\n", keys));
+                info.push_str("\r\n");
+
+                respond_bulk_string(&mut write_half, &info).await?;
+            }
             Command::Type { key } => {
                 let t = storage.type_of(&key);
                 let response = format!("+{}\r\n", t);
@@ -197,6 +259,8 @@ async fn handle_connection(stream: TcpStream, storage: Storage) -> io::Result<()
         }
     }
 
+    metrics.connected_clients.fetch_sub(1, Ordering::Relaxed);
+
     Ok(())
 }
 
@@ -204,16 +268,28 @@ pub async fn serve(
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send,
 ) -> io::Result<()> {
+    let local_addr = listener.local_addr()?;
+    let port = local_addr.port();
+
     let storage = Storage::default();
+    storage.spawn_expiration_task();
+
+    let metrics = Arc::new(Metrics {
+        start_time: Instant::now(),
+        connected_clients: AtomicUsize::new(0),
+        total_commands: AtomicU64::new(0),
+        tcp_port: port,
+    });
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
             res = listener.accept() => {
                 let (stream, addr) = res?;
                 let storage = storage.clone();
+                let metrics = metrics.clone();
                 println!("Accepted connection from {}", addr);
                 tokio::spawn(async move {
-                    if let Err(err) = handle_connection(stream, storage).await {
+                    if let Err(err) = handle_connection(stream, storage, metrics).await {
                         eprintln!("Connection error: {}", err);
                     }
                 });
