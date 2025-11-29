@@ -33,9 +33,25 @@
     - 未过期：返回 bulk string。
     - 过期/不存在：返回 `$-1`。
 
-- [x] **INCR / DECR**
-  - 当前：字符串自增自减，非整数时报错，与 Redis 语义接近。
-  - TODO：后续可考虑 INCRBY / DECRBY / INCRBYFLOAT 等扩展命令。
+- [x] **INCR / DECR / INCRBY / DECRBY**
+  - 当前：
+    - `INCR` / `DECR`：基于字符串整数值 +1 / -1，非整数或溢出时报 `-ERR value is not an integer or out of range`。
+    - `INCRBY key delta` / `DECRBY key delta`：在上述语义基础上支持带步长的自增/自减，delta 为 `i64`，错误语义同上。
+    - 不存在的 key 视为 `0` 再进行运算。
+  - TODO：后续可考虑 `INCRBYFLOAT` 等扩展命令。
+
+- [x] **MSET key value [key value ...] / MGET key [key ...]**
+  - 当前：
+    - `MSET`：要求参数个数为偶数且 >= 2，原子性简化为“要么全部 set，要么参数错误直接报错不写入”；成功返回 `+OK`。
+    - `MGET`：对每个 key 独立调用当前 `GET` 语义，组成数组返回；不存在或类型不匹配的 key 返回 `nil`。
+
+- [x] **SETNX / SETEX / PSETEX**
+  - 当前：
+    - `SETNX key value`：当 key 不存在或已过期时写入并返回 `:1`，否则不变并返回 `:0`。
+    - `SETEX key seconds value`：等价 `SET key value` + `EXPIRE key seconds`，seconds 为非负整数，错误时返回整数错误。
+    - `PSETEX key milliseconds value`：等价 `SET key value` + `PEXPIRE key milliseconds`，语义同上，单位为毫秒。
+  - TODO：
+    - 与带 EX/PX 的 `SET` 高级选项打通统一语义。
 
 - [x] **DEL key [key ...]**
 - [x] **EXISTS key [key ...]**
@@ -74,6 +90,35 @@
 状态说明：
 - 多 key 运算在集合缺失/类型错误时的行为已经与 Redis 接近，并有针对性测试。
 - TODO：暂未实现 `SUNIONSTORE` / `SINTERSTORE` / `SDIFFSTORE` 等写入型命令。
+
+---
+
+## 哈希 Hash
+
+- [x] **HSET key field value**
+  - 当前：
+    - key 不存在或已过期：创建一个 Hash 并插入该 field，返回 `1`。
+    - key 已存在且为 Hash：如果是新 field 返回 `1`，覆盖已有 field 返回 `0`。
+    - key 存在但类型不是 Hash：当前实现返回 `0`，不修改值。
+
+- [x] **HGET key field**
+  - 当前：
+    - key 存在且为 Hash 且 field 存在：返回该 field 的 bulk string。
+    - 其他情况（key 不存在、过期、类型不对、field 不存在）：`$-1`。
+
+- [x] **HDEL key field [field ...]**
+  - 当前：删除指定 field，返回成功删除的 field 数量；key 不存在或类型不对时返回 `0`。
+
+- [x] **HEXISTS key field**
+  - 当前：field 存在且 key 为 Hash 时返回 `:1`，否则返回 `:0`。
+
+- [x] **HGETALL key**
+  - 当前：
+    - key 为 Hash：返回 `[field1, value1, field2, value2, ...]` 形式的数组（不保证顺序）。
+    - 其余情况返回空数组。
+
+状态说明：
+- Hash 键的过期语义与 String/List/Set 一致，统一由 `EXPIRE`/`PEXPIRE`/`TTL`/`PTTL`/`PERSIST` 管理。
 
 ---
 
@@ -191,27 +236,27 @@
 - [x] DECR
 - [ ] APPEND
 - [ ] GETSET
-- [ ] MGET
-- [ ] MSET
+- [x] MGET
+- [x] MSET
 - [ ] MSETNX
 - [ ] STRLEN
-- [ ] INCRBY
-- [ ] DECRBY
+- [x] INCRBY
+- [x] DECRBY
 - [ ] INCRBYFLOAT
-- [ ] SETEX
-- [ ] PSETEX
-- [ ] SETNX
+- [x] SETEX
+- [x] PSETEX
+- [x] SETNX
 - [ ] GETRANGE
 - [ ] SETRANGE
 - [ ] SUBSTR（已废弃，等价 GETRANGE）
 
 ### Hashes
 
-- [ ] HSET
-- [ ] HGET
-- [ ] HGETALL
-- [ ] HDEL
-- [ ] HEXISTS
+- [x] HSET
+- [x] HGET
+- [x] HGETALL
+- [x] HDEL
+- [x] HEXISTS
 - [ ] HINCRBY
 - [ ] HINCRBYFLOAT
 - [ ] HKEYS

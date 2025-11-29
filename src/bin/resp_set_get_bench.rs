@@ -84,6 +84,74 @@ impl RespClient {
         self.read_bulk().await
     }
 
+    async fn ping(&mut self) {
+        self.send_array(&["PING"]).await;
+        let line = self.read_simple_line().await;
+        if line != "+PONG\r\n" {
+            panic!("unexpected PING response: {:?}", line);
+        }
+    }
+
+    async fn mset(&mut self, pairs: &[(&str, &str)]) {
+        let mut parts = Vec::with_capacity(1 + pairs.len() * 2);
+        parts.push("MSET");
+        for (k, v) in pairs {
+            parts.push(k);
+            parts.push(v);
+        }
+        self.send_array(&parts).await;
+        let line = self.read_simple_line().await;
+        if line != "+OK\r\n" {
+            panic!("unexpected MSET response: {:?}", line);
+        }
+    }
+
+    async fn mget(&mut self, keys: &[&str]) -> Vec<Option<String>> {
+        let mut parts = Vec::with_capacity(1 + keys.len());
+        parts.push("MGET");
+        parts.extend_from_slice(keys);
+        self.send_array(&parts).await;
+
+        let mut header = String::new();
+        self.reader.read_line(&mut header).await.unwrap();
+        if !header.starts_with('*') || !header.ends_with("\r\n") {
+            panic!("unexpected MGET header: {:?}", header);
+        }
+        let len_str = &header[1..header.len() - 2];
+        let len: usize = len_str
+            .parse()
+            .unwrap_or_else(|e| panic!("invalid MGET array len {:?}: {}", header, e));
+
+        let mut items = Vec::with_capacity(len);
+        for _ in 0..len {
+            let mut bulk_header = String::new();
+            self.reader.read_line(&mut bulk_header).await.unwrap();
+            if bulk_header == "$-1\r\n" {
+                items.push(None);
+                continue;
+            }
+            if !bulk_header.starts_with('$') || !bulk_header.ends_with("\r\n") {
+                panic!("unexpected MGET bulk header: {:?}", bulk_header);
+            }
+            let len_str = &bulk_header[1..bulk_header.len() - 2];
+            let bulk_len: usize = len_str
+                .parse()
+                .unwrap_or_else(|e| panic!("invalid MGET bulk len {:?}: {}", bulk_header, e));
+
+            let mut value = String::new();
+            self.reader.read_line(&mut value).await.unwrap();
+            if value.len() != bulk_len + 2 {
+                panic!(
+                    "MGET bulk length mismatch: expected {}+CRLF, got {:?}",
+                    bulk_len, value
+                );
+            }
+            items.push(Some(value.trim_end_matches("\r\n").to_string()));
+        }
+
+        items
+    }
+
     async fn incr(&mut self, key: &str) -> i64 {
         self.send_array(&["INCR", key]).await;
         let line = self.read_simple_line().await;
@@ -293,6 +361,149 @@ impl RespClient {
 
 async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
     match group {
+        "ping" => {
+            // PING 语义校验
+            client.ping().await;
+
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                client.ping().await;
+            }
+            let elapsed = start.elapsed();
+            let total_ops = iterations as f64;
+            let secs = elapsed.as_secs_f64();
+            let qps = if secs > 0.0 { total_ops / secs } else { 0.0 };
+
+            println!("[bench][ping] total time: {:?}", elapsed);
+            println!("[bench][ping] total ops: {}", total_ops as u64);
+            println!("[bench][ping] ops/sec: {:.2}", qps);
+        }
+        "mset_mget" => {
+            // 功能校验：MSET/MGET
+            let pairs = [("bench_m1", "v1"), ("bench_m2", "v2")];
+            client.mset(&pairs).await;
+            let values = client.mget(&["bench_m1", "bench_m2", "bench_missing"]).await;
+            if values.len() != 3
+                || values[0].as_deref() != Some("v1")
+                || values[1].as_deref() != Some("v2")
+                || values[2].is_some()
+            {
+                panic!("unexpected MSET/MGET values: {:?}", values);
+            }
+
+            // 性能测试：固定大小批量 MSET/MGET
+            let keys: Vec<String> = (0..10)
+                .map(|i| format!("bench_mk:{}", i))
+                .collect();
+            let key_refs: Vec<&str> = keys.iter().map(|k| k.as_str()).collect();
+
+            let start = std::time::Instant::now();
+            for i in 0..iterations {
+                // 构造一次性 MSET 命令：MSET k0 v0 k1 v1 ...
+                let mut raw: Vec<String> = Vec::with_capacity(1 + key_refs.len() * 2);
+                raw.push("MSET".to_string());
+                for (idx, k) in key_refs.iter().enumerate() {
+                    let v = format!("v{}:{}", i, idx);
+                    raw.push((*k).to_string());
+                    raw.push(v);
+                }
+                let parts: Vec<&str> = raw.iter().map(|s| s.as_str()).collect();
+                client.send_array(&parts).await;
+                let line = client.read_simple_line().await;
+                if line != "+OK\r\n" {
+                    panic!("unexpected MSET response in loop: {:?}", line);
+                }
+
+                let _ = client.mget(&key_refs).await;
+            }
+            let elapsed = start.elapsed();
+
+            let total_ops = (iterations * 2) as f64; // 每轮一 MSET + 一 MGET
+            let secs = elapsed.as_secs_f64();
+            let qps = if secs > 0.0 { total_ops / secs } else { 0.0 };
+
+            println!("[bench][mset_mget] total time: {:?}", elapsed);
+            println!("[bench][mset_mget] total ops: {}", total_ops as u64);
+            println!("[bench][mset_mget] ops/sec: {:.2}", qps);
+        }
+        "hash_ops" => {
+            // 功能校验：HSET/HGET/HGETALL/HDEL
+            let key = "bench_hash";
+            client.del(&[key]).await;
+            client
+                .send_array(&["HSET", key, "field", "value"])
+                .await;
+            let _ = client.read_simple_line().await; // :1
+
+            client
+                .send_array(&["HSET", key, "field", "value2"])
+                .await;
+            let _ = client.read_simple_line().await; // :0
+
+            client
+                .send_array(&["HGET", key, "field"])
+                .await;
+            let v = client.read_bulk().await;
+            if v.as_deref() != Some("value2") {
+                panic!("unexpected HGET value: {:?}", v);
+            }
+
+            client
+                .send_array(&["HGETALL", key])
+                .await;
+            let mut header = String::new();
+            client.reader.read_line(&mut header).await.unwrap();
+            if header.trim_end() != "*2" {
+                panic!("unexpected HGETALL header: {:?}", header);
+            }
+            let f = client.read_bulk().await;
+            let v2 = client.read_bulk().await;
+            if f.as_deref() != Some("field") || v2.as_deref() != Some("value2") {
+                panic!("unexpected HGETALL pair: {:?} {:?}", f, v2);
+            }
+
+            client
+                .send_array(&["HDEL", key, "field"])
+                .await;
+            let del_line = client.read_simple_line().await;
+            if del_line.trim_end() != ":1" {
+                panic!("unexpected HDEL response: {:?}", del_line);
+            }
+
+            // 性能测试：同一个 Hash 上循环 HSET/HGET
+            let key = "bench_hash_loop";
+            client.del(&[key]).await;
+
+            let start = std::time::Instant::now();
+            for i in 0..iterations {
+                let field = format!("f{}", i % 16);
+                let value = format!("v{}", i);
+                client
+                    .send_array(&["HSET", key, &field, &value])
+                    .await;
+                let _ = client.read_simple_line().await;
+
+                client
+                    .send_array(&["HGET", key, &field])
+                    .await;
+                let got = client.read_bulk().await;
+                if got.as_deref() != Some(value.as_str()) {
+                    panic!(
+                        "unexpected HGET in loop: expected {:?}, got {:?}",
+                        value, got
+                    );
+                }
+            }
+            let elapsed = start.elapsed();
+
+            let total_ops = (iterations * 2) as f64; // 每轮 HSET + HGET
+            let secs = elapsed.as_secs_f64();
+            let qps = if secs > 0.0 { total_ops / secs } else { 0.0 };
+
+            println!("[bench][hash_ops] total time: {:?}", elapsed);
+            println!("[bench][hash_ops] total ops: {}", total_ops as u64);
+            println!("[bench][hash_ops] ops/sec: {:.2}", qps);
+        }
         "set_get" => {
             // 先做一次功能校验，确保两端语义一致
             client.set("bench_foo", "bar").await;
@@ -710,6 +921,9 @@ async fn main() {
 
     if group == "all" {
         for g in [
+            "ping",
+            "mset_mget",
+            "hash_ops",
             "set_get",
             "incr_decr",
             "exists_del",

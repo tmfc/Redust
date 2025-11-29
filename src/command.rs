@@ -44,6 +44,8 @@ pub enum Command {
     Exists { keys: Vec<String> },
     Incr { key: String },
     Decr { key: String },
+    Incrby { key: String, delta: i64 },
+    Decrby { key: String, delta: i64 },
     Type { key: String },
     Keys { pattern: String },
     Lpush { key: String, values: Vec<String> },
@@ -59,12 +61,22 @@ pub enum Command {
     Sunion { keys: Vec<String> },
     Sinter { keys: Vec<String> },
     Sdiff { keys: Vec<String> },
+    Hset { key: String, field: String, value: String },
+    Hget { key: String, field: String },
+    Hdel { key: String, fields: Vec<String> },
+    Hexists { key: String, field: String },
+    Hgetall { key: String },
     Expire { key: String, seconds: i64 },
     Pexpire { key: String, millis: i64 },
     Ttl { key: String },
     Pttl { key: String },
     Persist { key: String },
     Info,
+    Mget { keys: Vec<String> },
+    Mset { pairs: Vec<(String, String)> },
+    Setnx { key: String, value: String },
+    Setex { key: String, seconds: i64, value: String },
+    Psetex { key: String, millis: i64, value: String },
     Unknown(Vec<String>),
     /// Represents an error that should be sent back to the client.
     Error(String),
@@ -176,6 +188,36 @@ pub async fn read_command(
                 return Ok(Some(Command::Error("ERR wrong number of arguments for 'decr' command".to_string())));
             }
             Command::Decr { key }
+        }
+        "INCRBY" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'incrby' command".to_string())));
+            };
+            let Some(delta_s) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'incrby' command".to_string())));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'incrby' command".to_string())));
+            }
+            let Ok(delta) = delta_s.parse::<i64>() else {
+                return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+            };
+            Command::Incrby { key, delta }
+        }
+        "DECRBY" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'decrby' command".to_string())));
+            };
+            let Some(delta_s) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'decrby' command".to_string())));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'decrby' command".to_string())));
+            }
+            let Ok(delta) = delta_s.parse::<i64>() else {
+                return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+            };
+            Command::Decrby { key, delta }
         }
         "DEL" => {
             let keys: Vec<String> = iter.collect();
@@ -339,6 +381,64 @@ pub async fn read_command(
             }
             Command::Sdiff { keys }
         }
+        "HSET" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hset' command".to_string())));
+            };
+            let Some(field) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hset' command".to_string())));
+            };
+            let Some(value) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hset' command".to_string())));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hset' command".to_string())));
+            }
+            Command::Hset { key, field, value }
+        }
+        "HGET" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hget' command".to_string())));
+            };
+            let Some(field) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hget' command".to_string())));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hget' command".to_string())));
+            }
+            Command::Hget { key, field }
+        }
+        "HDEL" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hdel' command".to_string())));
+            };
+            let fields: Vec<String> = iter.collect();
+            if fields.is_empty() {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hdel' command".to_string())));
+            }
+            Command::Hdel { key, fields }
+        }
+        "HEXISTS" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hexists' command".to_string())));
+            };
+            let Some(field) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hexists' command".to_string())));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hexists' command".to_string())));
+            }
+            Command::Hexists { key, field }
+        }
+        "HGETALL" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hgetall' command".to_string())));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hgetall' command".to_string())));
+            }
+            Command::Hgetall { key }
+        }
         "EXPIRE" => {
             let Some(key) = iter.next() else {
                 return Ok(Some(Command::Error("ERR wrong number of arguments for 'expire' command".to_string())));
@@ -401,6 +501,79 @@ pub async fn read_command(
                 return Ok(Some(Command::Error("ERR wrong number of arguments for 'info' command".to_string())));
             }
             Command::Info
+        }
+        "MGET" => {
+            let keys: Vec<String> = iter.collect();
+            if keys.is_empty() {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'mget' command".to_string())));
+            }
+            Command::Mget { keys }
+        }
+        "MSET" => {
+            let args: Vec<String> = iter.collect();
+            if args.len() < 2 || args.len() % 2 != 0 {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'mset' command".to_string())));
+            }
+            let mut pairs = Vec::new();
+            let mut it = args.into_iter();
+            while let (Some(k), Some(v)) = (it.next(), it.next()) {
+                pairs.push((k, v));
+            }
+            Command::Mset { pairs }
+        }
+        "SETNX" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'setnx' command".to_string())));
+            };
+            let Some(value) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'setnx' command".to_string())));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'setnx' command".to_string())));
+            }
+            Command::Setnx { key, value }
+        }
+        "SETEX" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'setex' command".to_string())));
+            };
+            let Some(sec_s) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'setex' command".to_string())));
+            };
+            let Some(value) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'setex' command".to_string())));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'setex' command".to_string())));
+            }
+            let Ok(seconds) = sec_s.parse::<i64>() else {
+                return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+            };
+            if seconds < 0 {
+                return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+            }
+            Command::Setex { key, seconds, value }
+        }
+        "PSETEX" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'psetex' command".to_string())));
+            };
+            let Some(ms_s) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'psetex' command".to_string())));
+            };
+            let Some(value) = iter.next() else {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'psetex' command".to_string())));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(Command::Error("ERR wrong number of arguments for 'psetex' command".to_string())));
+            }
+            let Ok(millis) = ms_s.parse::<i64>() else {
+                return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+            };
+            if millis < 0 {
+                return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+            }
+            Command::Psetex { key, millis, value }
         }
         _ => Command::Unknown(std::iter::once(command).chain(iter).collect()),
     };

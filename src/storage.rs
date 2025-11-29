@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use dashmap::DashMap;
@@ -17,6 +17,10 @@ enum StorageValue {
         value: HashSet<String>,
         expires_at: Option<Instant>,
     },
+    Hash {
+        value: HashMap<String, String>,
+        expires_at: Option<Instant>,
+    },
 }
 
 #[derive(Clone)]
@@ -33,6 +37,94 @@ impl Default for Storage {
 }
 
 impl Storage {
+    pub fn hset(&self, key: &str, field: &str, value: String) -> usize {
+        let now = Instant::now();
+        self.remove_if_expired(key, now);
+
+        let mut entry = self
+            .data
+            .entry(key.to_string())
+            .or_insert_with(|| StorageValue::Hash {
+                value: HashMap::new(),
+                expires_at: None,
+            });
+
+        match entry.value_mut() {
+            StorageValue::Hash { value: map, .. } => {
+                let existed = map.insert(field.to_string(), value).is_some();
+                if existed { 0 } else { 1 }
+            }
+            _ => 0, // Key exists but is not a hash
+        }
+    }
+
+    pub fn hget(&self, key: &str, field: &str) -> Option<String> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return None;
+        }
+
+        let entry = self.data.get(key)?;
+        match entry.value() {
+            StorageValue::Hash { value: map, .. } => map.get(field).cloned(),
+            _ => None,
+        }
+    }
+
+    pub fn hdel(&self, key: &str, fields: &[String]) -> usize {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return 0;
+        }
+
+        let Some(mut entry) = self.data.get_mut(key) else {
+            return 0;
+        };
+
+        match entry.value_mut() {
+            StorageValue::Hash { value: map, .. } => {
+                let mut removed = 0;
+                for f in fields {
+                    if map.remove(f).is_some() {
+                        removed += 1;
+                    }
+                }
+                removed
+            }
+            _ => 0,
+        }
+    }
+
+    pub fn hexists(&self, key: &str, field: &str) -> bool {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return false;
+        }
+
+        self.data.get(key).map_or(false, |entry| {
+            if let StorageValue::Hash { value: map, .. } = entry.value() {
+                map.contains_key(field)
+            } else {
+                false
+            }
+        })
+    }
+
+    pub fn hgetall(&self, key: &str) -> Vec<(String, String)> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Vec::new();
+        }
+
+        let entry = self.data.get(key);
+        let map = match entry.as_ref().map(|e| e.value()) {
+            Some(StorageValue::Hash { value: m, .. }) => m,
+            _ => return Vec::new(),
+        };
+
+        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+
     pub fn set(&self, key: String, value: String) {
         self.data.insert(
             key,
@@ -56,6 +148,45 @@ impl Storage {
                 None // Key exists but is not a string
             }
         })
+    }
+
+    pub fn mget(&self, keys: &[String]) -> Vec<Option<String>> {
+        keys.iter().map(|k| self.get(k)).collect()
+    }
+
+    pub fn mset(&self, pairs: &[(String, String)]) {
+        for (k, v) in pairs {
+            self.set(k.clone(), v.clone());
+        }
+    }
+
+    pub fn setnx(&self, key: &str, value: String) -> bool {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            // treat as non-existent
+        }
+
+        let mut inserted = false;
+        self.data
+            .entry(key.to_string())
+            .and_modify(|_existing| {
+                // key exists, do nothing
+            })
+            .or_insert_with(|| {
+                inserted = true;
+                StorageValue::String { value, expires_at: None }
+            });
+        inserted
+    }
+
+    pub fn set_with_expire_seconds(&self, key: String, value: String, seconds: i64) {
+        self.set(key.clone(), value);
+        self.expire_seconds(&key, seconds);
+    }
+
+    pub fn set_with_expire_millis(&self, key: String, value: String, millis: i64) {
+        self.set(key.clone(), value);
+        self.expire_millis(&key, millis);
     }
 
     pub fn del(&self, keys: &[String]) -> usize {
@@ -85,7 +216,7 @@ impl Storage {
         self.incr_by(key, -1)
     }
 
-    fn incr_by(&self, key: &str, delta: i64) -> Result<i64, ()> {
+    pub fn incr_by(&self, key: &str, delta: i64) -> Result<i64, ()> {
         let now = Instant::now();
         if self.remove_if_expired(key, now) {
             // Treat as non-existent and start from 0
@@ -129,6 +260,7 @@ impl Storage {
                 StorageValue::String { .. } => "string".to_string(),
                 StorageValue::List { .. } => "list".to_string(),
                 StorageValue::Set { .. } => "set".to_string(),
+                StorageValue::Hash { .. } => "hash".to_string(),
             },
         )
     }
@@ -405,7 +537,8 @@ impl Storage {
         match entry.value_mut() {
             StorageValue::String { expires_at, .. }
             | StorageValue::List { expires_at, .. }
-            | StorageValue::Set { expires_at, .. } => {
+            | StorageValue::Set { expires_at, .. }
+            | StorageValue::Hash { expires_at, .. } => {
                 *expires_at = Some(deadline);
                 true
             }
@@ -432,7 +565,8 @@ impl Storage {
         match entry.value_mut() {
             StorageValue::String { expires_at, .. }
             | StorageValue::List { expires_at, .. }
-            | StorageValue::Set { expires_at, .. } => {
+            | StorageValue::Set { expires_at, .. }
+            | StorageValue::Hash { expires_at, .. } => {
                 *expires_at = Some(deadline);
                 true
             }
@@ -456,7 +590,8 @@ impl Storage {
         let expires_at = match entry.value() {
             StorageValue::String { expires_at, .. }
             | StorageValue::List { expires_at, .. }
-            | StorageValue::Set { expires_at, .. } => expires_at,
+            | StorageValue::Set { expires_at, .. }
+            | StorageValue::Hash { expires_at, .. } => expires_at,
         };
 
         let Some(deadline) = expires_at else {
@@ -489,7 +624,8 @@ impl Storage {
         let expires_at = match entry.value() {
             StorageValue::String { expires_at, .. }
             | StorageValue::List { expires_at, .. }
-            | StorageValue::Set { expires_at, .. } => expires_at,
+            | StorageValue::Set { expires_at, .. }
+            | StorageValue::Hash { expires_at, .. } => expires_at,
         };
 
         let Some(deadline) = expires_at else {
@@ -518,7 +654,8 @@ impl Storage {
         match entry.value_mut() {
             StorageValue::String { expires_at, .. }
             | StorageValue::List { expires_at, .. }
-            | StorageValue::Set { expires_at, .. } => {
+            | StorageValue::Set { expires_at, .. }
+            | StorageValue::Hash { expires_at, .. } => {
                 if expires_at.is_some() {
                     *expires_at = None;
                     true
@@ -656,6 +793,7 @@ impl Storage {
             StorageValue::String { expires_at, .. } => expires_at,
             StorageValue::List { expires_at, .. } => expires_at,
             StorageValue::Set { expires_at, .. } => expires_at,
+            StorageValue::Hash { expires_at, .. } => expires_at,
         };
 
         match expires_at {

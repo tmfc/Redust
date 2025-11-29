@@ -6,18 +6,19 @@
 
 ## 当前聚焦的小类工作
 
-- [x] **过期语义预研与设计草案（MVP 完成）**
-  - 基于当前 `Storage` 结构，思考如何存储过期时间（如额外 map 或封装 value）。
-  - 对比惰性删除 + 定期采样删除两种策略，给出适合 Redust 的方案草图。
-  - （已初步实现）基础懒删除 + 定期采样删除 + EXPIRE/PEXPIRE/TTL/PTTL/PERSIST 命令与测试。
+- [x] **字符串多 key / 原子操作补齐（v1）**
+  - 实现并测试：`MGET` / `MSET` / `SETNX` / `SETEX` / `PSETEX` / `INCRBY` / `DECRBY` 等子集。
+  - 确认与 Redis 语义对齐（返回值、错误信息、过期语义交互）。
+  - 补充 `tests/` 下端到端用例，并在 `README.md` 示例中体现。（测试已补，README 示例待后续完善）
 
-- [x] **Storage 锁粒度与并发方案设计**
-  - 评估当前全局 `RwLock` 带来的瓶颈场景（例如大量并发写入/读写混合）。
-  - 对比几种可选方案（分片锁、并发 map 等），输出一份设计建议。
-  - 结论：当前采用单个 `DashMap<String, StorageValue>`，依赖其内部分片锁作为主要并发策略；不额外增加全局 `RwLock` 或手写多级分片，未来如遇瓶颈再在 `future.md` 中演进。
+- [x] **Hash 数据结构雏形（HSET/HGET 核心子集）**
+  - 设计 `Storage` 中 Hash 的内部存储结构（如 `HashMap<String, String>` 封装）。
+  - 实现并测试：`HSET` / `HGET` / `HDEL` / `HEXISTS` / `HGETALL` 的最小集合。
+  - 使用 `redis-cli` 做基本兼容性验证，补充文档示例。
 
-- [x] **INFO 子集与监控指标草稿**
-  - 已实现 INFO v1：redust_version、tcp_port、uptime_in_seconds、connected_clients、total_commands_processed、db0:keys 等基础指标。
-  - 进一步的指标与监控增强（per-command 统计、更精确内存、QPS 等）已记录在 `future.md` 的「INFO 指标增强（V2）」中。
+- [ ] **基础性能基准测试（单机内网场景）**
+  - 使用 `redis-benchmark` / 内置 bench，对 PING/SET/GET 做 QPS 与 P99 延迟测量。
+  - 记录一版基线数据（本地开发机），在 `roadmap.md` 或 `future.md` 中留存。
+  - 如发现明显瓶颈，再在 `future.md` 中登记相应优化条目。
 
 ---

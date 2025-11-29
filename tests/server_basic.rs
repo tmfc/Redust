@@ -160,6 +160,98 @@ async fn responds_to_basic_commands() {
 }
 
 #[tokio::test]
+async fn hashes_basic_behaviour() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // HSET myhash field value -> 1
+    write_half
+        .write_all(b"*4\r\n$4\r\nHSET\r\n$6\r\nmyhash\r\n$5\r\nfield\r\n$5\r\nvalue\r\n")
+        .await
+        .unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":1\r\n");
+
+    // HSET myhash field value2 -> 0 (overwrite)
+    write_half
+        .write_all(b"*4\r\n$4\r\nHSET\r\n$6\r\nmyhash\r\n$5\r\nfield\r\n$6\r\nvalue2\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":0\r\n");
+
+    // HGET myhash field -> value2
+    write_half
+        .write_all(b"*3\r\n$4\r\nHGET\r\n$6\r\nmyhash\r\n$5\r\nfield\r\n")
+        .await
+        .unwrap();
+    let mut bulk_header = String::new();
+    let mut bulk_value = String::new();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut bulk_value).await.unwrap();
+    assert_eq!(bulk_header, "$6\r\n");
+    assert_eq!(bulk_value, "value2\r\n");
+
+    // HEXISTS myhash field -> 1
+    write_half
+        .write_all(b"*3\r\n$7\r\nHEXISTS\r\n$6\r\nmyhash\r\n$5\r\nfield\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":1\r\n");
+
+    // HGETALL myhash -> [field, value2]
+    write_half
+        .write_all(b"*2\r\n$7\r\nHGETALL\r\n$6\r\nmyhash\r\n")
+        .await
+        .unwrap();
+    let mut arr_header = String::new();
+    reader.read_line(&mut arr_header).await.unwrap();
+    assert_eq!(arr_header, "*2\r\n");
+
+    bulk_header.clear();
+    bulk_value.clear();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut bulk_value).await.unwrap();
+    assert_eq!(bulk_header, "$5\r\n");
+    assert_eq!(bulk_value, "field\r\n");
+
+    bulk_header.clear();
+    bulk_value.clear();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut bulk_value).await.unwrap();
+    assert_eq!(bulk_header, "$6\r\n");
+    assert_eq!(bulk_value, "value2\r\n");
+
+    // HDEL myhash field -> 1
+    write_half
+        .write_all(b"*3\r\n$4\r\nHDEL\r\n$6\r\nmyhash\r\n$5\r\nfield\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":1\r\n");
+
+    // HEXISTS myhash field -> 0
+    write_half
+        .write_all(b"*3\r\n$7\r\nHEXISTS\r\n$6\r\nmyhash\r\n$5\r\nfield\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":0\r\n");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn info_basic_fields() {
     let (addr, shutdown, handle) = spawn_server().await;
     let stream = TcpStream::connect(addr).await.unwrap();

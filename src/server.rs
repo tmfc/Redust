@@ -94,6 +94,32 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
                     }
                 }
             }
+            Command::Incrby { key, delta } => {
+                match storage.incr_by(&key, delta) {
+                    Ok(value) => {
+                        let response = format!(":{}\r\n", value);
+                        write_half.write_all(response.as_bytes()).await?;
+                    }
+                    Err(_) => {
+                        write_half
+                            .write_all(b"-ERR value is not an integer or out of range\r\n")
+                            .await?;
+                    }
+                }
+            }
+            Command::Decrby { key, delta } => {
+                match storage.incr_by(&key, -delta) {
+                    Ok(value) => {
+                        let response = format!(":{}\r\n", value);
+                        write_half.write_all(response.as_bytes()).await?;
+                    }
+                    Err(_) => {
+                        write_half
+                            .write_all(b"-ERR value is not an integer or out of range\r\n")
+                            .await?;
+                    }
+                }
+            }
             Command::Del { keys } => {
                 let removed = storage.del(&keys);
                 let response = format!(":{}\r\n", removed);
@@ -188,6 +214,37 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
                 }
                 write_half.write_all(response.as_bytes()).await?;
             }
+            Command::Hset { key, field, value } => {
+                let added = storage.hset(&key, &field, value);
+                let response = format!(":{}\r\n", added);
+                write_half.write_all(response.as_bytes()).await?;
+            }
+            Command::Hget { key, field } => {
+                if let Some(value) = storage.hget(&key, &field) {
+                    respond_bulk_string(&mut write_half, &value).await?;
+                } else {
+                    write_half.write_all(b"$-1\r\n").await?;
+                }
+            }
+            Command::Hdel { key, fields } => {
+                let removed = storage.hdel(&key, &fields);
+                let response = format!(":{}\r\n", removed);
+                write_half.write_all(response.as_bytes()).await?;
+            }
+            Command::Hexists { key, field } => {
+                let exists = storage.hexists(&key, &field);
+                let response = if exists { ":1\r\n" } else { ":0\r\n" };
+                write_half.write_all(response.as_bytes()).await?;
+            }
+            Command::Hgetall { key } => {
+                let entries = storage.hgetall(&key);
+                let mut response = format!("*{}\r\n", entries.len() * 2);
+                for (field, value) in entries {
+                    response.push_str(&format!("${}\r\n{}\r\n", field.len(), field));
+                    response.push_str(&format!("${}\r\n{}\r\n", value.len(), value));
+                }
+                write_half.write_all(response.as_bytes()).await?;
+            }
             Command::Expire { key, seconds } => {
                 let res = storage.expire_seconds(&key, seconds);
                 let response = if res { ":1\r\n" } else { ":0\r\n" };
@@ -233,6 +290,38 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
                 info.push_str("\r\n");
 
                 respond_bulk_string(&mut write_half, &info).await?;
+            }
+            Command::Mget { keys } => {
+                let values = storage.mget(&keys);
+                let mut response = format!("*{}\r\n", values.len());
+                for v in values {
+                    match v {
+                        Some(s) => {
+                            response.push_str(&format!("${}\r\n{}\r\n", s.len(), s));
+                        }
+                        None => {
+                            response.push_str("$-1\r\n");
+                        }
+                    }
+                }
+                write_half.write_all(response.as_bytes()).await?;
+            }
+            Command::Mset { pairs } => {
+                storage.mset(&pairs);
+                write_half.write_all(b"+OK\r\n").await?;
+            }
+            Command::Setnx { key, value } => {
+                let inserted = storage.setnx(&key, value);
+                let response = if inserted { ":1\r\n" } else { ":0\r\n" };
+                write_half.write_all(response.as_bytes()).await?;
+            }
+            Command::Setex { key, seconds, value } => {
+                storage.set_with_expire_seconds(key, value, seconds);
+                write_half.write_all(b"+OK\r\n").await?;
+            }
+            Command::Psetex { key, millis, value } => {
+                storage.set_with_expire_millis(key, value, millis);
+                write_half.write_all(b"+OK\r\n").await?;
             }
             Command::Type { key } => {
                 let t = storage.type_of(&key);
