@@ -277,33 +277,63 @@ impl Storage {
             return Vec::new();
         }
 
-        let mut existing_sets_data: Vec<HashSet<String>> = Vec::new();
-        for key in keys {
-            if let Some(entry) = self.data.get(key) {
-                if let StorageValue::Set(set) = entry.value() {
-                    existing_sets_data.push(set.iter().cloned().collect());
-                } else {
-                    return Vec::new(); // Key exists but is not a set
+        // 先扫描一遍，找到最小的集合（按元素个数），同时保证所有 key 都存在且类型为 Set
+        let mut smallest_index: Option<usize> = None;
+        let mut smallest_len = usize::MAX;
+
+        for (i, key) in keys.iter().enumerate() {
+            let Some(entry) = self.data.get(key) else {
+                return Vec::new(); // Key does not exist
+            };
+
+            if let StorageValue::Set(set) = entry.value() {
+                let len = set.len();
+                if len < smallest_len {
+                    smallest_len = len;
+                    smallest_index = Some(i);
                 }
             } else {
-                return Vec::new(); // Key does not exist
+                return Vec::new(); // Key exists but is not a set
             }
         }
 
-        if existing_sets_data.is_empty() {
+        let Some(smallest_idx) = smallest_index else {
             return Vec::new();
+        };
+
+        // 再次获取最小集合，遍历其元素，并对其他集合做 contains 检查
+        let smallest_key = &keys[smallest_idx];
+        let Some(entry) = self.data.get(smallest_key) else {
+            return Vec::new();
+        };
+        let StorageValue::Set(smallest_set) = entry.value() else {
+            return Vec::new();
+        };
+
+        let mut result: HashSet<String> = HashSet::new();
+
+        'outer: for member in smallest_set.iter() {
+            // 检查该元素是否出现在其他所有集合中
+            for (j, key) in keys.iter().enumerate() {
+                if j == smallest_idx {
+                    continue;
+                }
+
+                let Some(other_entry) = self.data.get(key) else {
+                    return Vec::new();
+                };
+                let StorageValue::Set(other_set) = other_entry.value() else {
+                    return Vec::new();
+                };
+
+                if !other_set.contains(member) {
+                    continue 'outer;
+                }
+            }
+
+            result.insert(member.clone());
         }
 
-        // We already own the sets; start from the first and intersect with the rest
-        let mut result: HashSet<String> = existing_sets_data[0].clone();
-
-        for i in 1..existing_sets_data.len() {
-            result = result
-                .intersection(&existing_sets_data[i])
-                .cloned()
-                .collect();
-        }
-        
         let mut members: Vec<String> = result.into_iter().collect();
         members.sort();
         members
