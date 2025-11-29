@@ -3,7 +3,7 @@ use std::future::Future;
 use tokio::io::{self, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::command::{read_command, Command};
+use crate::command::{read_command, Command, CommandError}; // Import CommandError
 use crate::resp::respond_bulk_string;
 use crate::storage::Storage;
 
@@ -14,7 +14,24 @@ async fn handle_connection(stream: TcpStream, storage: Storage) -> io::Result<()
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    while let Some(cmd) = read_command(&mut reader).await? {
+    loop {
+        let cmd_result = read_command(&mut reader).await;
+        let cmd = match cmd_result {
+            Ok(Some(command)) => command,
+            Ok(None) => break, // Connection closed or no more data
+            Err(CommandError::Io(e)) => {
+                // Log the IO error and break
+                eprintln!("[conn] IO error reading command: {}", e);
+                break;
+            }
+            Err(CommandError::RedisError(msg)) => {
+                // Send the Redis-like error message to the client
+                let response = format!("-{}\r\n", msg);
+                write_half.write_all(response.as_bytes()).await?;
+                continue; // Continue to read next command
+            }
+        };
+
         println!("[conn] received command: {:?}", cmd);
 
         match cmd {
@@ -171,6 +188,10 @@ async fn handle_connection(stream: TcpStream, storage: Storage) -> io::Result<()
             Command::Unknown(parts) => {
                 let joined = parts.join(" ");
                 let response = format!("-ERR unknown command '{}'\r\n", joined);
+                write_half.write_all(response.as_bytes()).await?;
+            }
+            Command::Error(msg) => { // Handle Command::Error variant
+                let response = format!("-{}\r\n", msg);
                 write_half.write_all(response.as_bytes()).await?;
             }
         }

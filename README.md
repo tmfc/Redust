@@ -5,10 +5,10 @@ Redust 是一个使用 Rust 编写的、兼容 Redis 协议的轻量级服务。
 ## 功能特点
 
 - **兼容 Redis 协议**：
-  - 当前支持命令：`PING`、`ECHO`、`QUIT`、`SET`、`GET`、`DEL`、`EXISTS`、`INCR`、`DECR`、`TYPE`、`KEYS`。
+  - 当前支持命令：`PING`、`ECHO`、`QUIT`、`SET`、`GET`、`DEL`、`EXISTS`、`INCR`、`DECR`、`TYPE`、`KEYS`、`LPUSH`、`RPUSH`、`LPOP`、`RPOP`、`LRANGE`、`SADD`、`SREM`、`SMEMBERS`、`SCARD`、`SISMEMBER`、`SUNION`、`SINTER`、`SDIFF`。
   - 协议层基于 RESP2，实现了数组解析与 Bulk String 编解码。
 - **异步高并发**：基于 Tokio 运行时，每个 TCP 连接在独立任务中处理，支持多客户端并发访问同一存储。
-- **内存键值存储**：提供内置内存存储引擎（字符串类型），支持整数自增/自减以及简单的键空间查询。
+- **内存键值存储**：提供内置内存存储引擎，支持字符串、列表和集合类型，支持整数自增/自减以及简单的键空间查询。通过 `DashMap` 实现高并发。
 - **可配置监听地址**：通过 `REDUST_ADDR` 环境变量即可调整监听地址与端口。
 
 ## 快速开始

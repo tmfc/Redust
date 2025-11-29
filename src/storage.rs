@@ -1,71 +1,56 @@
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, RwLock};
+use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
+use dashmap::DashMap;
 
-#[derive(Default)]
-struct Inner {
-    strings: HashMap<String, String>,
-    lists: HashMap<String, VecDeque<String>>,
-    sets: HashMap<String, HashSet<String>>,
+#[derive(Debug, Clone)]
+enum StorageValue {
+    String(String),
+    List(VecDeque<String>),
+    Set(HashSet<String>),
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Storage {
-    inner: Arc<RwLock<Inner>>,
+    data: Arc<DashMap<String, StorageValue>>,
+}
+
+impl Default for Storage {
+    fn default() -> Self {
+        Storage {
+            data: Arc::new(DashMap::new()),
+        }
+    }
 }
 
 impl Storage {
     pub fn set(&self, key: String, value: String) {
-        if let Ok(mut inner) = self.inner.write() {
-            // 覆盖字符串值时，保留列表键空间独立存在
-            inner.strings.insert(key, value);
-        }
+        self.data.insert(key, StorageValue::String(value));
     }
 
     pub fn get(&self, key: &str) -> Option<String> {
-        match self.inner.read() {
-            Ok(inner) => inner.strings.get(key).cloned(),
-            Err(_) => None,
-        }
+        self.data.get(key).and_then(|entry| {
+            if let StorageValue::String(s) = entry.value() {
+                Some(s.clone())
+            } else {
+                None // Key exists but is not a string
+            }
+        })
     }
 
     pub fn del(&self, keys: &[String]) -> usize {
-        match self.inner.write() {
-            Ok(mut inner) => {
-                let mut removed = 0;
-                for key in keys {
-                    let mut deleted = false;
-                    if inner.strings.remove(key).is_some() {
-                        deleted = true;
-                    }
-                    if inner.lists.remove(key).is_some() {
-                        deleted = true;
-                    }
-                    if inner.sets.remove(key).is_some() {
-                        deleted = true;
-                    }
-                    if deleted {
-                        removed += 1;
-                    }
-                }
-                removed
+        let mut removed = 0;
+        for key in keys {
+            if self.data.remove(key).is_some() {
+                removed += 1;
             }
-            Err(_) => 0,
         }
+        removed
     }
 
     pub fn exists(&self, keys: &[String]) -> usize {
-        match self.inner.read() {
-            Ok(inner) => keys
-                .iter()
-                .filter(|k| {
-                    let k = k.as_str();
-                    inner.strings.contains_key(k)
-                        || inner.lists.contains_key(k)
-                        || inner.sets.contains_key(k)
-                })
-                .count(),
-            Err(_) => 0,
-        }
+        keys.iter()
+            .filter(|k| self.data.contains_key(*k))
+            .count()
     }
 
     pub fn incr(&self, key: &str) -> Result<i64, ()> {
@@ -77,64 +62,42 @@ impl Storage {
     }
 
     fn incr_by(&self, key: &str, delta: i64) -> Result<i64, ()> {
-        let mut guard = self.inner.write().map_err(|_| ())?;
-        let current = guard
-            .strings
-            .get(key)
-            .map(String::as_str)
-            .unwrap_or("0");
-        let value: i64 = current.parse().map_err(|_| ())?;
-        let new = value
-            .checked_add(delta)
-            .ok_or(())?;
-        guard.strings.insert(key.to_string(), new.to_string());
-        Ok(new)
+        let mut entry = self.data.entry(key.to_string()).or_insert(StorageValue::String("0".to_string()));
+
+        let current_val = match entry.value_mut() {
+            StorageValue::String(s) => s,
+            _ => return Err(()), // Key exists but is not a string
+        };
+
+        let value: i64 = current_val.parse().map_err(|_| ())?;
+        let new_val = value.checked_add(delta).ok_or(())?;
+        *current_val = new_val.to_string();
+        Ok(new_val)
     }
 
     pub fn type_of(&self, key: &str) -> String {
-        match self.inner.read() {
-            Ok(inner) => {
-                if inner.strings.contains_key(key) {
-                    "string".to_string()
-                } else if inner.lists.contains_key(key) {
-                    "list".to_string()
-                } else if inner.sets.contains_key(key) {
-                    "set".to_string()
-                } else {
-                    "none".to_string()
-                }
-            }
-            Err(_) => "none".to_string(),
-        }
+        self.data.get(key).map_or_else(
+            || "none".to_string(),
+            |entry| match entry.value() {
+                StorageValue::String(_) => "string".to_string(),
+                StorageValue::List(_) => "list".to_string(),
+                StorageValue::Set(_) => "set".to_string(),
+            },
+        )
     }
 
     pub fn keys(&self, pattern: &str) -> Vec<String> {
         // Very simple implementation: only support "*" (all keys) and exact match.
-        match self.inner.read() {
-            Ok(inner) => {
-                if pattern == "*" {
-                    let mut all: Vec<String> = inner
-                        .strings
-                        .keys()
-                        .chain(inner.lists.keys())
-                        .chain(inner.sets.keys())
-                        .cloned()
-                        .collect();
-                    all.sort();
-                    all.dedup();
-                    all
-                } else {
-                    let mut result = Vec::new();
-                    if inner.strings.contains_key(pattern)
-                        || inner.lists.contains_key(pattern)
-                        || inner.sets.contains_key(pattern)
-                    {
-                        result.push(pattern.to_string());
-                    }
-                    result
-                }
+        if pattern == "*" {
+            let mut all: Vec<String> = self.data.iter().map(|entry| entry.key().clone()).collect();
+            all.sort();
+            all
+        } else {
+            let mut result = Vec::new();
+            if self.data.contains_key(pattern) {
+                result.push(pattern.to_string());
             }
-            Err(_) => Vec::new(),
+            result
         }
     }
 
@@ -147,30 +110,28 @@ impl Storage {
     }
 
     fn push_internal(&self, key: &str, values: &[String], left: bool) -> usize {
-        let mut guard = match self.inner.write() {
-            Ok(g) => g,
-            Err(_) => return 0,
-        };
+        let mut entry = self.data.entry(key.to_string()).or_insert_with(|| StorageValue::List(VecDeque::new()));
 
-        let list = guard.lists.entry(key.to_string()).or_insert_with(VecDeque::new);
-        for v in values {
-            if left {
-                list.push_front(v.clone());
-            } else {
-                list.push_back(v.clone());
+        match entry.value_mut() {
+            StorageValue::List(list) => {
+                for v in values {
+                    if left {
+                        list.push_front(v.clone());
+                    } else {
+                        list.push_back(v.clone());
+                    }
+                }
+                list.len()
             }
+            _ => 0, // Key exists but is not a list
         }
-        list.len()
     }
 
     pub fn lrange(&self, key: &str, start: isize, stop: isize) -> Vec<String> {
-        let guard = match self.inner.read() {
-            Ok(g) => g,
-            Err(_) => return Vec::new(),
-        };
-
-        let Some(list) = guard.lists.get(key) else {
-            return Vec::new();
+        let entry = self.data.get(key);
+        let list = match entry.as_ref().map(|e| e.value()) {
+            Some(StorageValue::List(l)) => l,
+            _ => return Vec::new(), // Key does not exist or is not a list
         };
 
         let len = list.len() as isize;
@@ -202,8 +163,7 @@ impl Storage {
         let start_idx = s as usize;
         let end_idx = e as usize;
 
-        list
-            .iter()
+        list.iter()
             .skip(start_idx)
             .take(end_idx - start_idx + 1)
             .cloned()
@@ -211,68 +171,63 @@ impl Storage {
     }
 
     pub fn lpop(&self, key: &str) -> Option<String> {
-        let mut guard = match self.inner.write() {
-            Ok(g) => g,
-            Err(_) => return None,
-        };
-
-        let list = guard.lists.get_mut(key)?;
-        list.pop_front()
+        let mut entry = self.data.get_mut(key)?;
+        match entry.value_mut() {
+            StorageValue::List(list) => list.pop_front(),
+            _ => None, // Key exists but is not a list
+        }
     }
 
     pub fn rpop(&self, key: &str) -> Option<String> {
-        let mut guard = match self.inner.write() {
-            Ok(g) => g,
-            Err(_) => return None,
-        };
-
-        let list = guard.lists.get_mut(key)?;
-        list.pop_back()
+        let mut entry = self.data.get_mut(key)?;
+        match entry.value_mut() {
+            StorageValue::List(list) => list.pop_back(),
+            _ => None, // Key exists but is not a list
+        }
     }
 
     pub fn sadd(&self, key: &str, members: &[String]) -> usize {
-        let mut guard = match self.inner.write() {
-            Ok(g) => g,
-            Err(_) => return 0,
-        };
+        let mut entry = self.data.entry(key.to_string()).or_insert_with(|| StorageValue::Set(HashSet::new()));
 
-        let set = guard.sets.entry(key.to_string()).or_insert_with(HashSet::new);
-        let mut added = 0;
-        for m in members {
-            if set.insert(m.clone()) {
-                added += 1;
+        match entry.value_mut() {
+            StorageValue::Set(set) => {
+                let mut added = 0;
+                for m in members {
+                    if set.insert(m.clone()) {
+                        added += 1;
+                    }
+                }
+                added
             }
+            _ => 0, // Key exists but is not a set
         }
-        added
     }
 
     pub fn srem(&self, key: &str, members: &[String]) -> usize {
-        let mut guard = match self.inner.write() {
-            Ok(g) => g,
-            Err(_) => return 0,
-        };
+        if let Some(mut entry) = self.data.get_mut(key) {
 
-        let Some(set) = guard.sets.get_mut(key) else {
-            return 0;
-        };
-
-        let mut removed = 0;
-        for m in members {
-            if set.remove(m) {
-                removed += 1;
+            match entry.value_mut() {
+                StorageValue::Set(set) => {
+                    let mut removed = 0;
+                    for m in members {
+                        if set.remove(m) {
+                            removed += 1;
+                        }
+                    }
+                    removed
+                }
+                _ => 0, // Key exists but is not a set
             }
+        } else {
+            0 // Key does not exist
         }
-        removed
     }
 
     pub fn smembers(&self, key: &str) -> Vec<String> {
-        let guard = match self.inner.read() {
-            Ok(g) => g,
-            Err(_) => return Vec::new(),
-        };
-
-        let Some(set) = guard.sets.get(key) else {
-            return Vec::new();
+        let entry = self.data.get(key);
+        let set = match entry.as_ref().map(|e| e.value()) {
+            Some(StorageValue::Set(s)) => s,
+            _ => return Vec::new(), // Key does not exist or is not a set
         };
 
         let mut members: Vec<String> = set.iter().cloned().collect();
@@ -281,36 +236,33 @@ impl Storage {
     }
 
     pub fn scard(&self, key: &str) -> usize {
-        let guard = match self.inner.read() {
-            Ok(g) => g,
-            Err(_) => return 0,
-        };
-        guard.sets.get(key).map(|s| s.len()).unwrap_or(0)
+        self.data.get(key).map_or(0, |entry| {
+            if let StorageValue::Set(set) = entry.value() {
+                set.len()
+            } else {
+                0 // Key exists but is not a set
+            }
+        })
     }
 
     pub fn sismember(&self, key: &str, member: &str) -> bool {
-        let guard = match self.inner.read() {
-            Ok(g) => g,
-            Err(_) => return false,
-        };
-        guard
-            .sets
-            .get(key)
-            .map(|s| s.contains(member))
-            .unwrap_or(false)
+        self.data.get(key).map_or(false, |entry| {
+            if let StorageValue::Set(set) = entry.value() {
+                set.contains(member)
+            } else {
+                false // Key exists but is not a set
+            }
+        })
     }
 
     pub fn sunion(&self, keys: &[String]) -> Vec<String> {
-        let guard = match self.inner.read() {
-            Ok(g) => g,
-            Err(_) => return Vec::new(),
-        };
-
         let mut result: HashSet<String> = HashSet::new();
         for key in keys {
-            if let Some(set) = guard.sets.get(key) {
-                for m in set {
-                    result.insert(m.clone());
+            if let Some(entry) = self.data.get(key) {
+                if let StorageValue::Set(set) = entry.value() {
+                    for m in set {
+                        result.insert(m.clone());
+                    }
                 }
             }
         }
@@ -321,71 +273,63 @@ impl Storage {
     }
 
     pub fn sinter(&self, keys: &[String]) -> Vec<String> {
-        let guard = match self.inner.read() {
-            Ok(g) => g,
-            Err(_) => return Vec::new(),
-        };
-
         if keys.is_empty() {
             return Vec::new();
         }
 
-        // 收集所有存在的集合引用，如果有任意一个 key 不存在，则交集为空。
-        let mut existing_sets = Vec::with_capacity(keys.len());
+        let mut existing_sets_data: Vec<HashSet<String>> = Vec::new();
         for key in keys {
-            match guard.sets.get(key) {
-                Some(set) => existing_sets.push(set),
-                None => return Vec::new(),
+            if let Some(entry) = self.data.get(key) {
+                if let StorageValue::Set(set) = entry.value() {
+                    existing_sets_data.push(set.iter().cloned().collect());
+                } else {
+                    return Vec::new(); // Key exists but is not a set
+                }
+            } else {
+                return Vec::new(); // Key does not exist
             }
         }
 
-        // 选择元素最少的集合作为基准集合，降低整体扫描量。
-        let (min_index, min_set) = existing_sets
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, set)| set.len())
-            .unwrap();
-
-        let mut result: HashSet<String> = HashSet::new();
-        'outer: for member in min_set.iter() {
-            for (idx, set) in existing_sets.iter().enumerate() {
-                if idx == min_index {
-                    continue;
-                }
-                if !set.contains(member) {
-                    continue 'outer;
-                }
-            }
-            result.insert(member.clone());
+        if existing_sets_data.is_empty() {
+            return Vec::new();
         }
 
+        // We already own the sets; start from the first and intersect with the rest
+        let mut result: HashSet<String> = existing_sets_data[0].clone();
+
+        for i in 1..existing_sets_data.len() {
+            result = result
+                .intersection(&existing_sets_data[i])
+                .cloned()
+                .collect();
+        }
+        
         let mut members: Vec<String> = result.into_iter().collect();
         members.sort();
         members
     }
 
     pub fn sdiff(&self, keys: &[String]) -> Vec<String> {
-        let guard = match self.inner.read() {
-            Ok(g) => g,
-            Err(_) => return Vec::new(),
-        };
-
         if keys.is_empty() {
             return Vec::new();
         }
 
         let first_key = &keys[0];
-        let first_set = match guard.sets.get(first_key) {
-            Some(set) => set,
-            None => return Vec::new(),
+        let first_set_entry = self.data.get(first_key);
+
+        let first_set = match first_set_entry.as_ref().map(|e| e.value()) {
+            Some(StorageValue::Set(s)) => s,
+            _ => return Vec::new(), // Key does not exist or is not a set
         };
 
         let mut result: HashSet<String> = first_set.iter().cloned().collect();
 
         for key in &keys[1..] {
-            if let Some(set) = guard.sets.get(key) {
-                for member in set.iter() {
-                    result.remove(member);
+            if let Some(entry) = self.data.get(key) {
+                if let StorageValue::Set(set) = entry.value() {
+                    for member in set.iter() {
+                        result.remove(member);
+                    }
                 }
             }
         }
