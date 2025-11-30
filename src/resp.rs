@@ -97,6 +97,36 @@ pub async fn respond_bulk_string(
     writer.write_all(response.as_bytes()).await
 }
 
+pub async fn respond_simple_string(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    value: &str,
+) -> io::Result<()> {
+    let response = format!("+{}\r\n", value);
+    writer.write_all(response.as_bytes()).await
+}
+
+pub async fn respond_error(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    message: &str,
+) -> io::Result<()> {
+    let response = format!("-{}\r\n", message);
+    writer.write_all(response.as_bytes()).await
+}
+
+pub async fn respond_integer(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    value: i64,
+) -> io::Result<()> {
+    let response = format!(":{}\r\n", value);
+    writer.write_all(response.as_bytes()).await
+}
+
+pub async fn respond_null_bulk(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+) -> io::Result<()> {
+    writer.write_all(b"$-1\r\n").await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

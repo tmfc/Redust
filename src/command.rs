@@ -82,6 +82,19 @@ pub enum Command {
     Error(String),
 }
 
+fn err_wrong_args(cmd: &str) -> Command {
+    // Redis 错误消息中命令名通常是小写形式
+    Command::Error(format!("ERR wrong number of arguments for '{}' command", cmd.to_lowercase()))
+}
+
+fn err_not_integer() -> Command {
+    Command::Error("ERR value is not an integer or out of range".to_string())
+}
+
+fn err_syntax() -> Command {
+    Command::Error("ERR syntax error".to_string())
+}
+
 pub async fn read_command(
     reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
 ) -> Result<Option<Command>, CommandError> {
@@ -98,31 +111,31 @@ pub async fn read_command(
     let cmd = match upper.as_str() {
         "PING" => {
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'ping' command".to_string())));
+                return Ok(Some(err_wrong_args("ping")));
             }
             Command::Ping
         }
         "ECHO" => {
             let Some(value) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'echo' command".to_string())));
+                return Ok(Some(err_wrong_args("echo")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'echo' command".to_string())));
+                return Ok(Some(err_wrong_args("echo")));
             }
             Command::Echo(value)
         }
         "QUIT" => {
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'quit' command".to_string())));
+                return Ok(Some(err_wrong_args("quit")));
             }
             Command::Quit
         }
         "SET" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'set' command".to_string())));
+                return Ok(Some(err_wrong_args("set")));
             };
             let Some(value) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'set' command".to_string())));
+                return Ok(Some(err_wrong_args("set")));
             };
             // 解析可选参数，目前只支持 EX seconds / PX milliseconds，忽略大小写
             let mut expire_millis: Option<i64> = None;
@@ -132,30 +145,30 @@ pub async fn read_command(
                 match opt_upper.as_str() {
                     "EX" => {
                         let Some(sec_str) = iter.next() else {
-                            return Ok(Some(Command::Error("ERR syntax error".to_string())));
+                            return Ok(Some(err_syntax()));
                         };
                         let Ok(sec) = sec_str.parse::<i64>() else {
-                            return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+                            return Ok(Some(err_not_integer()));
                         };
                         if sec < 0 {
-                            return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+                            return Ok(Some(err_not_integer()));
                         }
                         expire_millis = Some(sec.saturating_mul(1000));
                     }
                     "PX" => {
                         let Some(ms_str) = iter.next() else {
-                            return Ok(Some(Command::Error("ERR syntax error".to_string())));
+                            return Ok(Some(err_syntax()));
                         };
                         let Ok(ms) = ms_str.parse::<i64>() else {
-                            return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+                            return Ok(Some(err_not_integer()));
                         };
                         if ms < 0 {
-                            return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+                            return Ok(Some(err_not_integer()));
                         }
                         expire_millis = Some(ms);
                     }
                     _ => {
-                        return Ok(Some(Command::Error("ERR syntax error".to_string())));
+                        return Ok(Some(err_syntax()));
                     }
                 }
             }
@@ -164,355 +177,355 @@ pub async fn read_command(
         }
         "GET" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'get' command".to_string())));
+                return Ok(Some(err_wrong_args("get")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'get' command".to_string())));
+                return Ok(Some(err_wrong_args("get")));
             }
             Command::Get { key }
         }
         "INCR" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'incr' command".to_string())));
+                return Ok(Some(err_wrong_args("incr")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'incr' command".to_string())));
+                return Ok(Some(err_wrong_args("incr")));
             }
             Command::Incr { key }
         }
         "DECR" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'decr' command".to_string())));
+                return Ok(Some(err_wrong_args("decr")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'decr' command".to_string())));
+                return Ok(Some(err_wrong_args("decr")));
             }
             Command::Decr { key }
         }
         "INCRBY" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'incrby' command".to_string())));
+                return Ok(Some(err_wrong_args("incrby")));
             };
             let Some(delta_s) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'incrby' command".to_string())));
+                return Ok(Some(err_wrong_args("incrby")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'incrby' command".to_string())));
+                return Ok(Some(err_wrong_args("incrby")));
             }
             let Ok(delta) = delta_s.parse::<i64>() else {
-                return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+                return Ok(Some(err_not_integer()));
             };
             Command::Incrby { key, delta }
         }
         "DECRBY" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'decrby' command".to_string())));
+                return Ok(Some(err_wrong_args("decrby")));
             };
             let Some(delta_s) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'decrby' command".to_string())));
+                return Ok(Some(err_wrong_args("decrby")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'decrby' command".to_string())));
+                return Ok(Some(err_wrong_args("decrby")));
             }
             let Ok(delta) = delta_s.parse::<i64>() else {
-                return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+                return Ok(Some(err_not_integer()));
             };
             Command::Decrby { key, delta }
         }
         "DEL" => {
             let keys: Vec<String> = iter.collect();
             if keys.is_empty() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'del' command".to_string())));
+                return Ok(Some(err_wrong_args("del")));
             }
             Command::Del { keys }
         }
         "EXISTS" => {
             let keys: Vec<String> = iter.collect();
             if keys.is_empty() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'exists' command".to_string())));
+                return Ok(Some(err_wrong_args("exists")));
             }
             Command::Exists { keys }
         }
         "TYPE" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'type' command".to_string())));
+                return Ok(Some(err_wrong_args("type")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'type' command".to_string())));
+                return Ok(Some(err_wrong_args("type")));
             }
             Command::Type { key }
         }
         "KEYS" => {
             let Some(pattern) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'keys' command".to_string())));
+                return Ok(Some(err_wrong_args("keys")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'keys' command".to_string())));
+                return Ok(Some(err_wrong_args("keys")));
             }
             Command::Keys { pattern }
         }
         "LPUSH" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'lpush' command".to_string())));
+                return Ok(Some(err_wrong_args("lpush")));
             };
             let values: Vec<String> = iter.collect();
             if values.is_empty() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'lpush' command".to_string())));
+                return Ok(Some(err_wrong_args("lpush")));
             }
             Command::Lpush { key, values }
         }
         "RPUSH" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'rpush' command".to_string())));
+                return Ok(Some(err_wrong_args("rpush")));
             };
             let values: Vec<String> = iter.collect();
             if values.is_empty() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'rpush' command".to_string())));
+                return Ok(Some(err_wrong_args("rpush")));
             }
             Command::Rpush { key, values }
         }
         "LPOP" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'lpop' command".to_string())));
+                return Ok(Some(err_wrong_args("lpop")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'lpop' command".to_string())));
+                return Ok(Some(err_wrong_args("lpop")));
             }
             Command::Lpop { key }
         }
         "RPOP" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'rpop' command".to_string())));
+                return Ok(Some(err_wrong_args("rpop")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'rpop' command".to_string())));
+                return Ok(Some(err_wrong_args("rpop")));
             }
             Command::Rpop { key }
         }
         "LRANGE" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'lrange' command".to_string())));
+                return Ok(Some(err_wrong_args("lrange")));
             };
             let Some(start_s) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'lrange' command".to_string())));
+                return Ok(Some(err_wrong_args("lrange")));
             };
             let Some(stop_s) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'lrange' command".to_string())));
+                return Ok(Some(err_wrong_args("lrange")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'lrange' command".to_string())));
+                return Ok(Some(err_wrong_args("lrange")));
             }
             let Ok(start) = start_s.parse::<isize>() else {
-                return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+                return Ok(Some(err_not_integer()));
             };
             let Ok(stop) = stop_s.parse::<isize>() else {
-                return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+                return Ok(Some(err_not_integer()));
             };
             Command::Lrange { key, start, stop }
         }
         "SADD" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'sadd' command".to_string())));
+                return Ok(Some(err_wrong_args("sadd")));
             };
             let members: Vec<String> = iter.collect();
             if members.is_empty() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'sadd' command".to_string())));
+                return Ok(Some(err_wrong_args("sadd")));
             }
             Command::Sadd { key, members }
         }
         "SREM" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'srem' command".to_string())));
+                return Ok(Some(err_wrong_args("srem")));
             };
             let members: Vec<String> = iter.collect();
             if members.is_empty() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'srem' command".to_string())));
+                return Ok(Some(err_wrong_args("srem")));
             }
             Command::Srem { key, members }
         }
         "SMEMBERS" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'smembers' command".to_string())));
+                return Ok(Some(err_wrong_args("smembers")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'smembers' command".to_string())));
+                return Ok(Some(err_wrong_args("smembers")));
             }
             Command::Smembers { key }
         }
         "SCARD" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'scard' command".to_string())));
+                return Ok(Some(err_wrong_args("scard")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'scard' command".to_string())));
+                return Ok(Some(err_wrong_args("scard")));
             }
             Command::Scard { key }
         }
         "SISMEMBER" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'sismember' command".to_string())));
+                return Ok(Some(err_wrong_args("sismember")));
             };
             let Some(member) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'sismember' command".to_string())));
+                return Ok(Some(err_wrong_args("sismember")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'sismember' command".to_string())));
+                return Ok(Some(err_wrong_args("sismember")));
             }
             Command::Sismember { key, member }
         }
         "SUNION" => {
             let keys: Vec<String> = iter.collect();
             if keys.is_empty() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'sunion' command".to_string())));
+                return Ok(Some(err_wrong_args("sunion")));
             }
             Command::Sunion { keys }
         }
         "SINTER" => {
             let keys: Vec<String> = iter.collect();
             if keys.is_empty() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'sinter' command".to_string())));
+                return Ok(Some(err_wrong_args("sinter")));
             }
             Command::Sinter { keys }
         }
         "SDIFF" => {
             let keys: Vec<String> = iter.collect();
             if keys.is_empty() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'sdiff' command".to_string())));
+                return Ok(Some(err_wrong_args("sdiff")));
             }
             Command::Sdiff { keys }
         }
         "HSET" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hset' command".to_string())));
+                return Ok(Some(err_wrong_args("hset")));
             };
             let Some(field) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hset' command".to_string())));
+                return Ok(Some(err_wrong_args("hset")));
             };
             let Some(value) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hset' command".to_string())));
+                return Ok(Some(err_wrong_args("hset")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hset' command".to_string())));
+                return Ok(Some(err_wrong_args("hset")));
             }
             Command::Hset { key, field, value }
         }
         "HGET" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hget' command".to_string())));
+                return Ok(Some(err_wrong_args("hget")));
             };
             let Some(field) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hget' command".to_string())));
+                return Ok(Some(err_wrong_args("hget")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hget' command".to_string())));
+                return Ok(Some(err_wrong_args("hget")));
             }
             Command::Hget { key, field }
         }
         "HDEL" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hdel' command".to_string())));
+                return Ok(Some(err_wrong_args("hdel")));
             };
             let fields: Vec<String> = iter.collect();
             if fields.is_empty() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hdel' command".to_string())));
+                return Ok(Some(err_wrong_args("hdel")));
             }
             Command::Hdel { key, fields }
         }
         "HEXISTS" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hexists' command".to_string())));
+                return Ok(Some(err_wrong_args("hexists")));
             };
             let Some(field) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hexists' command".to_string())));
+                return Ok(Some(err_wrong_args("hexists")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hexists' command".to_string())));
+                return Ok(Some(err_wrong_args("hexists")));
             }
             Command::Hexists { key, field }
         }
         "HGETALL" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hgetall' command".to_string())));
+                return Ok(Some(err_wrong_args("hgetall")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'hgetall' command".to_string())));
+                return Ok(Some(err_wrong_args("hgetall")));
             }
             Command::Hgetall { key }
         }
         "EXPIRE" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'expire' command".to_string())));
+                return Ok(Some(err_wrong_args("expire")));
             };
             let Some(sec_str) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'expire' command".to_string())));
+                return Ok(Some(err_wrong_args("expire")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'expire' command".to_string())));
+                return Ok(Some(err_wrong_args("expire")));
             }
             let Ok(seconds) = sec_str.parse::<i64>() else {
-                return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+                return Ok(Some(err_not_integer()));
             };
             Command::Expire { key, seconds }
         }
         "PEXPIRE" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'pexpire' command".to_string())));
+                return Ok(Some(err_wrong_args("pexpire")));
             };
             let Some(ms_str) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'pexpire' command".to_string())));
+                return Ok(Some(err_wrong_args("pexpire")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'pexpire' command".to_string())));
+                return Ok(Some(err_wrong_args("pexpire")));
             }
             let Ok(millis) = ms_str.parse::<i64>() else {
-                return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+                return Ok(Some(err_not_integer()));
             };
             Command::Pexpire { key, millis }
         }
         "TTL" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'ttl' command".to_string())));
+                return Ok(Some(err_wrong_args("ttl")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'ttl' command".to_string())));
+                return Ok(Some(err_wrong_args("ttl")));
             }
             Command::Ttl { key }
         }
         "PTTL" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'pttl' command".to_string())));
+                return Ok(Some(err_wrong_args("pttl")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'pttl' command".to_string())));
+                return Ok(Some(err_wrong_args("pttl")));
             }
             Command::Pttl { key }
         }
         "PERSIST" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'persist' command".to_string())));
+                return Ok(Some(err_wrong_args("persist")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'persist' command".to_string())));
+                return Ok(Some(err_wrong_args("persist")));
             }
             Command::Persist { key }
         }
         "INFO" => {
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'info' command".to_string())));
+                return Ok(Some(err_wrong_args("info")));
             }
             Command::Info
         }
         "MGET" => {
             let keys: Vec<String> = iter.collect();
             if keys.is_empty() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'mget' command".to_string())));
+                return Ok(Some(err_wrong_args("mget")));
             }
             Command::Mget { keys }
         }
         "MSET" => {
             let args: Vec<String> = iter.collect();
             if args.len() < 2 || args.len() % 2 != 0 {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'mset' command".to_string())));
+                return Ok(Some(err_wrong_args("mset")));
             }
             let mut pairs = Vec::new();
             let mut it = args.into_iter();
@@ -523,55 +536,55 @@ pub async fn read_command(
         }
         "SETNX" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'setnx' command".to_string())));
+                return Ok(Some(err_wrong_args("setnx")));
             };
             let Some(value) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'setnx' command".to_string())));
+                return Ok(Some(err_wrong_args("setnx")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'setnx' command".to_string())));
+                return Ok(Some(err_wrong_args("setnx")));
             }
             Command::Setnx { key, value }
         }
         "SETEX" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'setex' command".to_string())));
+                return Ok(Some(err_wrong_args("setex")));
             };
             let Some(sec_s) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'setex' command".to_string())));
+                return Ok(Some(err_wrong_args("setex")));
             };
             let Some(value) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'setex' command".to_string())));
+                return Ok(Some(err_wrong_args("setex")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'setex' command".to_string())));
+                return Ok(Some(err_wrong_args("setex")));
             }
             let Ok(seconds) = sec_s.parse::<i64>() else {
-                return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+                return Ok(Some(err_not_integer()));
             };
             if seconds < 0 {
-                return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+                return Ok(Some(err_not_integer()));
             }
             Command::Setex { key, seconds, value }
         }
         "PSETEX" => {
             let Some(key) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'psetex' command".to_string())));
+                return Ok(Some(err_wrong_args("psetex")));
             };
             let Some(ms_s) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'psetex' command".to_string())));
+                return Ok(Some(err_wrong_args("psetex")));
             };
             let Some(value) = iter.next() else {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'psetex' command".to_string())));
+                return Ok(Some(err_wrong_args("psetex")));
             };
             if iter.next().is_some() {
-                return Ok(Some(Command::Error("ERR wrong number of arguments for 'psetex' command".to_string())));
+                return Ok(Some(err_wrong_args("psetex")));
             }
             let Ok(millis) = ms_s.parse::<i64>() else {
-                return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+                return Ok(Some(err_not_integer()));
             };
             if millis < 0 {
-                return Ok(Some(Command::Error("ERR value is not an integer or out of range".to_string())));
+                return Ok(Some(err_not_integer()));
             }
             Command::Psetex { key, millis, value }
         }
