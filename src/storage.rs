@@ -54,45 +54,56 @@ impl Storage {
         }
     }
 
-    pub fn hset(&self, key: &str, field: &str, value: String) -> usize {
+    pub fn hset(&self, key: &str, field: &str, value: String) -> Result<usize, ()> {
         let now = Instant::now();
         self.remove_if_expired(key, now);
 
-        let mut entry = self
-            .data
-            .entry(key.to_string())
-            .or_insert_with(|| StorageValue::Hash {
-                value: HashMap::new(),
-                expires_at: None,
-            });
+        let mut added = 0usize;
 
-        let added = match entry.value_mut() {
-            StorageValue::Hash { value: map, .. } => {
-                let existed = map.insert(field.to_string(), value).is_some();
-                if existed { 0 } else { 1 }
+        if let Some(mut entry) = self.data.get_mut(key) {
+            match entry.value_mut() {
+                StorageValue::Hash { value: map, .. } => {
+                    let existed = map.insert(field.to_string(), value).is_some();
+                    if !existed {
+                        added = 1;
+                    }
+                }
+                _ => return Err(()),
             }
-            _ => 0, // Key exists but is not a hash
-        };
+        } else {
+            let mut map = HashMap::new();
+            map.insert(field.to_string(), value);
+            added = 1;
+            self.data.insert(
+                key.to_string(),
+                StorageValue::Hash {
+                    value: map,
+                    expires_at: None,
+                },
+            );
+        }
 
         if added > 0 {
             self.touch_key(key);
             self.maybe_evict_for_write();
         }
 
-        added
+        Ok(added)
     }
 
-    pub fn hget(&self, key: &str, field: &str) -> Option<String> {
+    pub fn hget(&self, key: &str, field: &str) -> Result<Option<String>, ()> {
         let now = Instant::now();
         if self.remove_if_expired(key, now) {
-            return None;
+            return Ok(None);
         }
 
         let result = {
-            let entry = self.data.get(key)?;
+            let Some(entry) = self.data.get(key) else {
+                return Ok(None);
+            };
             match entry.value() {
                 StorageValue::Hash { value: map, .. } => map.get(field).cloned(),
-                _ => None,
+                _ => return Err(()),
             }
         };
 
@@ -100,17 +111,17 @@ impl Storage {
             self.touch_key(key);
         }
 
-        result
+        Ok(result)
     }
 
-    pub fn hdel(&self, key: &str, fields: &[String]) -> usize {
+    pub fn hdel(&self, key: &str, fields: &[String]) -> Result<usize, ()> {
         let now = Instant::now();
         if self.remove_if_expired(key, now) {
-            return 0;
+            return Ok(0);
         }
 
         let Some(mut entry) = self.data.get_mut(key) else {
-            return 0;
+            return Ok(0);
         };
 
         let removed = match entry.value_mut() {
@@ -123,42 +134,47 @@ impl Storage {
                 }
                 removed
             }
-            _ => 0,
+            _ => return Err(()),
         };
 
         if removed > 0 {
             self.touch_key(key);
         }
 
-        removed
+        Ok(removed)
     }
 
-    pub fn hexists(&self, key: &str, field: &str) -> bool {
+    pub fn hexists(&self, key: &str, field: &str) -> Result<bool, ()> {
         let now = Instant::now();
         if self.remove_if_expired(key, now) {
-            return false;
+            return Ok(false);
         }
 
-        self.data.get(key).map_or(false, |entry| {
-            if let StorageValue::Hash { value: map, .. } = entry.value() {
-                map.contains_key(field)
-            } else {
-                false
-            }
-        })
+        let Some(entry) = self.data.get(key) else {
+            return Ok(false);
+        };
+
+        let exists = if let StorageValue::Hash { value: map, .. } = entry.value() {
+            map.contains_key(field)
+        } else {
+            return Err(());
+        };
+
+        Ok(exists)
     }
 
-    pub fn hgetall(&self, key: &str) -> Vec<(String, String)> {
+    pub fn hgetall(&self, key: &str) -> Result<Vec<(String, String)>, ()> {
         let now = Instant::now();
         if self.remove_if_expired(key, now) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let (result, should_touch) = {
             let entry = self.data.get(key);
             let map = match entry.as_ref().map(|e| e.value()) {
                 Some(StorageValue::Hash { value: m, .. }) => m,
-                _ => return Vec::new(),
+                None => return Ok(Vec::new()),
+                _ => return Err(()),
             };
 
             let vec: Vec<(String, String)> =
@@ -171,7 +187,7 @@ impl Storage {
             self.touch_key(key);
         }
 
-        result
+        Ok(result)
     }
 
     pub fn set(&self, key: String, value: String) {
@@ -256,6 +272,7 @@ impl Storage {
         let mut removed = 0;
         for key in keys {
             if self.data.remove(key).is_some() {
+                self.last_access.remove(key);
                 removed += 1;
             }
         }
@@ -352,63 +369,77 @@ impl Storage {
         }
     }
 
-    pub fn lpush(&self, key: &str, values: &[String]) -> usize {
+    pub fn lpush(&self, key: &str, values: &[String]) -> Result<usize, ()> {
         self.push_internal(key, values, true)
     }
 
-    pub fn rpush(&self, key: &str, values: &[String]) -> usize {
+    pub fn rpush(&self, key: &str, values: &[String]) -> Result<usize, ()> {
         self.push_internal(key, values, false)
     }
 
-    fn push_internal(&self, key: &str, values: &[String], left: bool) -> usize {
+    fn push_internal(&self, key: &str, values: &[String], left: bool) -> Result<usize, ()> {
         let now = Instant::now();
         self.remove_if_expired(key, now);
 
-        let mut entry = self
-            .data
-            .entry(key.to_string())
-            .or_insert_with(|| StorageValue::List {
-                value: VecDeque::new(),
-                expires_at: None,
-            });
+        let len;
 
-        let len = match entry.value_mut() {
-            StorageValue::List { value: list, .. } => {
-                for v in values {
-                    if left {
-                        list.push_front(v.clone());
-                    } else {
-                        list.push_back(v.clone());
+        if let Some(mut entry) = self.data.get_mut(key) {
+            match entry.value_mut() {
+                StorageValue::List { value: list, .. } => {
+                    for v in values {
+                        if left {
+                            list.push_front(v.clone());
+                        } else {
+                            list.push_back(v.clone());
+                        }
                     }
+                    len = list.len();
                 }
-                list.len()
+                _ => return Err(()),
             }
-            _ => 0, // Key exists but is not a list
-        };
+        } else {
+            let mut list = VecDeque::new();
+            for v in values {
+                if left {
+                    list.push_front(v.clone());
+                } else {
+                    list.push_back(v.clone());
+                }
+            }
+            len = list.len();
+            self.data.insert(
+                key.to_string(),
+                StorageValue::List {
+                    value: list,
+                    expires_at: None,
+                },
+            );
+        }
 
         if len > 0 {
             self.touch_key(key);
             self.maybe_evict_for_write();
         }
 
-        len
+        Ok(len)
     }
 
-    pub fn lrange(&self, key: &str, start: isize, stop: isize) -> Vec<String> {
+    pub fn lrange(&self, key: &str, start: isize, stop: isize) -> Result<Vec<String>, ()> {
         let now = Instant::now();
         if self.remove_if_expired(key, now) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let entry = self.data.get(key);
         let list = match entry.as_ref().map(|e| e.value()) {
             Some(StorageValue::List { value, .. }) => value,
-            _ => return Vec::new(), // Key does not exist or is not a list
+            None => return Ok(Vec::new()),
+            _ => return Err(()),
         };
 
         let len = list.len() as isize;
         if len == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let mut s = start;
@@ -429,7 +460,7 @@ impl Storage {
         }
 
         if s > e || s >= len {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let start_idx = s as usize;
@@ -446,65 +477,82 @@ impl Storage {
             self.touch_key(key);
         }
 
-        result
+        Ok(result)
     }
 
-    pub fn lpop(&self, key: &str) -> Option<String> {
+    pub fn lpop(&self, key: &str) -> Result<Option<String>, ()> {
         let now = Instant::now();
         if self.remove_if_expired(key, now) {
-            return None;
+            return Ok(None);
         }
 
-        let mut entry = self.data.get_mut(key)?;
-        match entry.value_mut() {
+        let Some(mut entry) = self.data.get_mut(key) else {
+            return Ok(None);
+        };
+
+        let result = match entry.value_mut() {
             StorageValue::List { value: list, .. } => list.pop_front(),
-            _ => None, // Key exists but is not a list
-        }
+            _ => return Err(()),
+        };
+
+        Ok(result)
     }
 
-    pub fn rpop(&self, key: &str) -> Option<String> {
+    pub fn rpop(&self, key: &str) -> Result<Option<String>, ()> {
         let now = Instant::now();
         if self.remove_if_expired(key, now) {
-            return None;
+            return Ok(None);
         }
 
-        let mut entry = self.data.get_mut(key)?;
-        match entry.value_mut() {
+        let Some(mut entry) = self.data.get_mut(key) else {
+            return Ok(None);
+        };
+
+        let result = match entry.value_mut() {
             StorageValue::List { value: list, .. } => list.pop_back(),
-            _ => None, // Key exists but is not a list
-        }
+            _ => return Err(()),
+        };
+
+        Ok(result)
     }
 
-    pub fn llen(&self, key: &str) -> usize {
+    pub fn llen(&self, key: &str) -> Result<usize, ()> {
         let now = Instant::now();
         if self.remove_if_expired(key, now) {
-            return 0;
+            return Ok(0);
         }
 
-        self.data.get(key).map_or(0, |entry| {
-            if let StorageValue::List { value: list, .. } = entry.value() {
-                list.len()
-            } else {
-                0
-            }
-        })
+        let Some(entry) = self.data.get(key) else {
+            return Ok(0);
+        };
+
+        let len = if let StorageValue::List { value: list, .. } = entry.value() {
+            list.len()
+        } else {
+            return Err(());
+        };
+
+        Ok(len)
     }
 
-    pub fn lindex(&self, key: &str, index: isize) -> Option<String> {
+    pub fn lindex(&self, key: &str, index: isize) -> Result<Option<String>, ()> {
         let now = Instant::now();
         if self.remove_if_expired(key, now) {
-            return None;
+            return Ok(None);
         }
 
-        let entry = self.data.get(key)?;
+        let Some(entry) = self.data.get(key) else {
+            return Ok(None);
+        };
+
         let list = match entry.value() {
             StorageValue::List { value: list, .. } => list,
-            _ => return None,
+            _ => return Err(()),
         };
 
         let len = list.len() as isize;
         if len == 0 {
-            return None;
+            return Ok(None);
         }
 
         let mut idx = index;
@@ -512,29 +560,29 @@ impl Storage {
             idx += len;
         }
         if idx < 0 || idx >= len {
-            return None;
+            return Ok(None);
         }
 
-        list.get(idx as usize).cloned()
+        Ok(list.get(idx as usize).cloned())
     }
 
-    pub fn lrem(&self, key: &str, count: isize, value: &str) -> usize {
+    pub fn lrem(&self, key: &str, count: isize, value: &str) -> Result<usize, ()> {
         let now = Instant::now();
         if self.remove_if_expired(key, now) {
-            return 0;
+            return Ok(0);
         }
 
         let Some(mut entry) = self.data.get_mut(key) else {
-            return 0;
+            return Ok(0);
         };
 
         let list = match entry.value_mut() {
             StorageValue::List { value: list, .. } => list,
-            _ => return 0,
+            _ => return Err(()),
         };
 
         if list.is_empty() {
-            return 0;
+            return Ok(0);
         }
 
         // Implement Redis-like LREM semantics.
@@ -573,7 +621,11 @@ impl Storage {
             }
         }
 
-        removed
+        if removed > 0 {
+            self.touch_key(key);
+        }
+
+        Ok(removed)
     }
 
     pub fn ltrim(&self, key: &str, start: isize, stop: isize) -> Result<(), ()> {
@@ -640,43 +692,51 @@ impl Storage {
         Ok(())
     }
 
-    pub fn sadd(&self, key: &str, members: &[String]) -> usize {
+    pub fn sadd(&self, key: &str, members: &[String]) -> Result<usize, ()> {
         let now = Instant::now();
         self.remove_if_expired(key, now);
 
-        let mut entry = self
-            .data
-            .entry(key.to_string())
-            .or_insert_with(|| StorageValue::Set {
-                value: HashSet::new(),
-                expires_at: None,
-            });
+        let mut added = 0usize;
 
-        let added = match entry.value_mut() {
-            StorageValue::Set { value: set, .. } => {
-                let mut added = 0;
-                for m in members {
-                    if set.insert(m.clone()) {
-                        added += 1;
+        if let Some(mut entry) = self.data.get_mut(key) {
+            match entry.value_mut() {
+                StorageValue::Set { value: set, .. } => {
+                    for m in members {
+                        if set.insert(m.clone()) {
+                            added += 1;
+                        }
                     }
                 }
-                added
+                _ => return Err(()),
             }
-            _ => 0, // Key exists but is not a set
-        };
+        } else {
+            let mut set = HashSet::new();
+            for m in members {
+                if set.insert(m.clone()) {
+                    added += 1;
+                }
+            }
+            self.data.insert(
+                key.to_string(),
+                StorageValue::Set {
+                    value: set,
+                    expires_at: None,
+                },
+            );
+        }
 
         if added > 0 {
             self.touch_key(key);
             self.maybe_evict_for_write();
         }
 
-        added
+        Ok(added)
     }
 
-    pub fn srem(&self, key: &str, members: &[String]) -> usize {
+    pub fn srem(&self, key: &str, members: &[String]) -> Result<usize, ()> {
         let now = Instant::now();
         if self.remove_if_expired(key, now) {
-            return 0;
+            return Ok(0);
         }
 
         let removed = if let Some(mut entry) = self.data.get_mut(key) {
@@ -690,30 +750,31 @@ impl Storage {
                     }
                     removed
                 }
-                _ => 0, // Key exists but is not a set
+                _ => return Err(()),
             }
         } else {
-            0 // Key does not exist
+            0
         };
 
         if removed > 0 {
             self.touch_key(key);
         }
 
-        removed
+        Ok(removed)
     }
 
-    pub fn smembers(&self, key: &str) -> Vec<String> {
+    pub fn smembers(&self, key: &str) -> Result<Vec<String>, ()> {
         let now = Instant::now();
         if self.remove_if_expired(key, now) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let (mut members, should_touch) = {
             let entry = self.data.get(key);
             let set = match entry.as_ref().map(|e| e.value()) {
                 Some(StorageValue::Set { value, .. }) => value,
-                _ => return Vec::new(), // Key does not exist or is not a set
+                None => return Ok(Vec::new()),
+                _ => return Err(()),
             };
 
             let members: Vec<String> = set.iter().cloned().collect();
@@ -727,7 +788,7 @@ impl Storage {
             self.touch_key(key);
         }
 
-        members
+        Ok(members)
     }
 
     pub fn dbsize(&self) -> usize {
@@ -743,37 +804,45 @@ impl Storage {
             .count()
     }
 
-    pub fn scard(&self, key: &str) -> usize {
+    pub fn scard(&self, key: &str) -> Result<usize, ()> {
         let now = Instant::now();
         if self.remove_if_expired(key, now) {
-            return 0;
+            return Ok(0);
         }
 
-        self.data.get(key).map_or(0, |entry| {
-            if let StorageValue::Set { value: set, .. } = entry.value() {
-                set.len()
-            } else {
-                0 // Key exists but is not a set
-            }
-        })
+        let Some(entry) = self.data.get(key) else {
+            return Ok(0);
+        };
+
+        let len = if let StorageValue::Set { value: set, .. } = entry.value() {
+            set.len()
+        } else {
+            return Err(());
+        };
+
+        Ok(len)
     }
 
-    pub fn sismember(&self, key: &str, member: &str) -> bool {
+    pub fn sismember(&self, key: &str, member: &str) -> Result<bool, ()> {
         let now = Instant::now();
         if self.remove_if_expired(key, now) {
-            return false;
+            return Ok(false);
         }
 
-        self.data.get(key).map_or(false, |entry| {
-            if let StorageValue::Set { value: set, .. } = entry.value() {
-                set.contains(member)
-            } else {
-                false // Key exists but is not a set
-            }
-        })
+        let Some(entry) = self.data.get(key) else {
+            return Ok(false);
+        };
+
+        let exists = if let StorageValue::Set { value: set, .. } = entry.value() {
+            set.contains(member)
+        } else {
+            return Err(());
+        };
+
+        Ok(exists)
     }
 
-    pub fn sunion(&self, keys: &[String]) -> Vec<String> {
+    pub fn sunion(&self, keys: &[String]) -> Result<Vec<String>, ()> {
         let mut result: HashSet<String> = HashSet::new();
         for key in keys {
             let now = Instant::now();
@@ -782,17 +851,20 @@ impl Storage {
             }
 
             if let Some(entry) = self.data.get(key) {
-                if let StorageValue::Set { value: set, .. } = entry.value() {
-                    for m in set {
-                        result.insert(m.clone());
+                match entry.value() {
+                    StorageValue::Set { value: set, .. } => {
+                        for m in set {
+                            result.insert(m.clone());
+                        }
                     }
+                    _ => return Err(()),
                 }
             }
         }
 
         let mut members: Vec<String> = result.into_iter().collect();
         members.sort();
-        members
+        Ok(members)
     }
 
     pub fn save_rdb<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
@@ -908,6 +980,7 @@ impl Storage {
         }
 
         self.data.clear();
+        self.last_access.clear();
 
         loop {
             let mut type_buf = [0u8; 1];
@@ -1086,6 +1159,9 @@ impl Storage {
         // Redis 语义：seconds <= 0 视为立刻过期并删除，若 key 存在返回 1
         if seconds <= 0 {
             let existed = self.data.remove(key).is_some();
+            if existed {
+                self.last_access.remove(key);
+            }
             return existed;
         }
 
@@ -1114,6 +1190,9 @@ impl Storage {
     pub fn expire_millis(&self, key: &str, millis: i64) -> bool {
         if millis <= 0 {
             let existed = self.data.remove(key).is_some();
+            if existed {
+                self.last_access.remove(key);
+            }
             return existed;
         }
 
@@ -1166,7 +1245,9 @@ impl Storage {
 
         if *deadline <= now {
             // 过期键交给懒删除/定期删除，这里视为不存在
-            self.data.remove(key);
+            if self.data.remove(key).is_some() {
+                self.last_access.remove(key);
+            }
             return -2;
         }
 
@@ -1199,7 +1280,9 @@ impl Storage {
         };
 
         if *deadline <= now {
-            self.data.remove(key);
+            if self.data.remove(key).is_some() {
+                self.last_access.remove(key);
+            }
             return -2;
         }
 
@@ -1232,23 +1315,23 @@ impl Storage {
         }
     }
 
-    pub fn sinter(&self, keys: &[String]) -> Vec<String> {
+    pub fn sinter(&self, keys: &[String]) -> Result<Vec<String>, ()> {
         if keys.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
-        // 先扫描一遍，找到最小的集合（按元素个数），同时保证所有 key 都存在且类型为 Set
+        // 先扫描一遍，找到最小的集合（按元素个数），同时检查类型
         let mut smallest_index: Option<usize> = None;
         let mut smallest_len = usize::MAX;
 
         for (i, key) in keys.iter().enumerate() {
             let now = Instant::now();
             if self.remove_if_expired(key, now) {
-                return Vec::new();
+                return Ok(Vec::new());
             }
 
             let Some(entry) = self.data.get(key) else {
-                return Vec::new(); // Key does not exist
+                return Ok(Vec::new()); // Key does not exist -> empty
             };
 
             if let StorageValue::Set { value: set, .. } = entry.value() {
@@ -1258,32 +1341,31 @@ impl Storage {
                     smallest_index = Some(i);
                 }
             } else {
-                return Vec::new(); // Key exists but is not a set
+                return Err(()); // WRONGTYPE
             }
         }
 
         let Some(smallest_idx) = smallest_index else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
 
         // 再次获取最小集合，遍历其元素，并对其他集合做 contains 检查
         let smallest_key = &keys[smallest_idx];
         let now = Instant::now();
         if self.remove_if_expired(smallest_key, now) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let Some(entry) = self.data.get(smallest_key) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let StorageValue::Set { value: smallest_set, .. } = entry.value() else {
-            return Vec::new();
+            return Err(());
         };
 
         let mut result: HashSet<String> = HashSet::new();
 
         'outer: for member in smallest_set.iter() {
-            // 检查该元素是否出现在其他所有集合中
             for (j, key) in keys.iter().enumerate() {
                 if j == smallest_idx {
                     continue;
@@ -1291,14 +1373,14 @@ impl Storage {
 
                 let now = Instant::now();
                 if self.remove_if_expired(key, now) {
-                    return Vec::new();
+                    return Ok(Vec::new());
                 }
 
                 let Some(other_entry) = self.data.get(key) else {
-                    return Vec::new();
+                    return Ok(Vec::new());
                 };
                 let StorageValue::Set { value: other_set, .. } = other_entry.value() else {
-                    return Vec::new();
+                    return Err(());
                 };
 
                 if !other_set.contains(member) {
@@ -1311,25 +1393,26 @@ impl Storage {
 
         let mut members: Vec<String> = result.into_iter().collect();
         members.sort();
-        members
+        Ok(members)
     }
 
-    pub fn sdiff(&self, keys: &[String]) -> Vec<String> {
+    pub fn sdiff(&self, keys: &[String]) -> Result<Vec<String>, ()> {
         if keys.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let first_key = &keys[0];
         let now = Instant::now();
         if self.remove_if_expired(first_key, now) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let first_set_entry = self.data.get(first_key);
 
         let first_set = match first_set_entry.as_ref().map(|e| e.value()) {
             Some(StorageValue::Set { value: s, .. }) => s,
-            _ => return Vec::new(), // Key does not exist or is not a set
+            None => return Ok(Vec::new()), // missing -> empty
+            _ => return Err(()),           // WRONGTYPE
         };
 
         let mut result: HashSet<String> = first_set.iter().cloned().collect();
@@ -1341,17 +1424,20 @@ impl Storage {
             }
 
             if let Some(entry) = self.data.get(key) {
-                if let StorageValue::Set { value: set, .. } = entry.value() {
-                    for member in set.iter() {
-                        result.remove(member);
+                match entry.value() {
+                    StorageValue::Set { value: set, .. } => {
+                        for member in set.iter() {
+                            result.remove(member);
+                        }
                     }
+                    _ => return Err(()), // WRONGTYPE
                 }
             }
         }
 
         let mut members: Vec<String> = result.into_iter().collect();
         members.sort();
-        members
+        Ok(members)
     }
 
     fn value_is_expired(value: &StorageValue, now: Instant) -> bool {
@@ -1392,7 +1478,9 @@ impl Storage {
         }
 
         if should_remove {
-            self.data.remove(key);
+            if self.data.remove(key).is_some() {
+                self.last_access.remove(key);
+            }
             true
         } else {
             false

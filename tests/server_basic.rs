@@ -161,6 +161,72 @@ async fn responds_to_basic_commands() {
 }
 
 #[tokio::test]
+async fn wrongtype_errors_for_sets_and_hashes() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // SET strkey "v"
+    let set_req = "*3\r\n$3\r\nSET\r\n$6\r\nstrkey\r\n$1\r\nv\r\n";
+    write_half.write_all(set_req.as_bytes()).await.unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // SADD strkey a  -> WRONGTYPE (string vs set)
+    let sadd_wrong = "*3\r\n$4\r\nSADD\r\n$6\r\nstrkey\r\n$1\r\na\r\n";
+    write_half.write_all(sadd_wrong.as_bytes()).await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(
+        line,
+        "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+    );
+
+    // HSET strkey f v -> WRONGTYPE (string vs hash)
+    let hset_wrong = "*4\r\n$4\r\nHSET\r\n$6\r\nstrkey\r\n$1\r\nf\r\n$1\r\nv\r\n";
+    write_half.write_all(hset_wrong.as_bytes()).await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(
+        line,
+        "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+    );
+
+    // 建一个真正的 set，再对它做 list/hash 操作
+    let sadd_real = "*3\r\n$4\r\nSADD\r\n$5\r\nmyset\r\n$1\r\na\r\n";
+    write_half.write_all(sadd_real.as_bytes()).await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":1\r\n");
+
+    // LPUSH myset x -> WRONGTYPE (set vs list)
+    let lpush_wrong = "*3\r\n$5\r\nLPUSH\r\n$5\r\nmyset\r\n$1\r\nx\r\n";
+    write_half.write_all(lpush_wrong.as_bytes()).await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(
+        line,
+        "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+    );
+
+    // HGET myset f -> WRONGTYPE (set vs hash)
+    let hget_wrong = "*3\r\n$4\r\nHGET\r\n$5\r\nmyset\r\n$1\r\nf\r\n";
+    write_half.write_all(hget_wrong.as_bytes()).await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(
+        line,
+        "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+    );
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn select_command_isolates_databases() {
     let (addr, shutdown, handle) = spawn_server().await;
 

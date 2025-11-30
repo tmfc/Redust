@@ -15,7 +15,6 @@ pub async fn read_resp_array(
     }
 
     let header = header.trim_end();
-    println!("[resp] header line: {:?}", header);
     if !header.starts_with('*') {
         return Ok(Some(vec![header.to_string()]));
     }
@@ -43,7 +42,6 @@ pub async fn read_resp_array(
         }
 
         let bulk_header = bulk_header.trim_end();
-        println!("[resp] bulk header line: {:?}", bulk_header);
         let Some(stripped) = bulk_header.strip_prefix('$') else {
             // This case handles non-bulk string elements in the array, which is not valid RESP
             // for the commands we are parsing. We'll treat it as an error.
@@ -81,11 +79,9 @@ pub async fn read_resp_array(
         }
 
         let value = String::from_utf8_lossy(&buf).into_owned();
-        println!("[resp] bulk value: {:?}", value);
         parts.push(value);
     }
 
-    println!("[resp] parsed array parts: {:?}", parts);
     Ok(Some(parts))
 }
 

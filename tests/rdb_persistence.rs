@@ -17,9 +17,15 @@ async fn rdb_basic_roundtrip_via_storage() {
     let storage = Storage::default();
 
     storage.set("foo".to_string(), "bar".to_string());
-    storage.lpush("mylist", &vec!["a".to_string(), "b".to_string()]);
-    storage.sadd("myset", &vec!["x".to_string(), "y".to_string()]);
-    storage.hset("myhash", "field", "val".to_string());
+    storage
+        .lpush("mylist", &vec!["a".to_string(), "b".to_string()])
+        .unwrap();
+    storage
+        .sadd("myset", &vec!["x".to_string(), "y".to_string()])
+        .unwrap();
+    storage
+        .hset("myhash", "field", "val".to_string())
+        .unwrap();
 
     storage.set("ttl_key".to_string(), "tv".to_string());
     let _ = storage.expire_seconds("ttl_key", 10);
@@ -32,15 +38,15 @@ async fn rdb_basic_roundtrip_via_storage() {
 
     assert_eq!(restored.get("foo").as_deref(), Some("bar"));
 
-    let lvals = restored.lrange("mylist", 0, -1);
+    let lvals = restored.lrange("mylist", 0, -1).unwrap();
     // Redis 语义：LPUSH mylist a b -> 列表内容为 ["b", "a"]
     assert_eq!(lvals, vec!["b".to_string(), "a".to_string()]);
 
-    let mut svals = restored.smembers("myset");
+    let mut svals = restored.smembers("myset").unwrap();
     svals.sort();
     assert_eq!(svals, vec!["x".to_string(), "y".to_string()]);
 
-    let hvals = restored.hgetall("myhash");
+    let hvals = restored.hgetall("myhash").unwrap();
     assert_eq!(hvals, vec![("field".to_string(), "val".to_string())]);
 
     let ttl = restored.ttl_seconds("ttl_key");

@@ -236,56 +236,104 @@ async fn handle_list_command(
     match cmd {
         Command::Lpush { key, values } => {
             let physical = prefix_key(current_db, &key);
-            let len = storage.lpush(&physical, &values);
-            respond_integer(writer, len as i64).await?;
+            match storage.lpush(&physical, &values) {
+                Ok(len) => {
+                    respond_integer(writer, len as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
         }
         Command::Rpush { key, values } => {
             let physical = prefix_key(current_db, &key);
-            let len = storage.rpush(&physical, &values);
-            respond_integer(writer, len as i64).await?;
+            match storage.rpush(&physical, &values) {
+                Ok(len) => {
+                    respond_integer(writer, len as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
         }
         Command::Lrange { key, start, stop } => {
             let physical = prefix_key(current_db, &key);
-            let items = storage.lrange(&physical, start, stop);
-            let mut response = format!("*{}\r\n", items.len());
-            for item in items {
-                response.push_str(&format!("${}\r\n{}\r\n", item.len(), item));
+            match storage.lrange(&physical, start, stop) {
+                Ok(items) => {
+                    let mut response = format!("*{}\r\n", items.len());
+                    for item in items {
+                        response.push_str(&format!("${}\r\n{}\r\n", item.len(), item));
+                    }
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
             }
-            writer.write_all(response.as_bytes()).await?;
         }
         Command::Lpop { key } => {
             let physical = prefix_key(current_db, &key);
-            if let Some(value) = storage.lpop(&physical) {
-                respond_bulk_string(writer, &value).await?;
-            } else {
-                respond_null_bulk(writer).await?;
+            match storage.lpop(&physical) {
+                Ok(Some(value)) => {
+                    respond_bulk_string(writer, &value).await?;
+                }
+                Ok(None) => {
+                    respond_null_bulk(writer).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
             }
         }
         Command::Rpop { key } => {
             let physical = prefix_key(current_db, &key);
-            if let Some(value) = storage.rpop(&physical) {
-                respond_bulk_string(writer, &value).await?;
-            } else {
-                respond_null_bulk(writer).await?;
+            match storage.rpop(&physical) {
+                Ok(Some(value)) => {
+                    respond_bulk_string(writer, &value).await?;
+                }
+                Ok(None) => {
+                    respond_null_bulk(writer).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
             }
         }
         Command::Llen { key } => {
             let physical = prefix_key(current_db, &key);
-            let len = storage.llen(&physical);
-            respond_integer(writer, len as i64).await?;
+            match storage.llen(&physical) {
+                Ok(len) => {
+                    respond_integer(writer, len as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
         }
         Command::Lindex { key, index } => {
             let physical = prefix_key(current_db, &key);
-            if let Some(value) = storage.lindex(&physical, index) {
-                respond_bulk_string(writer, &value).await?;
-            } else {
-                respond_null_bulk(writer).await?;
+            match storage.lindex(&physical, index) {
+                Ok(Some(value)) => {
+                    respond_bulk_string(writer, &value).await?;
+                }
+                Ok(None) => {
+                    respond_null_bulk(writer).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
             }
         }
         Command::Lrem { key, count, value } => {
             let physical = prefix_key(current_db, &key);
-            let removed = storage.lrem(&physical, count, &value);
-            respond_integer(writer, removed as i64).await?;
+            match storage.lrem(&physical, count, &value) {
+                Ok(removed) => {
+                    respond_integer(writer, removed as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
         }
         Command::Ltrim { key, start, stop } => {
             let physical = prefix_key(current_db, &key);
@@ -313,60 +361,108 @@ async fn handle_set_command(
     match cmd {
         Command::Sadd { key, members } => {
             let physical = prefix_key(current_db, &key);
-            let added = storage.sadd(&physical, &members);
-            respond_integer(writer, added as i64).await?;
+            match storage.sadd(&physical, &members) {
+                Ok(added) => {
+                    respond_integer(writer, added as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
         }
         Command::Srem { key, members } => {
             let physical = prefix_key(current_db, &key);
-            let removed = storage.srem(&physical, &members);
-            respond_integer(writer, removed as i64).await?;
+            match storage.srem(&physical, &members) {
+                Ok(removed) => {
+                    respond_integer(writer, removed as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
         }
         Command::Smembers { key } => {
             let physical = prefix_key(current_db, &key);
-            let members = storage.smembers(&physical);
-            let mut response = format!("*{}\r\n", members.len());
-            for m in members {
-                response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
+            match storage.smembers(&physical) {
+                Ok(members) => {
+                    let mut response = format!("*{}\r\n", members.len());
+                    for m in members {
+                        response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
+                    }
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
             }
-            writer.write_all(response.as_bytes()).await?;
         }
         Command::Scard { key } => {
             let physical = prefix_key(current_db, &key);
-            let card = storage.scard(&physical);
-            respond_integer(writer, card as i64).await?;
+            match storage.scard(&physical) {
+                Ok(card) => {
+                    respond_integer(writer, card as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
         }
         Command::Sismember { key, member } => {
             let physical = prefix_key(current_db, &key);
-            let is_member = storage.sismember(&physical, &member);
-            let v = if is_member { 1 } else { 0 };
-            respond_integer(writer, v).await?;
+            match storage.sismember(&physical, &member) {
+                Ok(is_member) => {
+                    let v = if is_member { 1 } else { 0 };
+                    respond_integer(writer, v).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
         }
         Command::Sunion { keys } => {
             let physical: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
-            let members = storage.sunion(&physical);
-            let mut response = format!("*{}\r\n", members.len());
-            for m in members {
-                response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
+            match storage.sunion(&physical) {
+                Ok(members) => {
+                    let mut response = format!("*{}\r\n", members.len());
+                    for m in members {
+                        response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
+                    }
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
             }
-            writer.write_all(response.as_bytes()).await?;
         }
         Command::Sinter { keys } => {
             let physical: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
-            let members = storage.sinter(&physical);
-            let mut response = format!("*{}\r\n", members.len());
-            for m in members {
-                response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
+            match storage.sinter(&physical) {
+                Ok(members) => {
+                    let mut response = format!("*{}\r\n", members.len());
+                    for m in members {
+                        response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
+                    }
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
             }
-            writer.write_all(response.as_bytes()).await?;
         }
         Command::Sdiff { keys } => {
             let physical: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
-            let members = storage.sdiff(&physical);
-            let mut response = format!("*{}\r\n", members.len());
-            for m in members {
-                response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
+            match storage.sdiff(&physical) {
+                Ok(members) => {
+                    let mut response = format!("*{}\r\n", members.len());
+                    for m in members {
+                        response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
+                    }
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
             }
-            writer.write_all(response.as_bytes()).await?;
         }
         _ => {}
     }
@@ -383,37 +479,67 @@ async fn handle_hash_command(
     match cmd {
         Command::Hset { key, field, value } => {
             let physical = prefix_key(current_db, &key);
-            let added = storage.hset(&physical, &field, value);
-            respond_integer(writer, added as i64).await?;
+            match storage.hset(&physical, &field, value) {
+                Ok(added) => {
+                    respond_integer(writer, added as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
         }
         Command::Hget { key, field } => {
             let physical = prefix_key(current_db, &key);
-            if let Some(value) = storage.hget(&physical, &field) {
-                respond_bulk_string(writer, &value).await?;
-            } else {
-                respond_null_bulk(writer).await?;
+            match storage.hget(&physical, &field) {
+                Ok(Some(value)) => {
+                    respond_bulk_string(writer, &value).await?;
+                }
+                Ok(None) => {
+                    respond_null_bulk(writer).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
             }
         }
         Command::Hdel { key, fields } => {
             let physical = prefix_key(current_db, &key);
-            let removed = storage.hdel(&physical, &fields);
-            respond_integer(writer, removed as i64).await?;
+            match storage.hdel(&physical, &fields) {
+                Ok(removed) => {
+                    respond_integer(writer, removed as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
         }
         Command::Hexists { key, field } => {
             let physical = prefix_key(current_db, &key);
-            let exists = storage.hexists(&physical, &field);
-            let v = if exists { 1 } else { 0 };
-            respond_integer(writer, v).await?;
+            match storage.hexists(&physical, &field) {
+                Ok(exists) => {
+                    let v = if exists { 1 } else { 0 };
+                    respond_integer(writer, v).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
         }
         Command::Hgetall { key } => {
             let physical = prefix_key(current_db, &key);
-            let entries = storage.hgetall(&physical);
-            let mut response = format!("*{}\r\n", entries.len() * 2);
-            for (field, value) in entries {
-                response.push_str(&format!("${}\r\n{}\r\n", field.len(), field));
-                response.push_str(&format!("${}\r\n{}\r\n", value.len(), value));
+            match storage.hgetall(&physical) {
+                Ok(entries) => {
+                    let mut response = format!("*{}\r\n", entries.len() * 2);
+                    for (field, value) in entries {
+                        response.push_str(&format!("${}\r\n{}\r\n", field.len(), field));
+                        response.push_str(&format!("${}\r\n{}\r\n", value.len(), value));
+                    }
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
             }
-            writer.write_all(response.as_bytes()).await?;
         }
         _ => {}
     }
