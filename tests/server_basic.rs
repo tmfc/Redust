@@ -161,6 +161,75 @@ async fn responds_to_basic_commands() {
 }
 
 #[tokio::test]
+async fn select_command_isolates_databases() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 默认在 DB0：SET k v0
+    write_half
+        .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$2\r\nv0\r\n")
+        .await
+        .unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // 切到 DB1：SELECT 1
+    write_half
+        .write_all(b"*2\r\n$6\r\nSELECT\r\n$1\r\n1\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // 在 DB1 读取 k，应该看不到 DB0 里的值
+    write_half
+        .write_all(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "$-1\r\n");
+
+    // 在 DB1 写入同名 key：SET k v1
+    write_half
+        .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$2\r\nv1\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // 再切回 DB0：SELECT 0
+    write_half
+        .write_all(b"*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // 在 DB0 读取 k，应仍为 v0
+    write_half
+        .write_all(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+        .await
+        .unwrap();
+    let mut bulk_header = String::new();
+    let mut value = String::new();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(bulk_header, "$2\r\n");
+    assert_eq!(value, "v0\r\n");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn prometheus_metrics_exporter_basic() {
     // Enable metrics exporter on a fixed local port for this test.
     env::set_var("REDUST_METRICS_ADDR", "127.0.0.1:9898");

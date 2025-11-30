@@ -91,10 +91,15 @@ fn build_prometheus_metrics(storage: &Storage, metrics: &Metrics) -> String {
     buf
 }
 
+fn prefix_key(db: u8, key: &str) -> String {
+    format!("{}:{}", db, key)
+}
+
 async fn handle_string_command(
     cmd: Command,
     storage: &Storage,
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    current_db: u8,
 ) -> io::Result<()> {
     match cmd {
         Command::Ping => {
@@ -107,21 +112,24 @@ async fn handle_string_command(
             respond_simple_string(writer, "OK").await?;
         }
         Command::Set { key, value, expire_millis } => {
-            storage.set(key.clone(), value);
+            let physical = prefix_key(current_db, &key);
+            storage.set(physical.clone(), value);
             if let Some(ms) = expire_millis {
-                storage.expire_millis(&key, ms);
+                storage.expire_millis(&physical, ms);
             }
             respond_simple_string(writer, "OK").await?;
         }
         Command::Get { key } => {
-            if let Some(value) = storage.get(&key) {
+            let physical = prefix_key(current_db, &key);
+            if let Some(value) = storage.get(&physical) {
                 respond_bulk_string(writer, &value).await?;
             } else {
                 respond_null_bulk(writer).await?;
             }
         }
         Command::Incr { key } => {
-            match storage.incr(&key) {
+            let physical = prefix_key(current_db, &key);
+            match storage.incr(&physical) {
                 Ok(value) => {
                     respond_integer(writer, value).await?;
                 }
@@ -131,7 +139,8 @@ async fn handle_string_command(
             }
         }
         Command::Decr { key } => {
-            match storage.decr(&key) {
+            let physical = prefix_key(current_db, &key);
+            match storage.decr(&physical) {
                 Ok(value) => {
                     respond_integer(writer, value).await?;
                 }
@@ -141,7 +150,8 @@ async fn handle_string_command(
             }
         }
         Command::Incrby { key, delta } => {
-            match storage.incr_by(&key, delta) {
+            let physical = prefix_key(current_db, &key);
+            match storage.incr_by(&physical, delta) {
                 Ok(value) => {
                     respond_integer(writer, value).await?;
                 }
@@ -151,7 +161,8 @@ async fn handle_string_command(
             }
         }
         Command::Decrby { key, delta } => {
-            match storage.incr_by(&key, -delta) {
+            let physical = prefix_key(current_db, &key);
+            match storage.incr_by(&physical, -delta) {
                 Ok(value) => {
                     respond_integer(writer, value).await?;
                 }
@@ -161,15 +172,18 @@ async fn handle_string_command(
             }
         }
         Command::Del { keys } => {
-            let removed = storage.del(&keys);
+            let physical: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
+            let removed = storage.del(&physical);
             respond_integer(writer, removed as i64).await?;
         }
         Command::Exists { keys } => {
-            let count = storage.exists(&keys);
+            let physical: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
+            let count = storage.exists(&physical);
             respond_integer(writer, count as i64).await?;
         }
         Command::Mget { keys } => {
-            let values = storage.mget(&keys);
+            let physical: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
+            let values = storage.mget(&physical);
             let mut response = format!("*{}\r\n", values.len());
             for v in values {
                 match v {
@@ -184,20 +198,27 @@ async fn handle_string_command(
             writer.write_all(response.as_bytes()).await?;
         }
         Command::Mset { pairs } => {
-            storage.mset(&pairs);
+            let mapped: Vec<(String, String)> = pairs
+                .into_iter()
+                .map(|(k, v)| (prefix_key(current_db, &k), v))
+                .collect();
+            storage.mset(&mapped);
             respond_simple_string(writer, "OK").await?;
         }
         Command::Setnx { key, value } => {
-            let inserted = storage.setnx(&key, value);
+            let physical = prefix_key(current_db, &key);
+            let inserted = storage.setnx(&physical, value);
             let v = if inserted { 1 } else { 0 };
             respond_integer(writer, v).await?;
         }
         Command::Setex { key, seconds, value } => {
-            storage.set_with_expire_seconds(key, value, seconds);
+            let physical = prefix_key(current_db, &key);
+            storage.set_with_expire_seconds(physical, value, seconds);
             respond_simple_string(writer, "OK").await?;
         }
         Command::Psetex { key, millis, value } => {
-            storage.set_with_expire_millis(key, value, millis);
+            let physical = prefix_key(current_db, &key);
+            storage.set_with_expire_millis(physical, value, millis);
             respond_simple_string(writer, "OK").await?;
         }
         _ => {}
@@ -210,18 +231,22 @@ async fn handle_list_command(
     cmd: Command,
     storage: &Storage,
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    current_db: u8,
 ) -> io::Result<()> {
     match cmd {
         Command::Lpush { key, values } => {
-            let len = storage.lpush(&key, &values);
+            let physical = prefix_key(current_db, &key);
+            let len = storage.lpush(&physical, &values);
             respond_integer(writer, len as i64).await?;
         }
         Command::Rpush { key, values } => {
-            let len = storage.rpush(&key, &values);
+            let physical = prefix_key(current_db, &key);
+            let len = storage.rpush(&physical, &values);
             respond_integer(writer, len as i64).await?;
         }
         Command::Lrange { key, start, stop } => {
-            let items = storage.lrange(&key, start, stop);
+            let physical = prefix_key(current_db, &key);
+            let items = storage.lrange(&physical, start, stop);
             let mut response = format!("*{}\r\n", items.len());
             for item in items {
                 response.push_str(&format!("${}\r\n{}\r\n", item.len(), item));
@@ -229,36 +254,42 @@ async fn handle_list_command(
             writer.write_all(response.as_bytes()).await?;
         }
         Command::Lpop { key } => {
-            if let Some(value) = storage.lpop(&key) {
+            let physical = prefix_key(current_db, &key);
+            if let Some(value) = storage.lpop(&physical) {
                 respond_bulk_string(writer, &value).await?;
             } else {
                 respond_null_bulk(writer).await?;
             }
         }
         Command::Rpop { key } => {
-            if let Some(value) = storage.rpop(&key) {
+            let physical = prefix_key(current_db, &key);
+            if let Some(value) = storage.rpop(&physical) {
                 respond_bulk_string(writer, &value).await?;
             } else {
                 respond_null_bulk(writer).await?;
             }
         }
         Command::Llen { key } => {
-            let len = storage.llen(&key);
+            let physical = prefix_key(current_db, &key);
+            let len = storage.llen(&physical);
             respond_integer(writer, len as i64).await?;
         }
         Command::Lindex { key, index } => {
-            if let Some(value) = storage.lindex(&key, index) {
+            let physical = prefix_key(current_db, &key);
+            if let Some(value) = storage.lindex(&physical, index) {
                 respond_bulk_string(writer, &value).await?;
             } else {
                 respond_null_bulk(writer).await?;
             }
         }
         Command::Lrem { key, count, value } => {
-            let removed = storage.lrem(&key, count, &value);
+            let physical = prefix_key(current_db, &key);
+            let removed = storage.lrem(&physical, count, &value);
             respond_integer(writer, removed as i64).await?;
         }
         Command::Ltrim { key, start, stop } => {
-            match storage.ltrim(&key, start, stop) {
+            let physical = prefix_key(current_db, &key);
+            match storage.ltrim(&physical, start, stop) {
                 Ok(()) => {
                     respond_simple_string(writer, "OK").await?;
                 }
@@ -277,18 +308,22 @@ async fn handle_set_command(
     cmd: Command,
     storage: &Storage,
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    current_db: u8,
 ) -> io::Result<()> {
     match cmd {
         Command::Sadd { key, members } => {
-            let added = storage.sadd(&key, &members);
+            let physical = prefix_key(current_db, &key);
+            let added = storage.sadd(&physical, &members);
             respond_integer(writer, added as i64).await?;
         }
         Command::Srem { key, members } => {
-            let removed = storage.srem(&key, &members);
+            let physical = prefix_key(current_db, &key);
+            let removed = storage.srem(&physical, &members);
             respond_integer(writer, removed as i64).await?;
         }
         Command::Smembers { key } => {
-            let members = storage.smembers(&key);
+            let physical = prefix_key(current_db, &key);
+            let members = storage.smembers(&physical);
             let mut response = format!("*{}\r\n", members.len());
             for m in members {
                 response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
@@ -296,16 +331,19 @@ async fn handle_set_command(
             writer.write_all(response.as_bytes()).await?;
         }
         Command::Scard { key } => {
-            let card = storage.scard(&key);
+            let physical = prefix_key(current_db, &key);
+            let card = storage.scard(&physical);
             respond_integer(writer, card as i64).await?;
         }
         Command::Sismember { key, member } => {
-            let is_member = storage.sismember(&key, &member);
+            let physical = prefix_key(current_db, &key);
+            let is_member = storage.sismember(&physical, &member);
             let v = if is_member { 1 } else { 0 };
             respond_integer(writer, v).await?;
         }
         Command::Sunion { keys } => {
-            let members = storage.sunion(&keys);
+            let physical: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
+            let members = storage.sunion(&physical);
             let mut response = format!("*{}\r\n", members.len());
             for m in members {
                 response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
@@ -313,7 +351,8 @@ async fn handle_set_command(
             writer.write_all(response.as_bytes()).await?;
         }
         Command::Sinter { keys } => {
-            let members = storage.sinter(&keys);
+            let physical: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
+            let members = storage.sinter(&physical);
             let mut response = format!("*{}\r\n", members.len());
             for m in members {
                 response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
@@ -321,7 +360,8 @@ async fn handle_set_command(
             writer.write_all(response.as_bytes()).await?;
         }
         Command::Sdiff { keys } => {
-            let members = storage.sdiff(&keys);
+            let physical: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
+            let members = storage.sdiff(&physical);
             let mut response = format!("*{}\r\n", members.len());
             for m in members {
                 response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
@@ -338,30 +378,36 @@ async fn handle_hash_command(
     cmd: Command,
     storage: &Storage,
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    current_db: u8,
 ) -> io::Result<()> {
     match cmd {
         Command::Hset { key, field, value } => {
-            let added = storage.hset(&key, &field, value);
+            let physical = prefix_key(current_db, &key);
+            let added = storage.hset(&physical, &field, value);
             respond_integer(writer, added as i64).await?;
         }
         Command::Hget { key, field } => {
-            if let Some(value) = storage.hget(&key, &field) {
+            let physical = prefix_key(current_db, &key);
+            if let Some(value) = storage.hget(&physical, &field) {
                 respond_bulk_string(writer, &value).await?;
             } else {
                 respond_null_bulk(writer).await?;
             }
         }
         Command::Hdel { key, fields } => {
-            let removed = storage.hdel(&key, &fields);
+            let physical = prefix_key(current_db, &key);
+            let removed = storage.hdel(&physical, &fields);
             respond_integer(writer, removed as i64).await?;
         }
         Command::Hexists { key, field } => {
-            let exists = storage.hexists(&key, &field);
+            let physical = prefix_key(current_db, &key);
+            let exists = storage.hexists(&physical, &field);
             let v = if exists { 1 } else { 0 };
             respond_integer(writer, v).await?;
         }
         Command::Hgetall { key } => {
-            let entries = storage.hgetall(&key);
+            let physical = prefix_key(current_db, &key);
+            let entries = storage.hgetall(&physical);
             let mut response = format!("*{}\r\n", entries.len() * 2);
             for (field, value) in entries {
                 response.push_str(&format!("${}\r\n{}\r\n", field.len(), field));
@@ -379,46 +425,75 @@ async fn handle_key_meta_command(
     cmd: Command,
     storage: &Storage,
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    current_db: u8,
 ) -> io::Result<()> {
     match cmd {
         Command::Expire { key, seconds } => {
-            let res = storage.expire_seconds(&key, seconds);
+            let physical = prefix_key(current_db, &key);
+            let res = storage.expire_seconds(&physical, seconds);
             let v = if res { 1 } else { 0 };
             respond_integer(writer, v).await?;
         }
         Command::Pexpire { key, millis } => {
-            let res = storage.expire_millis(&key, millis);
+            let physical = prefix_key(current_db, &key);
+            let res = storage.expire_millis(&physical, millis);
             let v = if res { 1 } else { 0 };
             respond_integer(writer, v).await?;
         }
         Command::Ttl { key } => {
-            let ttl = storage.ttl_seconds(&key);
+            let physical = prefix_key(current_db, &key);
+            let ttl = storage.ttl_seconds(&physical);
             respond_integer(writer, ttl).await?;
         }
         Command::Pttl { key } => {
-            let ttl = storage.pttl_millis(&key);
+            let physical = prefix_key(current_db, &key);
+            let ttl = storage.pttl_millis(&physical);
             respond_integer(writer, ttl).await?;
         }
         Command::Persist { key } => {
-            let changed = storage.persist(&key);
+            let physical = prefix_key(current_db, &key);
+            let changed = storage.persist(&physical);
             let v = if changed { 1 } else { 0 };
             respond_integer(writer, v).await?;
         }
         Command::Type { key } => {
-            let t = storage.type_of(&key);
+            let physical = prefix_key(current_db, &key);
+            let t = storage.type_of(&physical);
             respond_simple_string(writer, &t).await?;
         }
         Command::Keys { pattern } => {
-            let keys = storage.keys(&pattern);
-            let mut response = format!("*{}\r\n", keys.len());
-            for k in keys {
+            let mut result: Vec<String> = Vec::new();
+
+            if pattern == "*" {
+                let all = storage.keys("*");
+                let prefix = format!("{}:", current_db);
+                for k in all {
+                    if let Some(rest) = k.strip_prefix(&prefix) {
+                        result.push(rest.to_string());
+                    }
+                }
+            } else {
+                let physical_pattern = prefix_key(current_db, &pattern);
+                let physical_keys = storage.keys(&physical_pattern);
+                let prefix = format!("{}:", current_db);
+                for k in physical_keys {
+                    if let Some(rest) = k.strip_prefix(&prefix) {
+                        result.push(rest.to_string());
+                    }
+                }
+            }
+
+            let mut response = format!("*{}\r\n", result.len());
+            for k in result {
                 response.push_str(&format!("${}\r\n{}\r\n", k.len(), k));
             }
             writer.write_all(response.as_bytes()).await?;
         }
         Command::Dbsize => {
-            let n = storage.dbsize() as i64;
-            respond_integer(writer, n).await?;
+            let all = storage.keys("*");
+            let prefix = format!("{}:", current_db);
+            let count = all.into_iter().filter(|k| k.starts_with(&prefix)).count();
+            respond_integer(writer, count as i64).await?;
         }
         _ => {}
     }
@@ -434,7 +509,6 @@ async fn handle_info_command(
     let uptime = Instant::now().duration_since(metrics.start_time).as_secs();
     let connected = metrics.connected_clients.load(Ordering::Relaxed);
     let total_cmds = metrics.total_commands.load(Ordering::Relaxed);
-    let keys = storage.keys("*").len();
     let maxmemory = storage.maxmemory_bytes().unwrap_or(0);
     let maxmemory_human = format_bytes(maxmemory);
     let used_memory = storage.approximate_used_memory();
@@ -454,7 +528,29 @@ async fn handle_info_command(
     info.push_str("\r\n# Stats\r\n");
     info.push_str(&format!("total_commands_processed:{}\r\n", total_cmds));
     info.push_str("\r\n# Keyspace\r\n");
-    info.push_str(&format!("db0:keys={}\r\n", keys));
+
+    let all_keys = storage.keys("*");
+    let mut db_counts = [0usize; 16];
+    for k in all_keys {
+        if let Some((db_part, _rest)) = k.split_once(':') {
+            if let Ok(idx) = db_part.parse::<usize>() {
+                if idx < db_counts.len() {
+                    db_counts[idx] += 1;
+                }
+            }
+        }
+    }
+
+    // db0 始终输出（即便为 0），保证 INFO 总有一行 db0:keys=...
+    info.push_str(&format!("db0:keys={}\r\n", db_counts[0]));
+
+    // 其他 DB 仅在有 key 时输出
+    for idx in 1..db_counts.len() {
+        let count = db_counts[idx];
+        if count > 0 {
+            info.push_str(&format!("db{}:keys={}\r\n", idx, count));
+        }
+    }
     info.push_str("\r\n");
 
     respond_bulk_string(writer, &info).await
@@ -518,6 +614,7 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
 
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
+    let mut current_db: u8 = 0;
 
     loop {
         let cmd_result = read_command(&mut reader).await;
@@ -559,10 +656,10 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
             | Command::Setex { .. }
             | Command::Psetex { .. } => {
                 // Quit 需要在外面单独处理连接关闭语义
-                handle_string_command(cmd, &storage, &mut write_half).await?;
+                handle_string_command(cmd, &storage, &mut write_half, current_db).await?;
             }
             Command::Quit => {
-                handle_string_command(cmd, &storage, &mut write_half).await?;
+                handle_string_command(cmd, &storage, &mut write_half, current_db).await?;
                 break;
             }
 
@@ -576,7 +673,7 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
             | Command::Lindex { .. }
             | Command::Lrem { .. }
             | Command::Ltrim { .. } => {
-                handle_list_command(cmd, &storage, &mut write_half).await?;
+                handle_list_command(cmd, &storage, &mut write_half, current_db).await?;
             }
 
             // set 命令
@@ -588,7 +685,7 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
             | Command::Sunion { .. }
             | Command::Sinter { .. }
             | Command::Sdiff { .. } => {
-                handle_set_command(cmd, &storage, &mut write_half).await?;
+                handle_set_command(cmd, &storage, &mut write_half, current_db).await?;
             }
 
             // hash 命令
@@ -597,7 +694,7 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
             | Command::Hdel { .. }
             | Command::Hexists { .. }
             | Command::Hgetall { .. } => {
-                handle_hash_command(cmd, &storage, &mut write_half).await?;
+                handle_hash_command(cmd, &storage, &mut write_half, current_db).await?;
             }
 
             // key 元信息、过期相关命令
@@ -609,12 +706,18 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
             | Command::Type { .. }
             | Command::Keys { .. }
             | Command::Dbsize => {
-                handle_key_meta_command(cmd, &storage, &mut write_half).await?;
+                handle_key_meta_command(cmd, &storage, &mut write_half, current_db).await?;
             }
 
             // info
             Command::Info => {
                 handle_info_command(&storage, &metrics, &mut write_half).await?;
+            }
+
+            // 多 DB：SELECT
+            Command::Select { db } => {
+                current_db = db;
+                respond_simple_string(&mut write_half, "OK").await?;
             }
 
             // 解析阶段构造的错误命令

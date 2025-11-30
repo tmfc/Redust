@@ -77,6 +77,7 @@ pub enum Command {
     Pttl { key: String },
     Persist { key: String },
     Info,
+    Select { db: u8 },
     Mget { keys: Vec<String> },
     Mset { pairs: Vec<(String, String)> },
     Setnx { key: String, value: String },
@@ -588,6 +589,24 @@ pub async fn read_command(
                 return Ok(Some(err_wrong_args("info")));
             }
             Command::Info
+        }
+        "SELECT" => {
+            let Some(db_str) = iter.next() else {
+                return Ok(Some(err_wrong_args("select")));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("select")));
+            }
+
+            let Ok(db_idx) = db_str.parse::<i64>() else {
+                return Ok(Some(err_not_integer()));
+            };
+
+            if db_idx < 0 || db_idx >= 16 {
+                return Ok(Some(Command::Error("ERR DB index is out of range".to_string())));
+            }
+
+            Command::Select { db: db_idx as u8 }
         }
         "MGET" => {
             let keys: Vec<String> = iter.collect();
