@@ -364,10 +364,36 @@ impl TestClient {
             Err(line)
         }
     }
+
+    async fn dbsize(&mut self) -> i64 {
+        self.send_array(&["DBSIZE"]).await;
+        let line = self.read_simple_line().await;
+        assert!(line.starts_with(":"));
+        line[1..line.len() - 2].parse().unwrap()
+    }
 }
 
 #[tokio::test]
-async fn standard_set_get_roundtrip() {
+async fn basic_dbsize_behaviour() {
+    let (addr, _shutdown, _handle) = spawn_server().await;
+
+    let mut client = TestClient::connect(addr).await;
+
+    // 初始应为 0
+    let initial = client.dbsize().await;
+    assert_eq!(initial, 0);
+
+    // 写入若干 key
+    client.set("k1", "v1").await;
+    client.set("k2", "v2").await;
+    client.set("k3", "v3").await;
+
+    let after_set = client.dbsize().await;
+    assert_eq!(after_set, 3);
+
+    // 删除一个 key 后，dbsize 应减少
+    client.send_array(&["DEL", "k1"]).await;
+    let _ = client.read_simple_line().await; // :1
     let (addr, shutdown, handle) = spawn_server().await;
 
     let mut client = TestClient::connect(addr).await;

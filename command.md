@@ -13,6 +13,12 @@
   - 当前：`ECHO msg` → bulk string；参数个数校验完整。
 - [x] **QUIT**
   - 当前：`QUIT` → `+OK` 并关闭连接。
+  
+## 信息与监控
+
+- [x] **INFO**
+  - 当前：返回 `# Server`、`# Clients`、`# Stats`、`# Keyspace` 等基础信息。
+  - 额外包含内存相关字段：`maxmemory` / `maxmemory_human` / `used_memory` / `used_memory_human`，用于观测内存配置与当前估算使用量。
 
 ---
 

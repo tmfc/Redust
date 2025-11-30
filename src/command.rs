@@ -48,6 +48,7 @@ pub enum Command {
     Decrby { key: String, delta: i64 },
     Type { key: String },
     Keys { pattern: String },
+    Dbsize,
     Lpush { key: String, values: Vec<String> },
     Rpush { key: String, values: Vec<String> },
     Lrange { key: String, start: isize, stop: isize },
@@ -258,6 +259,12 @@ pub async fn read_command(
                 return Ok(Some(err_wrong_args("type")));
             }
             Command::Type { key }
+        }
+        "DBSIZE" => {
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("dbsize")));
+            }
+            Command::Dbsize
         }
         "KEYS" => {
             let Some(pattern) = iter.next() else {

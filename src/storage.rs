@@ -2,9 +2,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 use dashmap::DashMap;
+use rand::{seq::IteratorRandom, thread_rng};
 
 #[derive(Debug, Clone)]
 enum StorageValue {
@@ -29,17 +33,27 @@ enum StorageValue {
 #[derive(Clone)]
 pub struct Storage {
     data: Arc<DashMap<String, StorageValue>>,
+    maxmemory_bytes: Option<u64>,
+    last_access: Arc<DashMap<String, u64>>,
+    access_counter: Arc<AtomicU64>,
 }
 
 impl Default for Storage {
     fn default() -> Self {
-        Storage {
-            data: Arc::new(DashMap::new()),
-        }
+        Storage::new(None)
     }
 }
 
 impl Storage {
+    pub fn new(maxmemory_bytes: Option<u64>) -> Self {
+        Storage {
+            data: Arc::new(DashMap::new()),
+            maxmemory_bytes,
+            last_access: Arc::new(DashMap::new()),
+            access_counter: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
     pub fn hset(&self, key: &str, field: &str, value: String) -> usize {
         let now = Instant::now();
         self.remove_if_expired(key, now);
@@ -52,13 +66,20 @@ impl Storage {
                 expires_at: None,
             });
 
-        match entry.value_mut() {
+        let added = match entry.value_mut() {
             StorageValue::Hash { value: map, .. } => {
                 let existed = map.insert(field.to_string(), value).is_some();
                 if existed { 0 } else { 1 }
             }
             _ => 0, // Key exists but is not a hash
+        };
+
+        if added > 0 {
+            self.touch_key(key);
+            self.maybe_evict_for_write();
         }
+
+        added
     }
 
     pub fn hget(&self, key: &str, field: &str) -> Option<String> {
@@ -67,11 +88,19 @@ impl Storage {
             return None;
         }
 
-        let entry = self.data.get(key)?;
-        match entry.value() {
-            StorageValue::Hash { value: map, .. } => map.get(field).cloned(),
-            _ => None,
+        let result = {
+            let entry = self.data.get(key)?;
+            match entry.value() {
+                StorageValue::Hash { value: map, .. } => map.get(field).cloned(),
+                _ => None,
+            }
+        };
+
+        if result.is_some() {
+            self.touch_key(key);
         }
+
+        result
     }
 
     pub fn hdel(&self, key: &str, fields: &[String]) -> usize {
@@ -84,7 +113,7 @@ impl Storage {
             return 0;
         };
 
-        match entry.value_mut() {
+        let removed = match entry.value_mut() {
             StorageValue::Hash { value: map, .. } => {
                 let mut removed = 0;
                 for f in fields {
@@ -95,7 +124,13 @@ impl Storage {
                 removed
             }
             _ => 0,
+        };
+
+        if removed > 0 {
+            self.touch_key(key);
         }
+
+        removed
     }
 
     pub fn hexists(&self, key: &str, field: &str) -> bool {
@@ -119,23 +154,36 @@ impl Storage {
             return Vec::new();
         }
 
-        let entry = self.data.get(key);
-        let map = match entry.as_ref().map(|e| e.value()) {
-            Some(StorageValue::Hash { value: m, .. }) => m,
-            _ => return Vec::new(),
+        let (result, should_touch) = {
+            let entry = self.data.get(key);
+            let map = match entry.as_ref().map(|e| e.value()) {
+                Some(StorageValue::Hash { value: m, .. }) => m,
+                _ => return Vec::new(),
+            };
+
+            let vec: Vec<(String, String)> =
+                map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            let touch = !vec.is_empty();
+            (vec, touch)
         };
 
-        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        if should_touch {
+            self.touch_key(key);
+        }
+
+        result
     }
 
     pub fn set(&self, key: String, value: String) {
         self.data.insert(
-            key,
+            key.clone(),
             StorageValue::String {
                 value,
                 expires_at: None,
             },
         );
+        self.touch_key(&key);
+        self.maybe_evict_for_write();
     }
 
     pub fn get(&self, key: &str) -> Option<String> {
@@ -144,13 +192,21 @@ impl Storage {
             return None;
         }
 
-        self.data.get(key).and_then(|entry| {
-            if let StorageValue::String { value, .. } = entry.value() {
-                Some(value.clone())
-            } else {
-                None // Key exists but is not a string
-            }
-        })
+        let result = {
+            self.data.get(key).and_then(|entry| {
+                if let StorageValue::String { value, .. } = entry.value() {
+                    Some(value.clone())
+                } else {
+                    None // Key exists but is not a string
+                }
+            })
+        };
+
+        if result.is_some() {
+            self.touch_key(key);
+        }
+
+        result
     }
 
     pub fn mget(&self, keys: &[String]) -> Vec<Option<String>> {
@@ -179,6 +235,10 @@ impl Storage {
                 inserted = true;
                 StorageValue::String { value, expires_at: None }
             });
+        if inserted {
+            self.touch_key(key);
+            self.maybe_evict_for_write();
+        }
         inserted
     }
 
@@ -248,6 +308,8 @@ impl Storage {
         let value: i64 = current_val.parse().map_err(|_| ())?;
         let new_val = value.checked_add(delta).ok_or(())?;
         *current_val = new_val.to_string();
+        self.touch_key(key);
+        self.maybe_evict_for_write();
         Ok(new_val)
     }
 
@@ -310,7 +372,7 @@ impl Storage {
                 expires_at: None,
             });
 
-        match entry.value_mut() {
+        let len = match entry.value_mut() {
             StorageValue::List { value: list, .. } => {
                 for v in values {
                     if left {
@@ -322,7 +384,14 @@ impl Storage {
                 list.len()
             }
             _ => 0, // Key exists but is not a list
+        };
+
+        if len > 0 {
+            self.touch_key(key);
+            self.maybe_evict_for_write();
         }
+
+        len
     }
 
     pub fn lrange(&self, key: &str, start: isize, stop: isize) -> Vec<String> {
@@ -366,11 +435,18 @@ impl Storage {
         let start_idx = s as usize;
         let end_idx = e as usize;
 
-        list.iter()
+        let result: Vec<String> = list
+            .iter()
             .skip(start_idx)
             .take(end_idx - start_idx + 1)
             .cloned()
-            .collect()
+            .collect();
+
+        if !result.is_empty() {
+            self.touch_key(key);
+        }
+
+        result
     }
 
     pub fn lpop(&self, key: &str) -> Option<String> {
@@ -541,6 +617,7 @@ impl Storage {
         if s > e || s >= len {
             // Result is empty list
             list.clear();
+            self.touch_key(key);
             return Ok(());
         }
 
@@ -557,6 +634,9 @@ impl Storage {
             list.drain(0..start_idx);
         }
 
+        self.touch_key(key);
+        // ltrim 只会收缩列表，不会增加内存，这里不触发淘汰
+
         Ok(())
     }
 
@@ -572,7 +652,7 @@ impl Storage {
                 expires_at: None,
             });
 
-        match entry.value_mut() {
+        let added = match entry.value_mut() {
             StorageValue::Set { value: set, .. } => {
                 let mut added = 0;
                 for m in members {
@@ -583,7 +663,14 @@ impl Storage {
                 added
             }
             _ => 0, // Key exists but is not a set
+        };
+
+        if added > 0 {
+            self.touch_key(key);
+            self.maybe_evict_for_write();
         }
+
+        added
     }
 
     pub fn srem(&self, key: &str, members: &[String]) -> usize {
@@ -592,8 +679,7 @@ impl Storage {
             return 0;
         }
 
-        if let Some(mut entry) = self.data.get_mut(key) {
-
+        let removed = if let Some(mut entry) = self.data.get_mut(key) {
             match entry.value_mut() {
                 StorageValue::Set { value: set, .. } => {
                     let mut removed = 0;
@@ -608,7 +694,13 @@ impl Storage {
             }
         } else {
             0 // Key does not exist
+        };
+
+        if removed > 0 {
+            self.touch_key(key);
         }
+
+        removed
     }
 
     pub fn smembers(&self, key: &str) -> Vec<String> {
@@ -617,15 +709,38 @@ impl Storage {
             return Vec::new();
         }
 
-        let entry = self.data.get(key);
-        let set = match entry.as_ref().map(|e| e.value()) {
-            Some(StorageValue::Set { value, .. }) => value,
-            _ => return Vec::new(), // Key does not exist or is not a set
+        let (mut members, should_touch) = {
+            let entry = self.data.get(key);
+            let set = match entry.as_ref().map(|e| e.value()) {
+                Some(StorageValue::Set { value, .. }) => value,
+                _ => return Vec::new(), // Key does not exist or is not a set
+            };
+
+            let members: Vec<String> = set.iter().cloned().collect();
+            let touch = !members.is_empty();
+            (members, touch)
         };
 
-        let mut members: Vec<String> = set.iter().cloned().collect();
         members.sort();
+
+        if should_touch {
+            self.touch_key(key);
+        }
+
         members
+    }
+
+    pub fn dbsize(&self) -> usize {
+        let now = Instant::now();
+        let keys: Vec<String> = self
+            .data
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        keys.into_iter()
+            .filter(|k| !self.remove_if_expired(k, now))
+            .count()
     }
 
     pub fn scard(&self, key: &str) -> usize {
@@ -1310,5 +1425,99 @@ impl Storage {
                 }
             }
         });
+    }
+
+    fn touch_key(&self, key: &str) {
+        let ts = self.access_counter.fetch_add(1, Ordering::Relaxed);
+        self.last_access.insert(key.to_string(), ts);
+    }
+
+    fn evict_one_sampled_key(&self) -> bool {
+        let sample_size: usize = 5;
+
+        let mut rng = thread_rng();
+
+        // 均匀随机从所有 key 中选择 sample_size 个候选
+        let candidates: Vec<String> = self
+            .data
+            .iter()
+            .map(|e| e.key().clone())
+            .choose_multiple(&mut rng, sample_size);
+
+        if candidates.is_empty() {
+            return false;
+        }
+
+        let mut oldest_key: Option<String> = None;
+        let mut oldest_ts: u64 = u64::MAX;
+
+        for k in candidates.into_iter() {
+            let ts = self
+                .last_access
+                .get(&k)
+                .map(|v| *v.value())
+                .unwrap_or(0);
+
+            if ts < oldest_ts {
+                oldest_ts = ts;
+                oldest_key = Some(k);
+            }
+        }
+
+        let Some(key) = oldest_key else {
+            return false;
+        };
+
+        self.data.remove(&key);
+        self.last_access.remove(&key);
+        true
+    }
+
+    pub fn maybe_evict_for_write(&self) {
+        let Some(limit) = self.maxmemory_bytes else {
+            return;
+        };
+
+        // 简单实现：反复检查 approximate_used_memory，直到不再超限或没有可淘汰的键
+        loop {
+            let used = self.approximate_used_memory();
+            if used <= limit {
+                break;
+            }
+
+            if !self.evict_one_sampled_key() {
+                break;
+            }
+        }
+    }
+
+    pub fn approximate_used_memory(&self) -> u64 {
+        let mut total: u64 = 0;
+
+        for entry in self.data.iter() {
+            let key_size = entry.key().len() as u64;
+            let value = entry.value();
+
+            let value_size: u64 = match value {
+                StorageValue::String { value, .. } => value.len() as u64,
+                StorageValue::List { value: list, .. } => {
+                    list.iter().map(|v| v.len() as u64).sum()
+                }
+                StorageValue::Set { value: set, .. } => {
+                    set.iter().map(|v| v.len() as u64).sum()
+                }
+                StorageValue::Hash { value: map, .. } => {
+                    map.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum()
+                }
+            };
+
+            total = total.saturating_add(key_size.saturating_add(value_size));
+        }
+
+        total
+    }
+
+    pub fn maxmemory_bytes(&self) -> Option<u64> {
+        self.maxmemory_bytes
     }
 }

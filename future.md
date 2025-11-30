@@ -108,6 +108,14 @@
     - 方案二：粗略估算（按 value 长度累加等）。
   - 评估采集这些信息的性能影响，并在 INFO 输出中标注估算精度。
 
+- [ ] **DBSIZE / used_memory 计数器增量维护**
+  - 现状：
+    - `dbsize` 通过遍历所有 key 并执行一次过期检查得到结果，复杂度为 O(N)。
+    - `approximate_used_memory` 同样通过遍历并按字符串长度粗略估算内存占用，也是 O(N)，且在 `maybe_evict_for_write` 中可能被多次调用。
+  - 未来方向：
+    - 为 `dbsize` 和 `used_memory` 引入全局原子计数器（如 `AtomicUsize` / `AtomicU64`），在增/删/改 key 时按增量更新，让查询变成 O(1)。
+    - 需要系统性梳理所有写路径（包括懒删除和定期过期任务、RDB 加载等），保证计数器与真实状态的一致性。
+
 - [ ] **瞬时 QPS 与滑动窗口指标**
   - `instantaneous_ops_per_sec` 等：
     - 在 Metrics 中维护一个时间窗口，对最近 N 秒的命令数做近似统计。

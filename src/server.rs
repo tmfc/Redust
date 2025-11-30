@@ -24,6 +24,50 @@ struct Metrics {
     tcp_port: u16,
 }
 
+fn parse_maxmemory_bytes(input: &str) -> Option<u64> {
+    let s = input.trim().to_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+
+    // 纯数字：按字节解析
+    if let Ok(v) = s.parse::<u64>() {
+        return Some(v);
+    }
+
+    // 支持带单位：MB / GB（大小写不敏感）
+    let (num_part, multiplier) = if let Some(stripped) = s.strip_suffix("mb") {
+        (stripped.trim(), 1024u64 * 1024)
+    } else if let Some(stripped) = s.strip_suffix("gb") {
+        (stripped.trim(), 1024u64 * 1024 * 1024)
+    } else {
+        return None;
+    };
+
+    let base = num_part.parse::<u64>().ok()?;
+    base.checked_mul(multiplier)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+
+    if bytes >= GB {
+        let v = bytes as f64 / GB as f64;
+        return format!("{:.2}GB", v);
+    }
+    if bytes >= MB {
+        let v = bytes as f64 / MB as f64;
+        return format!("{:.2}MB", v);
+    }
+    if bytes >= KB {
+        let v = bytes as f64 / KB as f64;
+        return format!("{:.2}KB", v);
+    }
+    format!("{}B", bytes)
+}
+
 fn build_prometheus_metrics(storage: &Storage, metrics: &Metrics) -> String {
     let uptime = Instant::now().duration_since(metrics.start_time).as_secs();
     let connected = metrics.connected_clients.load(Ordering::Relaxed);
@@ -372,6 +416,10 @@ async fn handle_key_meta_command(
             }
             writer.write_all(response.as_bytes()).await?;
         }
+        Command::Dbsize => {
+            let n = storage.dbsize() as i64;
+            respond_integer(writer, n).await?;
+        }
         _ => {}
     }
 
@@ -387,12 +435,20 @@ async fn handle_info_command(
     let connected = metrics.connected_clients.load(Ordering::Relaxed);
     let total_cmds = metrics.total_commands.load(Ordering::Relaxed);
     let keys = storage.keys("*").len();
+    let maxmemory = storage.maxmemory_bytes().unwrap_or(0);
+    let maxmemory_human = format_bytes(maxmemory);
+    let used_memory = storage.approximate_used_memory();
+    let used_memory_human = format_bytes(used_memory);
 
     let mut info = String::new();
     info.push_str("# Server\r\n");
     info.push_str(&format!("redust_version:0.1.0\r\n"));
     info.push_str(&format!("tcp_port:{}\r\n", metrics.tcp_port));
     info.push_str(&format!("uptime_in_seconds:{}\r\n", uptime));
+    info.push_str(&format!("maxmemory:{}\r\n", maxmemory));
+    info.push_str(&format!("maxmemory_human:{}\r\n", maxmemory_human));
+    info.push_str(&format!("used_memory:{}\r\n", used_memory));
+    info.push_str(&format!("used_memory_human:{}\r\n", used_memory_human));
     info.push_str("\r\n# Clients\r\n");
     info.push_str(&format!("connected_clients:{}\r\n", connected));
     info.push_str("\r\n# Stats\r\n");
@@ -551,7 +607,8 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
             | Command::Pttl { .. }
             | Command::Persist { .. }
             | Command::Type { .. }
-            | Command::Keys { .. } => {
+            | Command::Keys { .. }
+            | Command::Dbsize => {
                 handle_key_meta_command(cmd, &storage, &mut write_half).await?;
             }
 
@@ -585,8 +642,12 @@ pub async fn serve(
 ) -> io::Result<()> {
     let local_addr = listener.local_addr()?;
     let port = local_addr.port();
+    let maxmemory_bytes = env::var("REDUST_MAXMEMORY_BYTES")
+        .ok()
+        .and_then(|s| parse_maxmemory_bytes(&s))
+        .filter(|v| *v > 0);
 
-    let storage = Storage::default();
+    let storage = Storage::new(maxmemory_bytes);
 
     let rdb_path = env::var("REDUST_RDB_PATH").unwrap_or_else(|_| "redust.rdb".to_string());
     if let Err(e) = storage.load_rdb(&rdb_path) {
