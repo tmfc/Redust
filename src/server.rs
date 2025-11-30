@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::sync::{Arc, atomic::{AtomicU64, AtomicUsize, Ordering}};
 use std::time::Instant;
+use std::env;
 
 use tokio::io::{self, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -20,6 +21,29 @@ struct Metrics {
     connected_clients: AtomicUsize,
     total_commands: AtomicU64,
     tcp_port: u16,
+}
+
+fn build_prometheus_metrics(storage: &Storage, metrics: &Metrics) -> String {
+    let uptime = Instant::now().duration_since(metrics.start_time).as_secs();
+    let connected = metrics.connected_clients.load(Ordering::Relaxed);
+    let total_cmds = metrics.total_commands.load(Ordering::Relaxed);
+    let keys = storage.keys("*").len();
+
+    let mut buf = String::new();
+
+    buf.push_str("# TYPE redust_uptime_seconds counter\n");
+    buf.push_str(&format!("redust_uptime_seconds {}\n", uptime));
+
+    buf.push_str("# TYPE redust_connected_clients gauge\n");
+    buf.push_str(&format!("redust_connected_clients {}\n", connected));
+
+    buf.push_str("# TYPE redust_total_commands_processed counter\n");
+    buf.push_str(&format!("redust_total_commands_processed {}\n", total_cmds));
+
+    buf.push_str("# TYPE redust_keyspace_keys gauge\n");
+    buf.push_str(&format!("redust_keyspace_keys{{db=\"0\"}} {}\n", keys));
+
+    buf
 }
 
 async fn handle_string_command(
@@ -171,6 +195,31 @@ async fn handle_list_command(
                 respond_bulk_string(writer, &value).await?;
             } else {
                 respond_null_bulk(writer).await?;
+            }
+        }
+        Command::Llen { key } => {
+            let len = storage.llen(&key);
+            respond_integer(writer, len as i64).await?;
+        }
+        Command::Lindex { key, index } => {
+            if let Some(value) = storage.lindex(&key, index) {
+                respond_bulk_string(writer, &value).await?;
+            } else {
+                respond_null_bulk(writer).await?;
+            }
+        }
+        Command::Lrem { key, count, value } => {
+            let removed = storage.lrem(&key, count, &value);
+            respond_integer(writer, removed as i64).await?;
+        }
+        Command::Ltrim { key, start, stop } => {
+            match storage.ltrim(&key, start, stop) {
+                Ok(()) => {
+                    respond_simple_string(writer, "OK").await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
             }
         }
         _ => {}
@@ -354,6 +403,56 @@ async fn handle_info_command(
     respond_bulk_string(writer, &info).await
 }
 
+async fn handle_metrics_connection(
+    mut stream: TcpStream,
+    storage: Storage,
+    metrics: Arc<Metrics>,
+) -> io::Result<()> {
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = [0u8; 1024];
+    let n = stream.read(&mut buf).await?;
+    if n == 0 {
+        return Ok(());
+    }
+
+    let req = String::from_utf8_lossy(&buf[..n]);
+    let first_line = req.lines().next().unwrap_or("");
+    let ok = first_line.starts_with("GET /metrics ") || first_line.starts_with("GET /metrics\r");
+
+    if !ok {
+        let resp = "HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+        stream.write_all(resp.as_bytes()).await?;
+        return Ok(());
+    }
+
+    let body = build_prometheus_metrics(&storage, &metrics);
+    let resp = format!(
+        "HTTP/1.0 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(resp.as_bytes()).await?;
+    Ok(())
+}
+
+async fn run_metrics_exporter(bind_addr: &str, storage: Storage, metrics: Arc<Metrics>) -> io::Result<()> {
+    let listener = TcpListener::bind(bind_addr).await?;
+    println!("[metrics] exporter listening on {}", listener.local_addr()?);
+
+    loop {
+        let (stream, addr) = listener.accept().await?;
+        let storage = storage.clone();
+        let metrics = metrics.clone();
+        println!("[metrics] connection from {}", addr);
+        tokio::spawn(async move {
+            if let Err(e) = handle_metrics_connection(stream, storage, metrics).await {
+                eprintln!("[metrics] connection error: {}", e);
+            }
+        });
+    }
+}
+
 async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Metrics>) -> io::Result<()> {
     let peer_addr = stream.peer_addr().ok();
     println!("[conn] new connection from {:?}", peer_addr);
@@ -415,7 +514,11 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
             | Command::Rpush { .. }
             | Command::Lrange { .. }
             | Command::Lpop { .. }
-            | Command::Rpop { .. } => {
+            | Command::Rpop { .. }
+            | Command::Llen { .. }
+            | Command::Lindex { .. }
+            | Command::Lrem { .. }
+            | Command::Ltrim { .. } => {
                 handle_list_command(cmd, &storage, &mut write_half).await?;
             }
 
@@ -491,6 +594,18 @@ pub async fn serve(
         total_commands: AtomicU64::new(0),
         tcp_port: port,
     });
+
+    if let Ok(metrics_addr) = env::var("REDUST_METRICS_ADDR") {
+        if !metrics_addr.is_empty() {
+            let storage_clone = storage.clone();
+            let metrics_clone = metrics.clone();
+            tokio::spawn(async move {
+                if let Err(e) = run_metrics_exporter(&metrics_addr, storage_clone, metrics_clone).await {
+                    eprintln!("[metrics] exporter failed: {}", e);
+                }
+            });
+        }
+    }
     tokio::pin!(shutdown);
     loop {
         tokio::select! {

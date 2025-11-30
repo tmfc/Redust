@@ -44,6 +44,56 @@ async fn mset_and_mget_roundtrip() {
 }
 
 #[tokio::test]
+async fn command_argument_and_integer_errors_match_redis() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let mut client = TestClient::connect(addr).await;
+
+    // SET with missing value -> ERR wrong number of arguments for 'set' command
+    client.send_array(&["SET", "foo"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'set' command\r\n");
+
+    // GET with missing key -> ERR wrong number of arguments for 'get' command
+    client.send_array(&["GET"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'get' command\r\n");
+
+    // EXPIRE with missing seconds -> ERR wrong number of arguments for 'expire' command
+    client.send_array(&["EXPIRE", "foo"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'expire' command\r\n");
+
+    // EXPIRE with non-integer seconds -> ERR value is not an integer or out of range
+    client.send_array(&["EXPIRE", "foo", "notint"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR value is not an integer or out of range\r\n");
+
+    // PEXPIRE with non-integer millis -> same integer error
+    client.send_array(&["PEXPIRE", "foo", "notint"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR value is not an integer or out of range\r\n");
+
+    // SETEX with non-integer seconds -> integer error
+    client.send_array(&["SETEX", "foo", "notint", "bar"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR value is not an integer or out of range\r\n");
+
+    // PSETEX with non-integer millis -> integer error
+    client.send_array(&["PSETEX", "foo", "notint", "bar"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR value is not an integer or out of range\r\n");
+
+    // INCRBY with non-integer delta -> integer error
+    client.send_array(&["INCRBY", "foo", "notint"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR value is not an integer or out of range\r\n");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn setnx_semantics() {
     let (addr, shutdown, handle) = spawn_server().await;
 

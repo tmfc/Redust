@@ -28,7 +28,7 @@ impl fmt::Display for CommandError {
 
 impl std::error::Error for CommandError {}
 
-
+/// Represents a Redis command.
 #[derive(Debug)]
 pub enum Command {
     Ping,
@@ -53,6 +53,10 @@ pub enum Command {
     Lrange { key: String, start: isize, stop: isize },
     Lpop { key: String },
     Rpop { key: String },
+    Llen { key: String },
+    Lindex { key: String, index: isize },
+    Lrem { key: String, count: isize, value: String },
+    Ltrim { key: String, start: isize, stop: isize },
     Sadd { key: String, members: Vec<String> },
     Srem { key: String, members: Vec<String> },
     Smembers { key: String },
@@ -322,6 +326,69 @@ pub async fn read_command(
                 return Ok(Some(err_not_integer()));
             };
             Command::Lrange { key, start, stop }
+        }
+        "LLEN" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(err_wrong_args("llen")));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("llen")));
+            }
+            Command::Llen { key }
+        }
+        "LINDEX" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(err_wrong_args("lindex")));
+            };
+            let Some(idx_s) = iter.next() else {
+                return Ok(Some(err_wrong_args("lindex")));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("lindex")));
+            }
+            let Ok(index) = idx_s.parse::<isize>() else {
+                return Ok(Some(err_not_integer()));
+            };
+            Command::Lindex { key, index }
+        }
+        "LREM" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(err_wrong_args("lrem")));
+            };
+            let Some(count_s) = iter.next() else {
+                return Ok(Some(err_wrong_args("lrem")));
+            };
+            let Some(value) = iter.next() else {
+                return Ok(Some(err_wrong_args("lrem")));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("lrem")));
+            }
+            let Ok(count) = count_s.parse::<isize>() else {
+                return Ok(Some(err_not_integer()));
+            };
+            Command::Lrem { key, count, value }
+        }
+        "LTRIM" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(err_wrong_args("ltrim")));
+            };
+            let Some(start_s) = iter.next() else {
+                return Ok(Some(err_wrong_args("ltrim")));
+            };
+            let Some(stop_s) = iter.next() else {
+                return Ok(Some(err_wrong_args("ltrim")));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("ltrim")));
+            }
+            let Ok(start) = start_s.parse::<isize>() else {
+                return Ok(Some(err_not_integer()));
+            };
+            let Ok(stop) = stop_s.parse::<isize>() else {
+                return Ok(Some(err_not_integer()));
+            };
+            Command::Ltrim { key, start, stop }
         }
         "SADD" => {
             let Some(key) = iter.next() else {

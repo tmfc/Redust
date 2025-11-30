@@ -396,6 +396,167 @@ impl Storage {
         }
     }
 
+    pub fn llen(&self, key: &str) -> usize {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return 0;
+        }
+
+        self.data.get(key).map_or(0, |entry| {
+            if let StorageValue::List { value: list, .. } = entry.value() {
+                list.len()
+            } else {
+                0
+            }
+        })
+    }
+
+    pub fn lindex(&self, key: &str, index: isize) -> Option<String> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return None;
+        }
+
+        let entry = self.data.get(key)?;
+        let list = match entry.value() {
+            StorageValue::List { value: list, .. } => list,
+            _ => return None,
+        };
+
+        let len = list.len() as isize;
+        if len == 0 {
+            return None;
+        }
+
+        let mut idx = index;
+        if idx < 0 {
+            idx += len;
+        }
+        if idx < 0 || idx >= len {
+            return None;
+        }
+
+        list.get(idx as usize).cloned()
+    }
+
+    pub fn lrem(&self, key: &str, count: isize, value: &str) -> usize {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return 0;
+        }
+
+        let Some(mut entry) = self.data.get_mut(key) else {
+            return 0;
+        };
+
+        let list = match entry.value_mut() {
+            StorageValue::List { value: list, .. } => list,
+            _ => return 0,
+        };
+
+        if list.is_empty() {
+            return 0;
+        }
+
+        // Implement Redis-like LREM semantics.
+        let mut removed = 0usize;
+
+        if count == 0 {
+            // remove all occurrences
+            let original_len = list.len();
+            list.retain(|v| v != value);
+            removed = original_len - list.len();
+        } else if count > 0 {
+            // from head to tail, remove up to count
+            let mut remaining = count as usize;
+            let mut i = 0;
+            while i < list.len() && remaining > 0 {
+                if list[i] == value {
+                    list.remove(i);
+                    removed += 1;
+                    remaining -= 1;
+                    // do not advance i; list has shifted
+                } else {
+                    i += 1;
+                }
+            }
+        } else {
+            // count < 0: from tail to head, remove up to |count|
+            let mut remaining = (-count) as usize;
+            let mut i = list.len();
+            while i > 0 && remaining > 0 {
+                i -= 1;
+                if list[i] == value {
+                    list.remove(i);
+                    removed += 1;
+                    remaining -= 1;
+                }
+            }
+        }
+
+        removed
+    }
+
+    pub fn ltrim(&self, key: &str, start: isize, stop: isize) -> Result<(), ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(());
+        }
+
+        let Some(mut entry) = self.data.get_mut(key) else {
+            // key does not exist: Redis treats as no-op
+            return Ok(());
+        };
+
+        let list = match entry.value_mut() {
+            StorageValue::List { value: list, .. } => list,
+            _ => return Err(()), // WRONGTYPE
+        };
+
+        if list.is_empty() {
+            return Ok(());
+        }
+
+        let len = list.len() as isize;
+        let mut s = start;
+        let mut e = stop;
+
+        if s < 0 {
+            s += len;
+        }
+        if e < 0 {
+            e += len;
+        }
+
+        if s < 0 {
+            s = 0;
+        }
+        if e >= len {
+            e = len - 1;
+        }
+
+        if s > e || s >= len {
+            // Result is empty list
+            list.clear();
+            return Ok(());
+        }
+
+        let start_idx = s as usize;
+        let end_idx = e as usize;
+
+        // Keep only [start_idx, end_idx]
+        // First, drop elements after end_idx
+        if end_idx + 1 < list.len() {
+            list.truncate(end_idx + 1);
+        }
+        // Then, drop elements before start_idx by draining
+        if start_idx > 0 {
+            list.drain(0..start_idx);
+        }
+
+        Ok(())
+    }
+
     pub fn sadd(&self, key: &str, members: &[String]) -> usize {
         let now = Instant::now();
         self.remove_if_expired(key, now);
