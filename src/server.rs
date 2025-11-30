@@ -35,8 +35,10 @@ fn parse_maxmemory_bytes(input: &str) -> Option<u64> {
         return Some(v);
     }
 
-    // 支持带单位：MB / GB（大小写不敏感）
-    let (num_part, multiplier) = if let Some(stripped) = s.strip_suffix("mb") {
+    // 支持带单位：KB / MB / GB（大小写不敏感）
+    let (num_part, multiplier) = if let Some(stripped) = s.strip_suffix("kb") {
+        (stripped.trim(), 1024u64)
+    } else if let Some(stripped) = s.strip_suffix("mb") {
         (stripped.trim(), 1024u64 * 1024)
     } else if let Some(stripped) = s.strip_suffix("gb") {
         (stripped.trim(), 1024u64 * 1024 * 1024)
@@ -66,6 +68,10 @@ fn format_bytes(bytes: u64) -> String {
         return format!("{:.2}KB", v);
     }
     format!("{}B", bytes)
+}
+
+fn current_max_value_bytes() -> Option<u64> {
+    env::var("REDUST_MAXVALUE_BYTES").ok().and_then(|s| parse_maxmemory_bytes(&s)).filter(|v| *v > 0)
 }
 
 fn build_prometheus_metrics(storage: &Storage, metrics: &Metrics) -> String {
@@ -113,6 +119,12 @@ async fn handle_string_command(
         }
         Command::Set { key, value, expire_millis } => {
             let physical = prefix_key(current_db, &key);
+            if let Some(limit) = current_max_value_bytes() {
+                if (value.as_bytes().len() as u64) > limit {
+                    respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                    return Ok(());
+                }
+            }
             storage.set(physical.clone(), value);
             if let Some(ms) = expire_millis {
                 storage.expire_millis(&physical, ms);
@@ -198,6 +210,15 @@ async fn handle_string_command(
             writer.write_all(response.as_bytes()).await?;
         }
         Command::Mset { pairs } => {
+            if let Some(limit) = current_max_value_bytes() {
+                for (_k, v) in pairs.iter() {
+                    if (v.as_bytes().len() as u64) > limit {
+                        respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                        return Ok(());
+                    }
+                }
+            }
+
             let mapped: Vec<(String, String)> = pairs
                 .into_iter()
                 .map(|(k, v)| (prefix_key(current_db, &k), v))
@@ -207,17 +228,35 @@ async fn handle_string_command(
         }
         Command::Setnx { key, value } => {
             let physical = prefix_key(current_db, &key);
+            if let Some(limit) = current_max_value_bytes() {
+                if (value.as_bytes().len() as u64) > limit {
+                    respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                    return Ok(());
+                }
+            }
             let inserted = storage.setnx(&physical, value);
             let v = if inserted { 1 } else { 0 };
             respond_integer(writer, v).await?;
         }
         Command::Setex { key, seconds, value } => {
             let physical = prefix_key(current_db, &key);
+            if let Some(limit) = current_max_value_bytes() {
+                if (value.as_bytes().len() as u64) > limit {
+                    respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                    return Ok(());
+                }
+            }
             storage.set_with_expire_seconds(physical, value, seconds);
             respond_simple_string(writer, "OK").await?;
         }
         Command::Psetex { key, millis, value } => {
             let physical = prefix_key(current_db, &key);
+            if let Some(limit) = current_max_value_bytes() {
+                if (value.as_bytes().len() as u64) > limit {
+                    respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                    return Ok(());
+                }
+            }
             storage.set_with_expire_millis(physical, value, millis);
             respond_simple_string(writer, "OK").await?;
         }
@@ -236,6 +275,14 @@ async fn handle_list_command(
     match cmd {
         Command::Lpush { key, values } => {
             let physical = prefix_key(current_db, &key);
+            if let Some(limit) = current_max_value_bytes() {
+                for v in &values {
+                    if (v.as_bytes().len() as u64) > limit {
+                        respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                        return Ok(());
+                    }
+                }
+            }
             match storage.lpush(&physical, &values) {
                 Ok(len) => {
                     respond_integer(writer, len as i64).await?;
@@ -247,6 +294,14 @@ async fn handle_list_command(
         }
         Command::Rpush { key, values } => {
             let physical = prefix_key(current_db, &key);
+            if let Some(limit) = current_max_value_bytes() {
+                for v in &values {
+                    if (v.as_bytes().len() as u64) > limit {
+                        respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                        return Ok(());
+                    }
+                }
+            }
             match storage.rpush(&physical, &values) {
                 Ok(len) => {
                     respond_integer(writer, len as i64).await?;
@@ -361,6 +416,14 @@ async fn handle_set_command(
     match cmd {
         Command::Sadd { key, members } => {
             let physical = prefix_key(current_db, &key);
+            if let Some(limit) = current_max_value_bytes() {
+                for m in &members {
+                    if (m.as_bytes().len() as u64) > limit {
+                        respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                        return Ok(());
+                    }
+                }
+            }
             match storage.sadd(&physical, &members) {
                 Ok(added) => {
                     respond_integer(writer, added as i64).await?;
@@ -479,6 +542,12 @@ async fn handle_hash_command(
     match cmd {
         Command::Hset { key, field, value } => {
             let physical = prefix_key(current_db, &key);
+            if let Some(limit) = current_max_value_bytes() {
+                if (value.as_bytes().len() as u64) > limit {
+                    respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                    return Ok(());
+                }
+            }
             match storage.hset(&physical, &field, value) {
                 Ok(added) => {
                     respond_integer(writer, added as i64).await?;
@@ -742,6 +811,9 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
     let mut reader = BufReader::new(read_half);
     let mut current_db: u8 = 0;
 
+    let auth_password = env::var("REDUST_AUTH_PASSWORD").ok().filter(|s| !s.is_empty());
+    let mut authenticated = auth_password.is_none();
+
     loop {
         let cmd_result = read_command(&mut reader).await;
         let cmd = match cmd_result {
@@ -762,7 +834,42 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
 
         metrics.total_commands.fetch_add(1, Ordering::Relaxed);
 
-        println!("[conn] received command: {:?}", cmd);
+        match &cmd {
+            Command::Auth { .. } => {
+                println!("[conn] received command: AUTH ****");
+            }
+            _ => {
+                println!("[conn] received command: {:?}", cmd);
+            }
+        }
+
+        // AUTH 处理与权限检查
+        if let Some(ref pwd) = auth_password {
+            match cmd {
+                Command::Auth { ref password } => {
+                    if password == pwd {
+                        authenticated = true;
+                        respond_simple_string(&mut write_half, "OK").await?;
+                    } else {
+                        respond_error(&mut write_half, "WRONGPASS invalid username-password pair or user is disabled").await?;
+                    }
+                    continue;
+                }
+                Command::Ping | Command::Echo(_) | Command::Quit => {
+                    // 这些命令在未认证时仍然允许
+                }
+                _ => {
+                    if !authenticated {
+                        respond_error(&mut write_half, "NOAUTH Authentication required").await?;
+                        continue;
+                    }
+                }
+            }
+        } else if let Command::Auth { .. } = cmd {
+            // 未启用 AUTH，但客户端仍然发送 AUTH
+            respond_error(&mut write_half, "ERR AUTH not enabled").await?;
+            continue;
+        }
 
         match cmd {
             // string / generic key-value 命令
@@ -844,6 +951,10 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
             Command::Select { db } => {
                 current_db = db;
                 respond_simple_string(&mut write_half, "OK").await?;
+            }
+
+            Command::Auth { .. } => {
+                unreachable!();
             }
 
             // 解析阶段构造的错误命令

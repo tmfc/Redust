@@ -77,6 +77,7 @@ pub enum Command {
     Pttl { key: String },
     Persist { key: String },
     Info,
+    Auth { password: String },
     Select { db: u8 },
     Mget { keys: Vec<String> },
     Mset { pairs: Vec<(String, String)> },
@@ -589,6 +590,15 @@ pub async fn read_command(
                 return Ok(Some(err_wrong_args("info")));
             }
             Command::Info
+        }
+        "AUTH" => {
+            let Some(password) = iter.next() else {
+                return Ok(Some(err_wrong_args("auth")));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("auth")));
+            }
+            Command::Auth { password }
         }
         "SELECT" => {
             let Some(db_str) = iter.next() else {

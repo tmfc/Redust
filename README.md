@@ -49,6 +49,12 @@ Redust 通过环境变量和少量 CLI 参数进行配置：
   - 纯数字：按字节解析，例如 `104857600`。
   - 或带单位：`64KB` / `100MB` / `1GB`（大小写不敏感）。
   - `0` 或未设置：表示不限制内存使用，不触发 LRU 淘汰。
+- `REDUST_MAXVALUE_BYTES`：单个 value 最大字节数（可选）：
+  - 纯数字或带单位，解析规则与 `REDUST_MAXMEMORY_BYTES` 一致。
+  - 目前会限制字符串/列表/集合/哈希写入中的 value 长度（如 `SET`/`MSET`/`LPUSH`/`SADD`/`HSET` 等），超限时返回 `ERR value exceeds REDUST_MAXVALUE_BYTES` 并拒绝写入。
+- `REDUST_AUTH_PASSWORD`：全局认证密码（可选）：
+  - 未设置或为空：不启用认证，所有命令无需 AUTH 即可执行。
+  - 设置非空值：启用基于密码的简单认证，未认证连接仅允许执行 `PING`/`ECHO`/`QUIT`/`AUTH`。
 
 CLI 参数（在 `cargo run -- ...` 之后传入）：
 
@@ -82,6 +88,20 @@ redis-cli -h 127.0.0.1 -p 6379 INFO | grep memory
 
 # 或使用 nc 直接发送 RESP：
 printf "*1\r\n$4\r\nPING\r\n" | nc 127.0.0.1 6379
+
+# 启用 AUTH 后的简单示例
+# 假设以 REDUST_AUTH_PASSWORD=secret 启动服务：
+REDUST_AUTH_PASSWORD="secret" cargo run
+
+# 未认证时只能执行 PING / ECHO / QUIT / AUTH：
+redis-cli -h 127.0.0.1 -p 6379 SET k v
+# => (error) NOAUTH Authentication required
+
+# 先 AUTH 再写入：
+redis-cli -h 127.0.0.1 -p 6379 AUTH secret
+redis-cli -h 127.0.0.1 -p 6379 SET k v
+redis-cli -h 127.0.0.1 -p 6379 GET k
+# => "v"
 ```
 
 ## 运行测试

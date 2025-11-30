@@ -1,9 +1,11 @@
 use std::net::SocketAddr;
+
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
 use redust::server::serve;
+
 mod env_guard;
 use env_guard::{set_env, ENV_LOCK};
 
@@ -51,42 +53,51 @@ impl TestClient {
         self.reader.read_line(&mut line).await.unwrap();
         line
     }
-
-    async fn set(&mut self, key: &str, value: &str) {
-        self.send_array(&["SET", key, value]).await;
-        let line = self.read_simple_line().await;
-        assert_eq!(line, "+OK\r\n");
-    }
-
-    async fn dbsize(&mut self) -> i64 {
-        self.send_array(&["DBSIZE"]).await;
-        let line = self.read_simple_line().await;
-        assert!(line.starts_with(":"));
-        line[1..line.len() - 2].parse().unwrap()
-    }
 }
 
 #[tokio::test]
-async fn basic_maxmemory_eviction_smoke() {
+async fn rejects_value_exceeding_limit() {
     let _lock = ENV_LOCK.lock().unwrap();
-    // 设置较小的 maxmemory（64 KiB），使用纯字节值以匹配当前解析逻辑
-    let _guard = set_env("REDUST_MAXMEMORY_BYTES", "65536");
+    let _guard = set_env("REDUST_MAXVALUE_BYTES", "16");
+    // Limit to 16 bytes
 
     let (addr, shutdown, handle) = spawn_server().await;
     let mut client = TestClient::connect(addr).await;
 
-    let large_value = "x".repeat(1024); // 1KB 左右的 value
-    let total_keys = 2000;
+    let small = "1234567890abcdef"; // 16 bytes
+    let large = "1234567890abcdefX"; // 17 bytes
 
-    for i in 0..total_keys {
-        let key = format!("hot_k{}", i);
-        client.set(&key, &large_value).await;
-    }
+    // small should succeed
+    client.send_array(&["SET", "k1", small]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "+OK\r\n");
 
-    let final_dbsize = client.dbsize().await;
+    // large should be rejected
+    client.send_array(&["SET", "k2", large]).await;
+    let line = client.read_simple_line().await;
+    assert!(line.starts_with("-ERR value exceeds REDUST_MAXVALUE_BYTES"));
 
-    // 只要小于写入总数，就说明发生了淘汰（否则等于 total_keys）
-    assert!(final_dbsize < total_keys as i64);
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn mset_respects_limit() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _guard = set_env("REDUST_MAXVALUE_BYTES", "8");
+
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // v1 ok, v2 too large
+    client.send_array(&["MSET", "a", "12345678", "b", "123456789"]).await;
+    let line = client.read_simple_line().await;
+    assert!(line.starts_with("-ERR value exceeds REDUST_MAXVALUE_BYTES"));
+
+    // ensure that failed MSET did not partially write key a
+    client.send_array(&["GET", "a"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "$-1\r\n");
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
