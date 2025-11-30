@@ -45,6 +45,54 @@
 
 ---
 
+## 持久化演进（基于 RDB v1 的后续方向）
+
+> 现状：已经有 RDB v1 + 启动加载 + 基于 `REDUST_RDB_AUTO_SAVE_SECS` 的定时保存，仍有不少可以改进的空间。
+
+- [ ] **RDB 保存的崩溃一致性与原子性**
+  - 当前实现直接写入目标文件路径，未来可以考虑：
+    - 先写入临时文件（如 `.rdb.tmp`），完成后再 `rename` 覆盖，避免生成半截快照；
+    - 明确何时 `fsync`（例如：每次保存后，对文件和父目录各做一次 `fsync`）。
+  - 在文档中补充：不同文件系统/平台下的一致性假设和风险提示。
+
+- [ ] **RDB 保存的调度与限流**
+  - 当前自动保存任务是简单的固定间隔循环：`sleep(interval) -> save_rdb`。
+  - 后续可以：
+    - 结合最近一轮 save 的耗时/失败次数，动态调整间隔（例如：过慢时拉长间隔）；
+    - 在 save 过程中增加简单的分段写入/进度日志，便于诊断大实例下的抖动。
+
+- [ ] **RDB 版本升级与兼容策略**
+  - 在 `doc/rdb.md` 的基础上，设计 v2+ 的可能改动：
+    - 增强 TTL 表示方式（例如改用绝对时间戳，以便跨进程更精确恢复）；
+    - 支持更多数据类型（如未来的 ZSet、Stream 等）；
+    - 预留多 DB 支持的字段（db 编号）。
+  - 加载策略上明确：
+    - 如何处理「版本号比当前实现新的」文件（拒绝/警告/尝试降级解析）；
+    - 是否需要提供简单的“格式迁移”工具或命令。
+
+- [ ] **AOF 方向的预研与 PoC**
+  - 在 RDB v1 稳定后，可以启动一个最小 AOF PoC：
+    - 仅记录关键写命令（SET/DEL/EXPIRE 等）的 append-only 日志；
+    - 刷盘策略先对齐 Redis 常用的 `appendfsync everysec` 语义；
+    - 通过简单 rewrite（基于当前内存快照重写 AOF）控制文件大小。
+  - 目标是形成一份对比文档：RDB-only vs AOF-only vs RDB+AOF 的推荐部署策略。
+
+- [ ] **可配置的持久化策略与关闭选项**
+  - 通过环境变量或配置文件，允许用户：
+    - 完全关闭定时保存（当前默认已是关闭，仅配置变量才启用）；
+    - 为 RDB/AOF 分别配置保存间隔、文件路径等；
+    - 在 `INFO` 或 metrics 中暴露当前持久化策略的摘要（例如 `persistence:rdb,interval=60s`）。
+
+- [ ] **持久化与 INFO / metrics 的联动**
+  - 在 `INFO` 中补充：
+    - 上一次成功 RDB 保存的时间戳（类比 Redis `rdb_last_save_time`）；
+    - 最近一次保存结果（成功/失败及错误消息简要统计）。
+  - 在 Prometheus metrics 中暴露：
+    - `redust_rdb_last_save_timestamp`、`redust_rdb_last_save_duration_seconds`；
+    - `redust_rdb_save_failures_total` 等计数器。
+
+---
+
 ## INFO 指标增强（V2）
 
 在当前 INFO v1（redust_version/tcp_port/uptime_in_seconds/connected_clients/total_commands_processed/db0:keys）基础上，后续可以逐步增强：

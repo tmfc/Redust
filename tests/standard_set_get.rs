@@ -89,6 +89,65 @@ async fn command_argument_and_integer_errors_match_redis() {
     let line = client.read_simple_line().await;
     assert_eq!(line, "-ERR value is not an integer or out of range\r\n");
 
+    // LLEN with missing key -> ERR wrong number of arguments for 'llen' command
+    client.send_array(&["LLEN"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'llen' command\r\n");
+
+    // LLEN with extra argument -> same wrong-args error
+    client.send_array(&["LLEN", "foo", "extra"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'llen' command\r\n");
+
+    // LINDEX with non-integer index -> integer error
+    client.send_array(&["LINDEX", "foo", "notint"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR value is not an integer or out of range\r\n");
+
+    // HGETALL with wrong arg count -> wrong-args error
+    client.send_array(&["HGETALL"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'hgetall' command\r\n");
+
+    client.send_array(&["HGETALL", "foo", "extra"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'hgetall' command\r\n");
+
+    // SCARD with wrong arg count -> wrong-args error
+    client.send_array(&["SCARD"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'scard' command\r\n");
+
+    client.send_array(&["SCARD", "foo", "extra"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'scard' command\r\n");
+
+    // SISMEMBER with wrong arg count -> wrong-args error
+    client.send_array(&["SISMEMBER"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'sismember' command\r\n");
+
+    client.send_array(&["SISMEMBER", "foo"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'sismember' command\r\n");
+
+    client.send_array(&["SISMEMBER", "foo", "bar", "extra"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'sismember' command\r\n");
+
+    // SUNION/SINTER/SDIFF without any key -> wrong-args error
+    client.send_array(&["SUNION"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'sunion' command\r\n");
+
+    client.send_array(&["SINTER"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'sinter' command\r\n");
+
+    client.send_array(&["SDIFF"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'sdiff' command\r\n");
+
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
 }

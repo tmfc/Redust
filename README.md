@@ -71,6 +71,28 @@ cargo test
 - 集成测试：
   - `tests/server_basic.rs`：使用真实 TCP 连接验证 PING/ECHO/QUIT/SET/GET/DEL/EXISTS/INCR/DECR/TYPE/KEYS 等命令行为，以及多客户端共享存储与基本性能（默认 200 次 PING 往返需在 2 秒内完成）。
 
+## 持久化与 RDB 启动加载
+
+Redust 当前提供了一版**实验性的 RDB v1 快照格式**，用于在重启时恢复内存数据：
+
+- **启动加载**：
+  - 服务器启动时会尝试从 RDB 文件中加载现有数据。
+  - 默认路径为当前工作目录下的 `redust.rdb`。
+  - 可通过环境变量 `REDUST_RDB_PATH` 覆盖，例如：
+
+    ```bash
+    REDUST_RDB_PATH="/var/lib/redust/data.rdb" cargo run
+    ```
+
+- **加载失败行为**：
+  - 当文件不存在、magic/版本不匹配或内容损坏时，当前实现会记录一条日志并**以空库启动**，不会阻止服务监听 TCP 端口。
+
+- **格式说明**：
+  - RDB v1 的二进制格式仅用于 Redust 内部，不与官方 Redis RDB 兼容。
+  - 详细字段与语义说明见 `doc/rdb.md`。
+
+后续会根据 `roadmap.md` 中的规划，逐步完善持久化能力（包括触发保存的命令/策略、后台保存等）。
+
 ## 目录结构
 
 - `src/main.rs`：服务主入口，只负责读取配置并调用库的 `run_server`。

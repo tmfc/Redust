@@ -5,6 +5,7 @@ use std::env;
 
 use tokio::io::{self, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::sleep;
 
 use crate::command::{read_command, Command, CommandError}; // Import CommandError
 use crate::resp::{
@@ -586,7 +587,52 @@ pub async fn serve(
     let port = local_addr.port();
 
     let storage = Storage::default();
+
+    let rdb_path = env::var("REDUST_RDB_PATH").unwrap_or_else(|_| "redust.rdb".to_string());
+    if let Err(e) = storage.load_rdb(&rdb_path) {
+        eprintln!("[rdb] failed to load RDB from {}: {}", rdb_path, e);
+    } else {
+        println!("[rdb] loaded RDB from {} (if existing and valid)", rdb_path);
+    }
+
     storage.spawn_expiration_task();
+
+    if let Ok(interval_str) = env::var("REDUST_RDB_AUTO_SAVE_SECS") {
+        if let Ok(secs) = interval_str.parse::<u64>() {
+            if secs > 0 {
+                let storage_clone = storage.clone();
+                let path_clone = rdb_path.clone();
+                println!(
+                    "[rdb] auto-save enabled: every {} seconds to {}",
+                    secs, path_clone
+                );
+                tokio::spawn(async move {
+                    let interval = std::time::Duration::from_secs(secs);
+                    loop {
+                        sleep(interval).await;
+                        let storage_for_blocking = storage_clone.clone();
+                        let path_for_blocking = path_clone.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            storage_for_blocking.save_rdb(&path_for_blocking)
+                        })
+                        .await;
+
+                        match result {
+                            Ok(Ok(())) => {
+                                // saved successfully
+                            }
+                            Ok(Err(e)) => {
+                                eprintln!("[rdb] auto-save failed: {}", e);
+                            }
+                            Err(e) => {
+                                eprintln!("[rdb] auto-save task panicked: {}", e);
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
 
     let metrics = Arc::new(Metrics {
         start_time: Instant::now(),

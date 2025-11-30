@@ -147,6 +147,40 @@
 
 ---
 
+## 命令错误风格与参数校验约定（Redis 对齐）
+
+当前已实现的命令子集中，以下命令的**参数个数错误**与**整数解析错误**已经对齐 Redis 的错误风格，并通过端到端测试覆盖：
+
+- 字符串与多 key：
+  - `SET` / `GET` / `DEL` / `EXISTS` / `TYPE` / `KEYS`
+  - `INCR` / `DECR` / `INCRBY` / `DECRBY`
+  - `MGET` / `MSET` / `SETNX` / `SETEX` / `PSETEX`
+- 列表 List：
+  - `LPUSH` / `RPUSH` / `LRANGE` / `LPOP` / `RPOP`
+  - `LLEN` / `LINDEX` / `LREM` / `LTRIM`
+- 集合 Set：
+  - `SADD` / `SREM` / `SMEMBERS` / `SCARD` / `SISMEMBER`
+  - `SUNION` / `SINTER` / `SDIFF`
+- 哈希 Hash：
+  - `HSET` / `HGET` / `HDEL` / `HEXISTS` / `HGETALL`
+- 过期与 TTL：
+  - `EXPIRE` / `PEXPIRE` / `TTL` / `PTTL` / `PERSIST`
+- 连接与信息：
+  - `PING` / `ECHO` / `QUIT` / `INFO`
+
+统一的错误文案约定：
+
+- 参数个数错误：
+  - `-ERR wrong number of arguments for '<cmd>' command`（其中 `<cmd>` 为小写命令名）。
+- 需要整数的位置传入非整数或越界值：
+  - `-ERR value is not an integer or out of range`。
+- 目前 `SET` 带 EX/PX 等选项解析中的语法错误：
+  - `-ERR syntax error`。
+
+未来新增命令/扩展子语义时，建议沿用以上三类错误文案，并在解析阶段尽早返回 `Command::Error`，保持所有调用路径的错误风格一致。
+
+---
+
 ## 计划中的命令（尚未实现）
 
 - [ ] **高级 SET 选项**

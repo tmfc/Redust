@@ -1,4 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use dashmap::DashMap;
@@ -677,6 +680,293 @@ impl Storage {
         members
     }
 
+    pub fn save_rdb<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        let mut file = File::create(path)?;
+
+        file.write_all(b"REDUSTDB")?;
+        file.write_all(&1u32.to_le_bytes())?;
+
+        let now = Instant::now();
+
+        for entry in self.data.iter() {
+            let key = entry.key();
+            let value = entry.value();
+
+            if Storage::value_is_expired(value, now) {
+                continue;
+            }
+
+            let (type_byte, expires_millis) = match value {
+                StorageValue::String { expires_at, .. } => {
+                    (0u8, Self::remaining_millis(*expires_at, now))
+                }
+                StorageValue::List { expires_at, .. } => {
+                    (1u8, Self::remaining_millis(*expires_at, now))
+                }
+                StorageValue::Set { expires_at, .. } => {
+                    (2u8, Self::remaining_millis(*expires_at, now))
+                }
+                StorageValue::Hash { expires_at, .. } => {
+                    (3u8, Self::remaining_millis(*expires_at, now))
+                }
+            };
+
+            file.write_all(&[type_byte])?;
+            file.write_all(&expires_millis.to_le_bytes())?;
+
+            let key_bytes = key.as_bytes();
+            let key_len = key_bytes.len() as u32;
+            file.write_all(&key_len.to_le_bytes())?;
+            file.write_all(key_bytes)?;
+
+            match value {
+                StorageValue::String { value, .. } => {
+                    let v_bytes = value.as_bytes();
+                    let v_len = v_bytes.len() as u32;
+                    file.write_all(&v_len.to_le_bytes())?;
+                    file.write_all(v_bytes)?;
+                }
+                StorageValue::List { value: list, .. } => {
+                    let len = list.len() as u32;
+                    file.write_all(&len.to_le_bytes())?;
+                    for item in list.iter() {
+                        let b = item.as_bytes();
+                        let l = b.len() as u32;
+                        file.write_all(&l.to_le_bytes())?;
+                        file.write_all(b)?;
+                    }
+                }
+                StorageValue::Set { value: set, .. } => {
+                    let len = set.len() as u32;
+                    file.write_all(&len.to_le_bytes())?;
+                    for member in set.iter() {
+                        let b = member.as_bytes();
+                        let l = b.len() as u32;
+                        file.write_all(&l.to_le_bytes())?;
+                        file.write_all(b)?;
+                    }
+                }
+                StorageValue::Hash { value: map, .. } => {
+                    let len = map.len() as u32;
+                    file.write_all(&len.to_le_bytes())?;
+                    for (field, val) in map.iter() {
+                        let f_bytes = field.as_bytes();
+                        let f_len = f_bytes.len() as u32;
+                        file.write_all(&f_len.to_le_bytes())?;
+                        file.write_all(f_bytes)?;
+
+                        let v_bytes = val.as_bytes();
+                        let v_len = v_bytes.len() as u32;
+                        file.write_all(&v_len.to_le_bytes())?;
+                        file.write_all(v_bytes)?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn load_rdb<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        let path_ref = path.as_ref();
+        if !path_ref.exists() {
+            return Ok(());
+        }
+
+        let mut file = File::open(path_ref)?;
+
+        let mut magic = [0u8; 8];
+        if file.read_exact(&mut magic).is_err() {
+            return Ok(());
+        }
+        if &magic != b"REDUSTDB" {
+            return Ok(());
+        }
+
+        let mut version_bytes = [0u8; 4];
+        if file.read_exact(&mut version_bytes).is_err() {
+            return Ok(());
+        }
+        let version = u32::from_le_bytes(version_bytes);
+        if version != 1 {
+            return Ok(());
+        }
+
+        self.data.clear();
+
+        loop {
+            let mut type_buf = [0u8; 1];
+            match file.read_exact(&mut type_buf) {
+                Ok(()) => {}
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::UnexpectedEof {
+                        break;
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+
+            let mut expires_buf = [0u8; 8];
+            if file.read_exact(&mut expires_buf).is_err() {
+                break;
+            }
+            let expires_millis = i64::from_le_bytes(expires_buf);
+
+            let mut key_len_buf = [0u8; 4];
+            if file.read_exact(&mut key_len_buf).is_err() {
+                break;
+            }
+            let key_len = u32::from_le_bytes(key_len_buf) as usize;
+            let mut key_bytes = vec![0u8; key_len];
+            if file.read_exact(&mut key_bytes).is_err() {
+                break;
+            }
+            let key = match String::from_utf8(key_bytes) {
+                Ok(s) => s,
+                Err(_) => {
+                    return Ok(());
+                }
+            };
+
+            let now = Instant::now();
+            let expires_at = if expires_millis < 0 {
+                None
+            } else if expires_millis == 0 {
+                continue;
+            } else {
+                Some(now + Duration::from_millis(expires_millis as u64))
+            };
+
+            let t = type_buf[0];
+            let value = match t {
+                0 => {
+                    let mut len_buf = [0u8; 4];
+                    if file.read_exact(&mut len_buf).is_err() {
+                        break;
+                    }
+                    let len = u32::from_le_bytes(len_buf) as usize;
+                    let mut v = vec![0u8; len];
+                    if file.read_exact(&mut v).is_err() {
+                        break;
+                    }
+                    let s = match String::from_utf8(v) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            return Ok(());
+                        }
+                    };
+                    StorageValue::String { value: s, expires_at }
+                }
+                1 => {
+                    let mut len_buf = [0u8; 4];
+                    if file.read_exact(&mut len_buf).is_err() {
+                        break;
+                    }
+                    let len = u32::from_le_bytes(len_buf) as usize;
+                    let mut list = VecDeque::with_capacity(len);
+                    for _ in 0..len {
+                        let mut ilen_buf = [0u8; 4];
+                        if file.read_exact(&mut ilen_buf).is_err() {
+                            break;
+                        }
+                        let ilen = u32::from_le_bytes(ilen_buf) as usize;
+                        let mut item = vec![0u8; ilen];
+                        if file.read_exact(&mut item).is_err() {
+                            break;
+                        }
+                        let s = match String::from_utf8(item) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                return Ok(());
+                            }
+                        };
+                        list.push_back(s);
+                    }
+                    StorageValue::List { value: list, expires_at }
+                }
+                2 => {
+                    let mut len_buf = [0u8; 4];
+                    if file.read_exact(&mut len_buf).is_err() {
+                        break;
+                    }
+                    let len = u32::from_le_bytes(len_buf) as usize;
+                    let mut set = HashSet::with_capacity(len);
+                    for _ in 0..len {
+                        let mut mlen_buf = [0u8; 4];
+                        if file.read_exact(&mut mlen_buf).is_err() {
+                            break;
+                        }
+                        let mlen = u32::from_le_bytes(mlen_buf) as usize;
+                        let mut member = vec![0u8; mlen];
+                        if file.read_exact(&mut member).is_err() {
+                            break;
+                        }
+                        let s = match String::from_utf8(member) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                return Ok(());
+                            }
+                        };
+                        set.insert(s);
+                    }
+                    StorageValue::Set { value: set, expires_at }
+                }
+                3 => {
+                    let mut len_buf = [0u8; 4];
+                    if file.read_exact(&mut len_buf).is_err() {
+                        break;
+                    }
+                    let len = u32::from_le_bytes(len_buf) as usize;
+                    let mut map = HashMap::with_capacity(len);
+                    for _ in 0..len {
+                        let mut flen_buf = [0u8; 4];
+                        if file.read_exact(&mut flen_buf).is_err() {
+                            break;
+                        }
+                        let flen = u32::from_le_bytes(flen_buf) as usize;
+                        let mut field = vec![0u8; flen];
+                        if file.read_exact(&mut field).is_err() {
+                            break;
+                        }
+                        let field_str = match String::from_utf8(field) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                return Ok(());
+                            }
+                        };
+
+                        let mut vlen_buf = [0u8; 4];
+                        if file.read_exact(&mut vlen_buf).is_err() {
+                            break;
+                        }
+                        let vlen = u32::from_le_bytes(vlen_buf) as usize;
+                        let mut val = vec![0u8; vlen];
+                        if file.read_exact(&mut val).is_err() {
+                            break;
+                        }
+                        let val_str = match String::from_utf8(val) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                return Ok(());
+                            }
+                        };
+
+                        map.insert(field_str, val_str);
+                    }
+                    StorageValue::Hash { value: map, expires_at }
+                }
+                _ => {
+                    return Ok(());
+                }
+            };
+
+            self.data.insert(key, value);
+        }
+
+        Ok(())
+    }
+
     pub fn expire_seconds(&self, key: &str, seconds: i64) -> bool {
         // Redis 语义：seconds <= 0 视为立刻过期并删除，若 key 存在返回 1
         if seconds <= 0 {
@@ -960,6 +1250,20 @@ impl Storage {
         match expires_at {
             Some(when) => now >= *when,
             None => false,
+        }
+    }
+
+    fn remaining_millis(expires_at: Option<Instant>, now: Instant) -> i64 {
+        match expires_at {
+            None => -1,
+            Some(deadline) => {
+                if deadline <= now {
+                    0
+                } else {
+                    let dur = deadline.duration_since(now);
+                    dur.as_millis() as i64
+                }
+            }
         }
     }
 
