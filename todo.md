@@ -1,24 +1,27 @@
 # Redust 项目待办事项
-
-本文件用于跟踪当前“可以立刻开干”的小类工作，同时保留长期问题列表。中长期路线请参考 `roadmap.md`。
-
----
-
-## 当前聚焦的小类工作
-
-- [x] **字符串多 key / 原子操作补齐（v1）**
-  - 实现并测试：`MGET` / `MSET` / `SETNX` / `SETEX` / `PSETEX` / `INCRBY` / `DECRBY` 等子集。
-  - 确认与 Redis 语义对齐（返回值、错误信息、过期语义交互）。
-  - 补充 `tests/` 下端到端用例，并在 `README.md` 示例中体现。（测试已补，README 示例待后续完善）
-
-- [x] **Hash 数据结构雏形（HSET/HGET 核心子集）**
-  - 设计 `Storage` 中 Hash 的内部存储结构（如 `HashMap<String, String>` 封装）。
-  - 实现并测试：`HSET` / `HGET` / `HDEL` / `HEXISTS` / `HGETALL` 的最小集合。
-  - 使用 `redis-cli` 做基本兼容性验证，补充文档示例。
-
-- [ ] **基础性能基准测试（单机内网场景）**
-  - 使用 `redis-benchmark` / 内置 bench，对 PING/SET/GET 做 QPS 与 P99 延迟测量。
-  - 记录一版基线数据（本地开发机），在 `roadmap.md` 或 `future.md` 中留存。
-  - 如发现明显瓶颈，再在 `future.md` 中登记相应优化条目。
+ 
+本文件用于跟踪当前「可以立刻开干」的工作项。中长期路线请参考 `roadmap.md`。
 
 ---
+
+## 当前聚焦的小类工作（从 roadmap 挑选）
+
+- [x] **Key 过期与淘汰：maxmemory + LRU 策略 MVP**
+  - 基于现有过期机制（惰性删除 + 定期采样）增加全局 `maxmemory` 配置。
+  - 实现一种最小可用的淘汰策略（如 allkeys-lru），并对淘汰行为做基本观测。
+
+- [x] **多 DB / 多逻辑数据库（SELECT <db> 雏形）**
+  - 实现最小版多 DB 支持：默认 DB + 可配置的最大 DB 数量。
+  - 支持 `SELECT <db>` 命令，并在 INFO/指标中暴露各 DB 的 key 数量。
+
+- [x] **内存管理与大 key 行为规范**
+  - 结合 `maxmemory`，规范大 key / 大集合在内存和性能上的行为与限制。
+  - 为极端场景（超大集合、深度嵌套结构）补充回归用例。
+
+- [x] **安全性：AUTH + 多租户故事预留**
+  - 实现简单版 `AUTH` + 密码校验，未认证连接只能执行有限命令集。
+  - 在设计上预留未来 ACL / 多租户（按 DB 维度）的扩展空间。
+
+- [x] **协议与客户端兼容性测试**
+  - 使用 `redis-cli`、`redis-rs`、`go-redis` 等做端到端兼容性验证。
+  - 为发现的不兼容行为在 `future.md` 中登记后续修复/优化条目。

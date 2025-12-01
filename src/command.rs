@@ -28,7 +28,7 @@ impl fmt::Display for CommandError {
 
 impl std::error::Error for CommandError {}
 
-
+/// Represents a Redis command.
 #[derive(Debug)]
 pub enum Command {
     Ping,
@@ -48,11 +48,16 @@ pub enum Command {
     Decrby { key: String, delta: i64 },
     Type { key: String },
     Keys { pattern: String },
+    Dbsize,
     Lpush { key: String, values: Vec<String> },
     Rpush { key: String, values: Vec<String> },
     Lrange { key: String, start: isize, stop: isize },
     Lpop { key: String },
     Rpop { key: String },
+    Llen { key: String },
+    Lindex { key: String, index: isize },
+    Lrem { key: String, count: isize, value: String },
+    Ltrim { key: String, start: isize, stop: isize },
     Sadd { key: String, members: Vec<String> },
     Srem { key: String, members: Vec<String> },
     Smembers { key: String },
@@ -72,6 +77,8 @@ pub enum Command {
     Pttl { key: String },
     Persist { key: String },
     Info,
+    Auth { password: String },
+    Select { db: u8 },
     Mget { keys: Vec<String> },
     Mset { pairs: Vec<(String, String)> },
     Setnx { key: String, value: String },
@@ -255,6 +262,12 @@ pub async fn read_command(
             }
             Command::Type { key }
         }
+        "DBSIZE" => {
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("dbsize")));
+            }
+            Command::Dbsize
+        }
         "KEYS" => {
             let Some(pattern) = iter.next() else {
                 return Ok(Some(err_wrong_args("keys")));
@@ -322,6 +335,69 @@ pub async fn read_command(
                 return Ok(Some(err_not_integer()));
             };
             Command::Lrange { key, start, stop }
+        }
+        "LLEN" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(err_wrong_args("llen")));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("llen")));
+            }
+            Command::Llen { key }
+        }
+        "LINDEX" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(err_wrong_args("lindex")));
+            };
+            let Some(idx_s) = iter.next() else {
+                return Ok(Some(err_wrong_args("lindex")));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("lindex")));
+            }
+            let Ok(index) = idx_s.parse::<isize>() else {
+                return Ok(Some(err_not_integer()));
+            };
+            Command::Lindex { key, index }
+        }
+        "LREM" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(err_wrong_args("lrem")));
+            };
+            let Some(count_s) = iter.next() else {
+                return Ok(Some(err_wrong_args("lrem")));
+            };
+            let Some(value) = iter.next() else {
+                return Ok(Some(err_wrong_args("lrem")));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("lrem")));
+            }
+            let Ok(count) = count_s.parse::<isize>() else {
+                return Ok(Some(err_not_integer()));
+            };
+            Command::Lrem { key, count, value }
+        }
+        "LTRIM" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(err_wrong_args("ltrim")));
+            };
+            let Some(start_s) = iter.next() else {
+                return Ok(Some(err_wrong_args("ltrim")));
+            };
+            let Some(stop_s) = iter.next() else {
+                return Ok(Some(err_wrong_args("ltrim")));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("ltrim")));
+            }
+            let Ok(start) = start_s.parse::<isize>() else {
+                return Ok(Some(err_not_integer()));
+            };
+            let Ok(stop) = stop_s.parse::<isize>() else {
+                return Ok(Some(err_not_integer()));
+            };
+            Command::Ltrim { key, start, stop }
         }
         "SADD" => {
             let Some(key) = iter.next() else {
@@ -514,6 +590,33 @@ pub async fn read_command(
                 return Ok(Some(err_wrong_args("info")));
             }
             Command::Info
+        }
+        "AUTH" => {
+            let Some(password) = iter.next() else {
+                return Ok(Some(err_wrong_args("auth")));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("auth")));
+            }
+            Command::Auth { password }
+        }
+        "SELECT" => {
+            let Some(db_str) = iter.next() else {
+                return Ok(Some(err_wrong_args("select")));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("select")));
+            }
+
+            let Ok(db_idx) = db_str.parse::<i64>() else {
+                return Ok(Some(err_not_integer()));
+            };
+
+            if db_idx < 0 || db_idx >= 16 {
+                return Ok(Some(Command::Error("ERR DB index is out of range".to_string())));
+            }
+
+            Command::Select { db: db_idx as u8 }
         }
         "MGET" => {
             let keys: Vec<String> = iter.collect();

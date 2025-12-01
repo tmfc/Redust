@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::env;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -154,6 +155,322 @@ async fn responds_to_basic_commands() {
     let mut key_value = String::new();
     reader.read_line(&mut key_value).await.unwrap();
     assert_eq!(key_value, "cnt\r\n");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn wrongtype_errors_for_sets_and_hashes() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // SET strkey "v"
+    let set_req = "*3\r\n$3\r\nSET\r\n$6\r\nstrkey\r\n$1\r\nv\r\n";
+    write_half.write_all(set_req.as_bytes()).await.unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // SADD strkey a  -> WRONGTYPE (string vs set)
+    let sadd_wrong = "*3\r\n$4\r\nSADD\r\n$6\r\nstrkey\r\n$1\r\na\r\n";
+    write_half.write_all(sadd_wrong.as_bytes()).await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(
+        line,
+        "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+    );
+
+    // HSET strkey f v -> WRONGTYPE (string vs hash)
+    let hset_wrong = "*4\r\n$4\r\nHSET\r\n$6\r\nstrkey\r\n$1\r\nf\r\n$1\r\nv\r\n";
+    write_half.write_all(hset_wrong.as_bytes()).await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(
+        line,
+        "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+    );
+
+    // 建一个真正的 set，再对它做 list/hash 操作
+    let sadd_real = "*3\r\n$4\r\nSADD\r\n$5\r\nmyset\r\n$1\r\na\r\n";
+    write_half.write_all(sadd_real.as_bytes()).await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":1\r\n");
+
+    // LPUSH myset x -> WRONGTYPE (set vs list)
+    let lpush_wrong = "*3\r\n$5\r\nLPUSH\r\n$5\r\nmyset\r\n$1\r\nx\r\n";
+    write_half.write_all(lpush_wrong.as_bytes()).await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(
+        line,
+        "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+    );
+
+    // HGET myset f -> WRONGTYPE (set vs hash)
+    let hget_wrong = "*3\r\n$4\r\nHGET\r\n$5\r\nmyset\r\n$1\r\nf\r\n";
+    write_half.write_all(hget_wrong.as_bytes()).await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(
+        line,
+        "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+    );
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn select_command_isolates_databases() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 默认在 DB0：SET k v0
+    write_half
+        .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$2\r\nv0\r\n")
+        .await
+        .unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // 切到 DB1：SELECT 1
+    write_half
+        .write_all(b"*2\r\n$6\r\nSELECT\r\n$1\r\n1\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // 在 DB1 读取 k，应该看不到 DB0 里的值
+    write_half
+        .write_all(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "$-1\r\n");
+
+    // 在 DB1 写入同名 key：SET k v1
+    write_half
+        .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$2\r\nv1\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // 再切回 DB0：SELECT 0
+    write_half
+        .write_all(b"*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // 在 DB0 读取 k，应仍为 v0
+    write_half
+        .write_all(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+        .await
+        .unwrap();
+    let mut bulk_header = String::new();
+    let mut value = String::new();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(bulk_header, "$2\r\n");
+    assert_eq!(value, "v0\r\n");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn prometheus_metrics_exporter_basic() {
+    // Enable metrics exporter on a fixed local port for this test.
+    env::set_var("REDUST_METRICS_ADDR", "127.0.0.1:9898");
+
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    // Send a PING to bump total_commands_processed.
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    write_half
+        .write_all(b"*1\r\n$4\r\nPING\r\n")
+        .await
+        .unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+PONG\r\n");
+
+    // Now scrape /metrics from the exporter.
+    let mut metrics_stream = TcpStream::connect("127.0.0.1:9898").await.unwrap();
+    metrics_stream
+        .write_all(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+
+    let mut buf = String::new();
+    {
+        use tokio::io::AsyncReadExt;
+        let mut reader = BufReader::new(metrics_stream); // reuse BufReader for HTTP response
+        reader.read_to_string(&mut buf).await.unwrap();
+    }
+
+    assert!(buf.contains("redust_uptime_seconds"));
+    assert!(buf.contains("redust_connected_clients"));
+    assert!(buf.contains("redust_total_commands_processed"));
+    assert!(buf.contains("redust_keyspace_keys"));
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn list_command_wrongtype_error() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // SET foo bar
+    write_half
+        .write_all(b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n")
+        .await
+        .unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // LTRIM foo 0 -1 should return WRONGTYPE
+    write_half
+        .write_all(b"*4\r\n$5\r\nLTRIM\r\n$3\r\nfoo\r\n$1\r\n0\r\n$2\r\n-1\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(
+        line,
+        "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+    );
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn lists_extended_commands() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // RPUSH mylist a b a c -> 4
+    write_half
+        .write_all(b"*6\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\na\r\n$1\r\nc\r\n")
+        .await
+        .unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":4\r\n");
+
+    // LLEN mylist -> 4
+    write_half
+        .write_all(b"*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":4\r\n");
+
+    // LINDEX mylist 0 -> a
+    write_half
+        .write_all(b"*3\r\n$6\r\nLINDEX\r\n$6\r\nmylist\r\n$1\r\n0\r\n")
+        .await
+        .unwrap();
+    let mut bulk_header = String::new();
+    let mut value = String::new();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(bulk_header, "$1\r\n");
+    assert_eq!(value, "a\r\n");
+
+    // LINDEX mylist -1 -> c
+    write_half
+        .write_all(b"*3\r\n$6\r\nLINDEX\r\n$6\r\nmylist\r\n$2\r\n-1\r\n")
+        .await
+        .unwrap();
+    bulk_header.clear();
+    value.clear();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(bulk_header, "$1\r\n");
+    assert_eq!(value, "c\r\n");
+
+    // LREM mylist 1 a -> remove first a from head, list becomes: b a c
+    write_half
+        .write_all(b"*4\r\n$4\r\nLREM\r\n$6\r\nmylist\r\n$1\r\n1\r\n$1\r\na\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":1\r\n");
+
+    // LLEN mylist -> 3
+    write_half
+        .write_all(b"*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":3\r\n");
+
+    // LTRIM mylist 1 -1 -> keep from index 1 to end (a, c)
+    write_half
+        .write_all(b"*4\r\n$5\r\nLTRIM\r\n$6\r\nmylist\r\n$1\r\n1\r\n$2\r\n-1\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // LRANGE mylist 0 -1 -> [a, c]
+    write_half
+        .write_all(b"*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$1\r\n0\r\n$2\r\n-1\r\n")
+        .await
+        .unwrap();
+
+    let mut header = String::new();
+    reader.read_line(&mut header).await.unwrap();
+    assert_eq!(header, "*2\r\n");
+
+    bulk_header.clear();
+    value.clear();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(bulk_header, "$1\r\n");
+    assert_eq!(value, "a\r\n");
+
+    bulk_header.clear();
+    value.clear();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(bulk_header, "$1\r\n");
+    assert_eq!(value, "c\r\n");
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();

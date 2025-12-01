@@ -6,3 +6,7 @@ edition = "2021"
 [dependencies]
 dashmap = "6.1.0"
 tokio = { version = "1", features = ["full"] }
+rand = "0.8"
+
+[dev-dependencies]
+redis = { version = "0.25", features = ["tokio-comp"] }

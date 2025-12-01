@@ -44,6 +44,115 @@ async fn mset_and_mget_roundtrip() {
 }
 
 #[tokio::test]
+async fn command_argument_and_integer_errors_match_redis() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let mut client = TestClient::connect(addr).await;
+
+    // SET with missing value -> ERR wrong number of arguments for 'set' command
+    client.send_array(&["SET", "foo"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'set' command\r\n");
+
+    // GET with missing key -> ERR wrong number of arguments for 'get' command
+    client.send_array(&["GET"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'get' command\r\n");
+
+    // EXPIRE with missing seconds -> ERR wrong number of arguments for 'expire' command
+    client.send_array(&["EXPIRE", "foo"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'expire' command\r\n");
+
+    // EXPIRE with non-integer seconds -> ERR value is not an integer or out of range
+    client.send_array(&["EXPIRE", "foo", "notint"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR value is not an integer or out of range\r\n");
+
+    // PEXPIRE with non-integer millis -> same integer error
+    client.send_array(&["PEXPIRE", "foo", "notint"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR value is not an integer or out of range\r\n");
+
+    // SETEX with non-integer seconds -> integer error
+    client.send_array(&["SETEX", "foo", "notint", "bar"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR value is not an integer or out of range\r\n");
+
+    // PSETEX with non-integer millis -> integer error
+    client.send_array(&["PSETEX", "foo", "notint", "bar"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR value is not an integer or out of range\r\n");
+
+    // INCRBY with non-integer delta -> integer error
+    client.send_array(&["INCRBY", "foo", "notint"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR value is not an integer or out of range\r\n");
+
+    // LLEN with missing key -> ERR wrong number of arguments for 'llen' command
+    client.send_array(&["LLEN"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'llen' command\r\n");
+
+    // LLEN with extra argument -> same wrong-args error
+    client.send_array(&["LLEN", "foo", "extra"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'llen' command\r\n");
+
+    // LINDEX with non-integer index -> integer error
+    client.send_array(&["LINDEX", "foo", "notint"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR value is not an integer or out of range\r\n");
+
+    // HGETALL with wrong arg count -> wrong-args error
+    client.send_array(&["HGETALL"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'hgetall' command\r\n");
+
+    client.send_array(&["HGETALL", "foo", "extra"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'hgetall' command\r\n");
+
+    // SCARD with wrong arg count -> wrong-args error
+    client.send_array(&["SCARD"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'scard' command\r\n");
+
+    client.send_array(&["SCARD", "foo", "extra"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'scard' command\r\n");
+
+    // SISMEMBER with wrong arg count -> wrong-args error
+    client.send_array(&["SISMEMBER"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'sismember' command\r\n");
+
+    client.send_array(&["SISMEMBER", "foo"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'sismember' command\r\n");
+
+    client.send_array(&["SISMEMBER", "foo", "bar", "extra"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'sismember' command\r\n");
+
+    // SUNION/SINTER/SDIFF without any key -> wrong-args error
+    client.send_array(&["SUNION"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'sunion' command\r\n");
+
+    client.send_array(&["SINTER"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'sinter' command\r\n");
+
+    client.send_array(&["SDIFF"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR wrong number of arguments for 'sdiff' command\r\n");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn setnx_semantics() {
     let (addr, shutdown, handle) = spawn_server().await;
 
@@ -255,10 +364,36 @@ impl TestClient {
             Err(line)
         }
     }
+
+    async fn dbsize(&mut self) -> i64 {
+        self.send_array(&["DBSIZE"]).await;
+        let line = self.read_simple_line().await;
+        assert!(line.starts_with(":"));
+        line[1..line.len() - 2].parse().unwrap()
+    }
 }
 
 #[tokio::test]
-async fn standard_set_get_roundtrip() {
+async fn basic_dbsize_behaviour() {
+    let (addr, _shutdown, _handle) = spawn_server().await;
+
+    let mut client = TestClient::connect(addr).await;
+
+    // 初始应为 0
+    let initial = client.dbsize().await;
+    assert_eq!(initial, 0);
+
+    // 写入若干 key
+    client.set("k1", "v1").await;
+    client.set("k2", "v2").await;
+    client.set("k3", "v3").await;
+
+    let after_set = client.dbsize().await;
+    assert_eq!(after_set, 3);
+
+    // 删除一个 key 后，dbsize 应减少
+    client.send_array(&["DEL", "k1"]).await;
+    let _ = client.read_simple_line().await; // :1
     let (addr, shutdown, handle) = spawn_server().await;
 
     let mut client = TestClient::connect(addr).await;
