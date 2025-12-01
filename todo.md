@@ -6,22 +6,15 @@
 
 ## 当前聚焦的小类工作（从 roadmap 挑选）
 
-- [x] **Key 过期与淘汰：maxmemory + LRU 策略 MVP**
-  - 基于现有过期机制（惰性删除 + 定期采样）增加全局 `maxmemory` 配置。
-  - 实现一种最小可用的淘汰策略（如 allkeys-lru），并对淘汰行为做基本观测。
+- [x] **统一日志框架替代 println!（日志与可观测性）**
+  - 目标：用一个简单的日志库替换当前散落在各处的 `println!` / `eprintln!`，至少支持日志等级（info/warn/error）和模块前缀（如 [conn] / [resp] / [rdb]）。
+  - 初版范围：只在 server 启动、连接处理、RDB 加载/保存、metrics 导出等关键路径接入，不做复杂配置系统。
 
-- [x] **多 DB / 多逻辑数据库（SELECT <db> 雏形）**
-  - 实现最小版多 DB 支持：默认 DB + 可配置的最大 DB 数量。
-  - 支持 `SELECT <db>` 命令，并在 INFO/指标中暴露各 DB 的 key 数量。
+- [x] **扩展客户端兼容性测试（redis-cli / go-redis 子集）**（已在 `future.md` 中登记为后续工作）
+  - 目标：在现有 redis-rs 端到端测试基础上，增加一组基于 `redis-cli` 与 Go `go-redis` 的基础命令回归，用于发现协议/行为差异。
+  - 初版范围：覆盖 string（SET/GET/INCR）、list（RPUSH/LRANGE）、hash（HSET/HGET/HGETALL）和基本过期命令（EXPIRE/TTL）。
 
-- [x] **内存管理与大 key 行为规范**
-  - 结合 `maxmemory`，规范大 key / 大集合在内存和性能上的行为与限制。
-  - 为极端场景（超大集合、深度嵌套结构）补充回归用例。
-
-- [x] **安全性：AUTH + 多租户故事预留**
-  - 实现简单版 `AUTH` + 密码校验，未认证连接只能执行有限命令集。
-  - 在设计上预留未来 ACL / 多租户（按 DB 维度）的扩展空间。
-
-- [x] **协议与客户端兼容性测试**
-  - 使用 `redis-cli`、`redis-rs`、`go-redis` 等做端到端兼容性验证。
-  - 为发现的不兼容行为在 `future.md` 中登记后续修复/优化条目。
+- [ ] **在现有类型上补常用命令（Hash & Set & SET 扩展）**
+  - Hash：`HINCRBY` / `HLEN` / `HKEYS` / `HVALS` / `HMGET` 等高频命令已补全，并有端到端测试覆盖。
+  - Set：补充 `SPOP` / `SRANDMEMBER` / `SUNIONSTORE` / `SINTERSTORE` / `SDIFFSTORE` 等操作，完善集合读写与运算语义。
+  - SET 扩展：从未来规划中提前实现完整 `SET` 选项组合，支持 `NX` / `XX` / `KEEPTTL` / `GET` 等，并与现有 EX/PX 实现对齐 Redis 行为。

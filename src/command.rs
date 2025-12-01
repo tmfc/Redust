@@ -63,14 +63,24 @@ pub enum Command {
     Smembers { key: String },
     Scard { key: String },
     Sismember { key: String, member: String },
+    Spop { key: String, count: Option<i64> },
+    Srandmember { key: String, count: Option<i64> },
     Sunion { keys: Vec<String> },
     Sinter { keys: Vec<String> },
     Sdiff { keys: Vec<String> },
+    Sunionstore { dest: String, keys: Vec<String> },
+    Sinterstore { dest: String, keys: Vec<String> },
+    Sdiffstore { dest: String, keys: Vec<String> },
     Hset { key: String, field: String, value: String },
     Hget { key: String, field: String },
     Hdel { key: String, fields: Vec<String> },
     Hexists { key: String, field: String },
     Hgetall { key: String },
+    Hkeys { key: String },
+    Hvals { key: String },
+    Hmget { key: String, fields: Vec<String> },
+    Hincrby { key: String, field: String, delta: i64 },
+    Hlen { key: String },
     Expire { key: String, seconds: i64 },
     Pexpire { key: String, millis: i64 },
     Ttl { key: String },
@@ -437,6 +447,43 @@ pub async fn read_command(
             }
             Command::Scard { key }
         }
+        "SPOP" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(err_wrong_args("spop")));
+            };
+            let count = if let Some(next) = iter.next() {
+                if iter.next().is_some() {
+                    return Ok(Some(err_wrong_args("spop")));
+                }
+                let Ok(n) = next.parse::<i64>() else {
+                    return Ok(Some(err_not_integer()));
+                };
+                if n < 0 {
+                    return Ok(Some(err_not_integer()));
+                }
+                Some(n)
+            } else {
+                None
+            };
+            Command::Spop { key, count }
+        }
+        "SRANDMEMBER" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(err_wrong_args("srandmember")));
+            };
+            let count = if let Some(next) = iter.next() {
+                if iter.next().is_some() {
+                    return Ok(Some(err_wrong_args("srandmember")));
+                }
+                let Ok(n) = next.parse::<i64>() else {
+                    return Ok(Some(err_not_integer()));
+                };
+                Some(n)
+            } else {
+                None
+            };
+            Command::Srandmember { key, count }
+        }
         "SISMEMBER" => {
             let Some(key) = iter.next() else {
                 return Ok(Some(err_wrong_args("sismember")));
@@ -469,6 +516,36 @@ pub async fn read_command(
                 return Ok(Some(err_wrong_args("sdiff")));
             }
             Command::Sdiff { keys }
+        }
+        "SUNIONSTORE" => {
+            let Some(dest) = iter.next() else {
+                return Ok(Some(err_wrong_args("sunionstore")));
+            };
+            let keys: Vec<String> = iter.collect();
+            if keys.is_empty() {
+                return Ok(Some(err_wrong_args("sunionstore")));
+            }
+            Command::Sunionstore { dest, keys }
+        }
+        "SINTERSTORE" => {
+            let Some(dest) = iter.next() else {
+                return Ok(Some(err_wrong_args("sinterstore")));
+            };
+            let keys: Vec<String> = iter.collect();
+            if keys.is_empty() {
+                return Ok(Some(err_wrong_args("sinterstore")));
+            }
+            Command::Sinterstore { dest, keys }
+        }
+        "SDIFFSTORE" => {
+            let Some(dest) = iter.next() else {
+                return Ok(Some(err_wrong_args("sdiffstore")));
+            };
+            let keys: Vec<String> = iter.collect();
+            if keys.is_empty() {
+                return Ok(Some(err_wrong_args("sdiffstore")));
+            }
+            Command::Sdiffstore { dest, keys }
         }
         "HSET" => {
             let Some(key) = iter.next() else {
@@ -527,6 +604,61 @@ pub async fn read_command(
                 return Ok(Some(err_wrong_args("hgetall")));
             }
             Command::Hgetall { key }
+        }
+        "HKEYS" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(err_wrong_args("hkeys")));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("hkeys")));
+            }
+            Command::Hkeys { key }
+        }
+        "HVALS" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(err_wrong_args("hvals")));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("hvals")));
+            }
+            Command::Hvals { key }
+        }
+        "HMGET" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(err_wrong_args("hmget")));
+            };
+            let fields: Vec<String> = iter.collect();
+            if fields.is_empty() {
+                return Ok(Some(err_wrong_args("hmget")));
+            }
+            Command::Hmget { key, fields }
+        }
+        "HINCRBY" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(err_wrong_args("hincrby")));
+            };
+            let Some(field) = iter.next() else {
+                return Ok(Some(err_wrong_args("hincrby")));
+            };
+            let Some(delta_s) = iter.next() else {
+                return Ok(Some(err_wrong_args("hincrby")));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("hincrby")));
+            }
+            let Ok(delta) = delta_s.parse::<i64>() else {
+                return Ok(Some(err_not_integer()));
+            };
+            Command::Hincrby { key, field, delta }
+        }
+        "HLEN" => {
+            let Some(key) = iter.next() else {
+                return Ok(Some(err_wrong_args("hlen")));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("hlen")));
+            }
+            Command::Hlen { key }
         }
         "EXPIRE" => {
             let Some(key) = iter.next() else {

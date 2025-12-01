@@ -32,9 +32,9 @@ async fn redis_rs_basic_commands_roundtrip() {
     let url = format!("redis://{}", addr);
     let client = redis::Client::open(url).expect("create redis client");
     let mut conn = client
-        .get_async_connection()
+        .get_multiplexed_async_connection()
         .await
-        .expect("get async connection");
+        .expect("get async multiplexed connection");
 
     // PING
     let pong: String = redis::cmd("PING")
@@ -68,9 +68,9 @@ async fn redis_rs_list_commands_roundtrip() {
     let url = format!("redis://{}", addr);
     let client = redis::Client::open(url).expect("create redis client");
     let mut conn = client
-        .get_async_connection()
+        .get_multiplexed_async_connection()
         .await
-        .expect("get async connection");
+        .expect("get async multiplexed connection");
 
     // RPUSH mylist a b c
     let len: i64 = conn
@@ -99,9 +99,9 @@ async fn redis_rs_hash_commands_roundtrip() {
     let url = format!("redis://{}", addr);
     let client = redis::Client::open(url).expect("create redis client");
     let mut conn = client
-        .get_async_connection()
+        .get_multiplexed_async_connection()
         .await
-        .expect("get async connection");
+        .expect("get async multiplexed connection");
 
     // HSET myhash field value
     let added: i64 = conn

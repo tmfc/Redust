@@ -202,6 +202,63 @@ async fn wrongtype_errors_for_sets_and_hashes() {
     reader.read_line(&mut line).await.unwrap();
     assert_eq!(line, ":1\r\n");
 
+    // SPOP myset -> one element
+    write_half
+        .write_all(b"*2\r\n$4\r\nSPOP\r\n$5\r\nmyset\r\n")
+        .await
+        .unwrap();
+    let mut bulk_header = String::new();
+    let mut bulk_value = String::new();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut bulk_value).await.unwrap();
+    assert!(bulk_header.starts_with("$"));
+
+    // Refill set for SRANDMEMBER tests
+    write_half
+        .write_all(b"*4\r\n$4\r\nSADD\r\n$5\r\nmyset\r\n$1\r\na\r\n$1\r\nb\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+
+    // SRANDMEMBER myset -> single element
+    write_half
+        .write_all(b"*2\r\n$11\r\nSRANDMEMBER\r\n$5\r\nmyset\r\n")
+        .await
+        .unwrap();
+    bulk_header.clear();
+    bulk_value.clear();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut bulk_value).await.unwrap();
+    assert!(bulk_header.starts_with("$"));
+
+    // SRANDMEMBER myset 2 -> array of up to 2 distinct elements
+    write_half
+        .write_all(b"*3\r\n$11\r\nSRANDMEMBER\r\n$5\r\nmyset\r\n$1\r\n2\r\n")
+        .await
+        .unwrap();
+    let mut arr_header = String::new();
+    reader.read_line(&mut arr_header).await.unwrap();
+    assert!(arr_header.starts_with("*"));
+    // 将 SRANDMEMBER 返回的数组元素读完以对齐后续协议流
+    if let Some(len_str) = arr_header.strip_prefix("*") {
+        if let Some(len_str) = len_str.strip_suffix("\r\n") {
+            if let Ok(n) = len_str.parse::<usize>() {
+                for _ in 0..n {
+                    bulk_header.clear();
+                    bulk_value.clear();
+                    // 读取每个成员的 bulk header 和内容
+                    reader.read_line(&mut bulk_header).await.unwrap(); // $len\r\n
+                    if bulk_header.starts_with("$") {
+                        reader.read_line(&mut bulk_value).await.unwrap(); // value\r\n
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     // LPUSH myset x -> WRONGTYPE (set vs list)
     let lpush_wrong = "*3\r\n$5\r\nLPUSH\r\n$5\r\nmyset\r\n$1\r\nx\r\n";
     write_half.write_all(lpush_wrong.as_bytes()).await.unwrap();
@@ -514,6 +571,59 @@ async fn hashes_basic_behaviour() {
     assert_eq!(bulk_header, "$6\r\n");
     assert_eq!(bulk_value, "value2\r\n");
 
+    // HKEYS myhash -> [field]
+    write_half
+        .write_all(b"*2\r\n$5\r\nHKEYS\r\n$6\r\nmyhash\r\n")
+        .await
+        .unwrap();
+    let mut arr_header2 = String::new();
+    reader.read_line(&mut arr_header2).await.unwrap();
+    assert_eq!(arr_header2, "*1\r\n");
+    bulk_header.clear();
+    bulk_value.clear();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut bulk_value).await.unwrap();
+    assert_eq!(bulk_header, "$5\r\n");
+    assert_eq!(bulk_value, "field\r\n");
+
+    // HVALS myhash -> [value2]
+    write_half
+        .write_all(b"*2\r\n$5\r\nHVALS\r\n$6\r\nmyhash\r\n")
+        .await
+        .unwrap();
+    let mut arr_header3 = String::new();
+    reader.read_line(&mut arr_header3).await.unwrap();
+    assert_eq!(arr_header3, "*1\r\n");
+    bulk_header.clear();
+    bulk_value.clear();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut bulk_value).await.unwrap();
+    assert_eq!(bulk_header, "$6\r\n");
+    assert_eq!(bulk_value, "value2\r\n");
+
+    // HMGET myhash field missing -> [value2, nil]
+    write_half
+        .write_all(b"*4\r\n$5\r\nHMGET\r\n$6\r\nmyhash\r\n$5\r\nfield\r\n$7\r\nmissing\r\n")
+        .await
+        .unwrap();
+    let mut arr_header4 = String::new();
+    reader.read_line(&mut arr_header4).await.unwrap();
+    assert_eq!(arr_header4, "*2\r\n");
+
+    // first bulk: value2
+    bulk_header.clear();
+    bulk_value.clear();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut bulk_value).await.unwrap();
+    assert_eq!(bulk_header, "$6\r\n");
+    assert_eq!(bulk_value, "value2\r\n");
+
+    // second bulk: nil
+    bulk_header.clear();
+    bulk_value.clear();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    assert_eq!(bulk_header, "$-1\r\n");
+
     // HEXISTS myhash field -> 1
     write_half
         .write_all(b"*3\r\n$7\r\nHEXISTS\r\n$6\r\nmyhash\r\n$5\r\nfield\r\n")
@@ -563,6 +673,33 @@ async fn hashes_basic_behaviour() {
     line.clear();
     reader.read_line(&mut line).await.unwrap();
     assert_eq!(line, ":0\r\n");
+
+    // HSET numhash f 10
+    write_half
+        .write_all(b"*4\r\n$4\r\nHSET\r\n$7\r\nnumhash\r\n$1\r\nf\r\n$2\r\n10\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":1\r\n");
+
+    // HINCRBY numhash f 5 -> 15
+    write_half
+        .write_all(b"*4\r\n$7\r\nHINCRBY\r\n$7\r\nnumhash\r\n$1\r\nf\r\n$1\r\n5\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":15\r\n");
+
+    // HLEN numhash -> 1
+    write_half
+        .write_all(b"*2\r\n$4\r\nHLEN\r\n$7\r\nnumhash\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":1\r\n");
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();

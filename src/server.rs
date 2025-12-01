@@ -7,6 +7,8 @@ use tokio::io::{self, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
 
+use log::{info, error};
+
 use crate::command::{read_command, Command, CommandError}; // Import CommandError
 use crate::resp::{
     respond_bulk_string,
@@ -137,6 +139,99 @@ async fn handle_string_command(
                 respond_bulk_string(writer, &value).await?;
             } else {
                 respond_null_bulk(writer).await?;
+            }
+        }
+        Command::Sunionstore { dest, keys } => {
+            let physical_keys: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
+            let physical_dest = prefix_key(current_db, &dest);
+            match storage.sunionstore(&physical_dest, &physical_keys) {
+                Ok(len) => {
+                    respond_integer(writer, len as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Sinterstore { dest, keys } => {
+            let physical_keys: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
+            let physical_dest = prefix_key(current_db, &dest);
+            match storage.sinterstore(&physical_dest, &physical_keys) {
+                Ok(len) => {
+                    respond_integer(writer, len as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Sdiffstore { dest, keys } => {
+            let physical_keys: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
+            let physical_dest = prefix_key(current_db, &dest);
+            match storage.sdiffstore(&physical_dest, &physical_keys) {
+                Ok(len) => {
+                    respond_integer(writer, len as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Spop { key, count } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.spop(&physical, count) {
+                Ok(values) => {
+                    if count.is_none() {
+                        if let Some(v) = values.into_iter().next() {
+                            let resp = format!("${}\r\n{}\r\n", v.len(), v);
+                            writer.write_all(resp.as_bytes()).await?;
+                        } else {
+                            writer.write_all(b"$-1\r\n").await?;
+                        }
+                    } else {
+                        let mut resp = format!("*{}\r\n", values.len());
+                        for v in values {
+                            resp.push_str(&format!("${}\r\n{}\r\n", v.len(), v));
+                        }
+                        writer.write_all(resp.as_bytes()).await?;
+                    }
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Srandmember { key, count } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.srandmember(&physical, count) {
+                Ok(values) => {
+                    if count.is_none() {
+                        if let Some(v) = values.into_iter().next() {
+                            let resp = format!("${}\r\n{}\r\n", v.len(), v);
+                            writer.write_all(resp.as_bytes()).await?;
+                        } else {
+                            writer.write_all(b"$-1\r\n").await?;
+                        }
+                    } else {
+                        let mut resp = format!("*{}\r\n", values.len());
+                        for v in values {
+                            resp.push_str(&format!("${}\r\n{}\r\n", v.len(), v));
+                        }
+                        writer.write_all(resp.as_bytes()).await?;
+                    }
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
             }
         }
         Command::Incr { key } => {
@@ -286,6 +381,58 @@ async fn handle_list_command(
             match storage.lpush(&physical, &values) {
                 Ok(len) => {
                     respond_integer(writer, len as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Hkeys { key } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.hkeys(&physical) {
+                Ok(keys) => {
+                    let mut response = format!("*{}\r\n", keys.len());
+                    for k in keys {
+                        response.push_str(&format!("${}\r\n{}\r\n", k.len(), k));
+                    }
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Hvals { key } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.hvals(&physical) {
+                Ok(vals) => {
+                    let mut response = format!("*{}\r\n", vals.len());
+                    for v in vals {
+                        response.push_str(&format!("${}\r\n{}\r\n", v.len(), v));
+                    }
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Hmget { key, fields } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.hmget(&physical, &fields) {
+                Ok(values) => {
+                    let mut response = format!("*{}\r\n", values.len());
+                    for v in values {
+                        match v {
+                            Some(s) => {
+                                response.push_str(&format!("${}\r\n{}\r\n", s.len(), s));
+                            }
+                            None => {
+                                response.push_str("$-1\r\n");
+                            }
+                        }
+                    }
+                    writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
                     respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
@@ -527,6 +674,59 @@ async fn handle_set_command(
                 }
             }
         }
+        Command::Spop { key, count } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.spop(&physical, count) {
+                Ok(mut members) => {
+                    match members.len() {
+                        0 => {
+                            // Redis: SPOP on empty set returns null bulk
+                            respond_null_bulk(writer).await?;
+                        }
+                        1 => {
+                            let m = members.pop().unwrap();
+                            respond_bulk_string(writer, &m).await?;
+                        }
+                        n => {
+                            let mut response = format!("*{}\r\n", n);
+                            for m in members {
+                                response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
+                            }
+                            writer.write_all(response.as_bytes()).await?;
+                        }
+                    }
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Srandmember { key, count } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.srandmember(&physical, count) {
+                Ok(members) => {
+                    match count {
+                        None => {
+                            if let Some(m) = members.into_iter().next() {
+                                respond_bulk_string(writer, &m).await?;
+                            } else {
+                                respond_null_bulk(writer).await?;
+                            }
+                        }
+                        Some(_) => {
+                            let mut response = format!("*{}\r\n", members.len());
+                            for m in members {
+                                response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
+                            }
+                            writer.write_all(response.as_bytes()).await?;
+                        }
+                    }
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
         _ => {}
     }
 
@@ -604,6 +804,91 @@ async fn handle_hash_command(
                         response.push_str(&format!("${}\r\n{}\r\n", value.len(), value));
                     }
                     writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Hkeys { key } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.hkeys(&physical) {
+                Ok(fields) => {
+                    let mut response = format!("*{}\r\n", fields.len());
+                    for field in fields {
+                        response.push_str(&format!("${}\r\n{}\r\n", field.len(), field));
+                    }
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Hvals { key } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.hvals(&physical) {
+                Ok(values) => {
+                    let mut response = format!("*{}\r\n", values.len());
+                    for value in values {
+                        response.push_str(&format!("${}\r\n{}\r\n", value.len(), value));
+                    }
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Hmget { key, fields } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.hmget(&physical, &fields) {
+                Ok(values) => {
+                    // HMGET 返回数组，每个元素是 bulk 或 null bulk
+                    let mut response = format!("*{}\r\n", values.len());
+                    for v in values {
+                        match v {
+                            Some(s) => {
+                                response.push_str(&format!("${}\r\n{}\r\n", s.len(), s));
+                            }
+                            None => {
+                                response.push_str("$-1\r\n");
+                            }
+                        }
+                    }
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Hincrby { key, field, delta } => {
+            let physical = prefix_key(current_db, &key);
+            let max = current_max_value_bytes();
+            match storage.hincr_by(&physical, &field, delta, max) {
+                Ok(value) => {
+                    respond_integer(writer, value).await?;
+                }
+                Err(crate::storage::HincrError::WrongType) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+                Err(crate::storage::HincrError::NotInteger) => {
+                    respond_error(writer, "ERR hash value is not an integer").await?;
+                }
+                Err(crate::storage::HincrError::Overflow) => {
+                    respond_error(writer, "ERR increment or decrement would overflow").await?;
+                }
+                Err(crate::storage::HincrError::MaxValueExceeded) => {
+                    respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                }
+            }
+        }
+        Command::Hlen { key } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.hlen(&physical) {
+                Ok(len) => {
+                    respond_integer(writer, len as i64).await?;
                 }
                 Err(()) => {
                     respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
@@ -786,16 +1071,16 @@ async fn handle_metrics_connection(
 
 async fn run_metrics_exporter(bind_addr: &str, storage: Storage, metrics: Arc<Metrics>) -> io::Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
-    println!("[metrics] exporter listening on {}", listener.local_addr()?);
+    info!("[metrics] exporter listening on {}", listener.local_addr()?);
 
     loop {
         let (stream, addr) = listener.accept().await?;
         let storage = storage.clone();
         let metrics = metrics.clone();
-        println!("[metrics] connection from {}", addr);
+        info!("[metrics] connection from {}", addr);
         tokio::spawn(async move {
             if let Err(e) = handle_metrics_connection(stream, storage, metrics).await {
-                eprintln!("[metrics] connection error: {}", e);
+                error!("[metrics] connection error: {}", e);
             }
         });
     }
@@ -803,7 +1088,7 @@ async fn run_metrics_exporter(bind_addr: &str, storage: Storage, metrics: Arc<Me
 
 async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Metrics>) -> io::Result<()> {
     let peer_addr = stream.peer_addr().ok();
-    println!("[conn] new connection from {:?}", peer_addr);
+    info!("[conn] new connection from {:?}", peer_addr);
 
     metrics.connected_clients.fetch_add(1, Ordering::Relaxed);
 
@@ -821,7 +1106,7 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
             Ok(None) => break, // Connection closed or no more data
             Err(CommandError::Io(e)) => {
                 // Log the IO error and break
-                eprintln!("[conn] IO error reading command: {}", e);
+                error!("[conn] IO error reading command: {}", e);
                 break;
             }
             Err(CommandError::RedisError(msg)) => {
@@ -836,10 +1121,10 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
 
         match &cmd {
             Command::Auth { .. } => {
-                println!("[conn] received command: AUTH ****");
+                info!("[conn] received command: AUTH ****");
             }
             _ => {
-                println!("[conn] received command: {:?}", cmd);
+                info!("[conn] received command: {:?}", cmd);
             }
         }
 
@@ -915,9 +1200,14 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
             | Command::Smembers { .. }
             | Command::Scard { .. }
             | Command::Sismember { .. }
+            | Command::Spop { .. }
+            | Command::Srandmember { .. }
             | Command::Sunion { .. }
             | Command::Sinter { .. }
-            | Command::Sdiff { .. } => {
+            | Command::Sdiff { .. }
+            | Command::Sunionstore { .. }
+            | Command::Sinterstore { .. }
+            | Command::Sdiffstore { .. } => {
                 handle_set_command(cmd, &storage, &mut write_half, current_db).await?;
             }
 
@@ -926,7 +1216,12 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
             | Command::Hget { .. }
             | Command::Hdel { .. }
             | Command::Hexists { .. }
-            | Command::Hgetall { .. } => {
+            | Command::Hgetall { .. }
+            | Command::Hkeys { .. }
+            | Command::Hvals { .. }
+            | Command::Hmget { .. }
+            | Command::Hincrby { .. }
+            | Command::Hlen { .. } => {
                 handle_hash_command(cmd, &storage, &mut write_half, current_db).await?;
             }
 
@@ -991,9 +1286,9 @@ pub async fn serve(
 
     let rdb_path = env::var("REDUST_RDB_PATH").unwrap_or_else(|_| "redust.rdb".to_string());
     if let Err(e) = storage.load_rdb(&rdb_path) {
-        eprintln!("[rdb] failed to load RDB from {}: {}", rdb_path, e);
+        error!("[rdb] failed to load RDB from {}: {}", rdb_path, e);
     } else {
-        println!("[rdb] loaded RDB from {} (if existing and valid)", rdb_path);
+        info!("[rdb] loaded RDB from {} (if existing and valid)", rdb_path);
     }
 
     storage.spawn_expiration_task();
@@ -1003,7 +1298,7 @@ pub async fn serve(
             if secs > 0 {
                 let storage_clone = storage.clone();
                 let path_clone = rdb_path.clone();
-                println!(
+                info!(
                     "[rdb] auto-save enabled: every {} seconds to {}",
                     secs, path_clone
                 );
@@ -1023,10 +1318,10 @@ pub async fn serve(
                                 // saved successfully
                             }
                             Ok(Err(e)) => {
-                                eprintln!("[rdb] auto-save failed: {}", e);
+                                error!("[rdb] auto-save failed: {}", e);
                             }
                             Err(e) => {
-                                eprintln!("[rdb] auto-save task panicked: {}", e);
+                                error!("[rdb] auto-save task panicked: {}", e);
                             }
                         }
                     }
@@ -1048,7 +1343,7 @@ pub async fn serve(
             let metrics_clone = metrics.clone();
             tokio::spawn(async move {
                 if let Err(e) = run_metrics_exporter(&metrics_addr, storage_clone, metrics_clone).await {
-                    eprintln!("[metrics] exporter failed: {}", e);
+                    error!("[metrics] exporter failed: {}", e);
                 }
             });
         }
@@ -1060,10 +1355,10 @@ pub async fn serve(
                 let (stream, addr) = res?;
                 let storage = storage.clone();
                 let metrics = metrics.clone();
-                println!("Accepted connection from {}", addr);
+                info!("Accepted connection from {}", addr);
                 tokio::spawn(async move {
                     if let Err(err) = handle_connection(stream, storage, metrics).await {
-                        eprintln!("Connection error: {}", err);
+                        error!("Connection error: {}", err);
                     }
                 });
             }
@@ -1083,7 +1378,7 @@ pub async fn run_server(
     let listener = TcpListener::bind(bind_addr).await?;
     let local_addr = listener.local_addr()?;
 
-    println!("Redust listening on {}", local_addr);
+    info!("Redust listening on {}", local_addr);
 
     serve(listener, shutdown).await
 }

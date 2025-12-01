@@ -82,6 +82,28 @@ async fn rejects_value_exceeding_limit() {
 }
 
 #[tokio::test]
+async fn hincrby_respects_limit() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _guard = set_env("REDUST_MAXVALUE_BYTES", "4");
+
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // 先写入一个小整数 9
+    client.send_array(&["HSET", "numhash", "f", "9"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, ":1\r\n");
+
+    // 多次 HINCRBY 使结果变为 10000（长度 5），超过 4 字节限制
+    client.send_array(&["HINCRBY", "numhash", "f", "9991"]).await;
+    let line = client.read_simple_line().await;
+    assert!(line.starts_with("-ERR value exceeds REDUST_MAXVALUE_BYTES"));
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn mset_respects_limit() {
     let _lock = ENV_LOCK.lock().unwrap();
     let _guard = set_env("REDUST_MAXVALUE_BYTES", "8");
