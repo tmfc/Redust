@@ -12,6 +12,7 @@ use log::{info, error};
 use crate::command::{read_command, Command, CommandError}; // Import CommandError
 use crate::resp::{
     respond_bulk_string,
+    respond_bulk_bytes,
     respond_simple_string,
     respond_error,
     respond_integer,
@@ -481,30 +482,35 @@ async fn handle_string_command(
         Command::Mget { keys } => {
             let physical: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
             let values = storage.mget(&physical);
-            let mut response = format!("*{}\r\n", values.len());
+            writer
+                .write_all(format!("*{}\r\n", values.len()).as_bytes())
+                .await?;
             for v in values {
                 match v {
                     Some(s) => {
-                        response.push_str(&format!("${}\r\n{}\r\n", s.len(), s));
+                        writer
+                            .write_all(format!("${}\r\n", s.len()).as_bytes())
+                            .await?;
+                        writer.write_all(&s).await?;
+                        writer.write_all(b"\r\n").await?;
                     }
                     None => {
-                        response.push_str("$-1\r\n");
+                        writer.write_all(b"$-1\r\n").await?;
                     }
                 }
             }
-            writer.write_all(response.as_bytes()).await?;
         }
         Command::Mset { pairs } => {
             if let Some(limit) = current_max_value_bytes() {
                 for (_k, v) in pairs.iter() {
-                    if (v.as_bytes().len() as u64) > limit {
+                    if (v.len() as u64) > limit {
                         respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
                         return Ok(());
                     }
                 }
             }
 
-            let mapped: Vec<(String, String)> = pairs
+            let mapped: Vec<(String, Vec<u8>)> = pairs
                 .into_iter()
                 .map(|(k, v)| (prefix_key(current_db, &k), v))
                 .collect();
@@ -514,14 +520,14 @@ async fn handle_string_command(
         Command::Msetnx { pairs } => {
             if let Some(limit) = current_max_value_bytes() {
                 for (_k, v) in pairs.iter() {
-                    if (v.as_bytes().len() as u64) > limit {
+                    if (v.len() as u64) > limit {
                         respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
                         return Ok(());
                     }
                 }
             }
 
-            let mapped: Vec<(String, String)> = pairs
+            let mapped: Vec<(String, Vec<u8>)> = pairs
                 .into_iter()
                 .map(|(k, v)| (prefix_key(current_db, &k), v))
                 .collect();
@@ -533,7 +539,7 @@ async fn handle_string_command(
         Command::Setnx { key, value } => {
             let physical = prefix_key(current_db, &key);
             if let Some(limit) = current_max_value_bytes() {
-                if (value.as_bytes().len() as u64) > limit {
+                if (value.len() as u64) > limit {
                     respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
                     return Ok(());
                 }
@@ -545,7 +551,7 @@ async fn handle_string_command(
         Command::Setex { key, seconds, value } => {
             let physical = prefix_key(current_db, &key);
             if let Some(limit) = current_max_value_bytes() {
-                if (value.as_bytes().len() as u64) > limit {
+                if (value.len() as u64) > limit {
                     respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
                     return Ok(());
                 }
@@ -556,7 +562,7 @@ async fn handle_string_command(
         Command::Psetex { key, millis, value } => {
             let physical = prefix_key(current_db, &key);
             if let Some(limit) = current_max_value_bytes() {
-                if (value.as_bytes().len() as u64) > limit {
+                if (value.len() as u64) > limit {
                     respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
                     return Ok(());
                 }
@@ -1544,7 +1550,11 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
 
             // 未知命令
             Command::Unknown(parts) => {
-                let joined = parts.join(" ");
+                let joined = parts
+                    .iter()
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 let msg = format!("ERR unknown command '{}'", joined);
                 respond_error(&mut write_half, &msg).await?;
             }

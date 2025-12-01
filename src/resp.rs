@@ -173,7 +173,7 @@ mod tests {
     async fn parses_non_array_as_single_element() {
         let (mut reader, _listener) = setup_test_client(b"+OK\r\n".to_vec()).await;
         let parts = read_resp_array(&mut reader).await.unwrap().unwrap();
-        assert_eq!(parts, vec!["+OK".to_string()]);
+        assert_eq!(parts, vec![b"+OK".to_vec()]);
     }
 
     #[tokio::test]

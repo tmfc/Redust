@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
@@ -191,6 +191,41 @@ async fn getrange_and_setrange_roundtrip() {
     client.send_array(&["SETRANGE", "list", "0", "x"]).await;
     let line2 = client.read_simple_line().await;
     assert!(line2.starts_with("-WRONGTYPE"));
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn getrange_returns_raw_bytes_on_multibyte_values() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let mut client = TestClient::connect(addr).await;
+
+    // "é" -> [0xC3, 0xA9]; requesting the second byte should return 0xA9
+    client.set_bytes("u", "é".as_bytes()).await;
+    let slice = client.getrange_bytes("u", 1, 1).await;
+    assert_eq!(slice, vec![0xA9]);
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn setrange_overwrites_bytes_without_truncating_multibyte_values() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let mut client = TestClient::connect(addr).await;
+
+    // "你好" bytes: e4 bd a0 e5 a5 bd
+    client.set_bytes("wide", "你好".as_bytes()).await;
+
+    // Overwrite the second byte with 'X' (0x58), producing invalid UTF-8 but keeping length
+    let new_len = client.setrange_bytes("wide", 1, b"X").await;
+    assert_eq!(new_len, 6);
+
+    let bytes = client.get_bytes("wide").await.unwrap();
+    assert_eq!(bytes, vec![0xE4, 0x58, 0xA0, 0xE5, 0xA5, 0xBD]);
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
@@ -676,13 +711,24 @@ impl TestClient {
         self.writer.write_all(buf.as_bytes()).await.unwrap();
     }
 
+    async fn send_array_bytes(&mut self, parts: &[&[u8]]) {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(format!("*{}\r\n", parts.len()).as_bytes());
+        for p in parts {
+            buf.extend_from_slice(format!("${}\r\n", p.len()).as_bytes());
+            buf.extend_from_slice(p);
+            buf.extend_from_slice(b"\r\n");
+        }
+        self.writer.write_all(&buf).await.unwrap();
+    }
+
     async fn read_simple_line(&mut self) -> String {
         let mut line = String::new();
         self.reader.read_line(&mut line).await.unwrap();
         line
     }
 
-    async fn read_bulk(&mut self) -> Option<String> {
+    async fn read_bulk_bytes(&mut self) -> Option<Vec<u8>> {
         let mut header = String::new();
         self.reader.read_line(&mut header).await.unwrap();
 
@@ -694,11 +740,21 @@ impl TestClient {
         let len_str = &header[1..header.len() - 2];
         let len: usize = len_str.parse().unwrap();
 
-        let mut value = String::new();
-        self.reader.read_line(&mut value).await.unwrap();
+        let mut value = vec![0u8; len];
+        self.reader.read_exact(&mut value).await.unwrap();
 
-        assert_eq!(value.len(), len + 2);
-        Some(value.trim_end_matches("\r\n").to_string())
+        // consume CRLF
+        let mut crlf = [0u8; 2];
+        self.reader.read_exact(&mut crlf).await.unwrap();
+        assert_eq!(&crlf, b"\r\n");
+
+        Some(value)
+    }
+
+    async fn read_bulk(&mut self) -> Option<String> {
+        self.read_bulk_bytes()
+            .await
+            .map(|b| String::from_utf8(b).unwrap())
     }
 
     async fn set(&mut self, key: &str, value: &str) {
@@ -707,9 +763,20 @@ impl TestClient {
         assert_eq!(line, "+OK\r\n");
     }
 
+    async fn set_bytes(&mut self, key: &str, value: &[u8]) {
+        self.send_array_bytes(&[b"SET", key.as_bytes(), value]).await;
+        let line = self.read_simple_line().await;
+        assert_eq!(line, "+OK\r\n");
+    }
+
     async fn get(&mut self, key: &str) -> Option<String> {
         self.send_array(&["GET", key]).await;
         self.read_bulk().await
+    }
+
+    async fn get_bytes(&mut self, key: &str) -> Option<Vec<u8>> {
+        self.send_array(&["GET", key]).await;
+        self.read_bulk_bytes().await
     }
 
     async fn mset(&mut self, pairs: &[(&str, &str)]) {
@@ -739,21 +806,9 @@ impl TestClient {
 
         let mut result = Vec::with_capacity(len);
         for _ in 0..len {
-            // 重用 bulk 读取逻辑，但这里直接展开
-            let mut bulk_header = String::new();
-            self.reader.read_line(&mut bulk_header).await.unwrap();
-            if bulk_header == "$-1\r\n" {
-                result.push(None);
-                continue;
-            }
-            assert!(bulk_header.starts_with('$'));
-            let len_str = &bulk_header[1..bulk_header.len() - 2];
-            let bulk_len: usize = len_str.parse().unwrap();
-
-            let mut value = String::new();
-            self.reader.read_line(&mut value).await.unwrap();
-            assert_eq!(value.len(), bulk_len + 2);
-            result.push(Some(value.trim_end_matches("\r\n").to_string()));
+            let item = self.read_bulk_bytes().await;
+            let converted = item.map(|b| String::from_utf8(b).unwrap());
+            result.push(converted);
         }
 
         result
@@ -838,9 +893,24 @@ impl TestClient {
         self.read_bulk().await.unwrap_or_default()
     }
 
+    async fn getrange_bytes(&mut self, key: &str, start: isize, end: isize) -> Vec<u8> {
+        let start_s = start.to_string();
+        let end_s = end.to_string();
+        self.send_array(&["GETRANGE", key, &start_s, &end_s]).await;
+        self.read_bulk_bytes().await.unwrap_or_default()
+    }
+
     async fn setrange(&mut self, key: &str, offset: usize, value: &str) -> i64 {
         let off_s = offset.to_string();
         self.send_array(&["SETRANGE", key, &off_s, value]).await;
+        let line = self.read_simple_line().await;
+        assert!(line.starts_with(":"));
+        line[1..line.len() - 2].parse().unwrap()
+    }
+
+    async fn setrange_bytes(&mut self, key: &str, offset: usize, value: &[u8]) -> i64 {
+        let off_s = offset.to_string();
+        self.send_array_bytes(&[b"SETRANGE", key.as_bytes(), off_s.as_bytes(), value]).await;
         let line = self.read_simple_line().await;
         assert!(line.starts_with(":"));
         line[1..line.len() - 2].parse().unwrap()

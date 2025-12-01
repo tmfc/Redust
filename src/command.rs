@@ -762,8 +762,12 @@ pub async fn read_command(
             let Some(count_bytes) = iter.next() else {
                 return Ok(Some(err_wrong_args("lrem")));
             };
-            let Some(value) = iter.next() else {
+            let Some(value_bytes) = iter.next() else {
                 return Ok(Some(err_wrong_args("lrem")));
+            };
+            let value = match parse_bulk_string(value_bytes) {
+                Ok(v) => v,
+                Err(e) => return Ok(Some(e)),
             };
             if iter.next().is_some() {
                 return Ok(Some(err_wrong_args("lrem")));
