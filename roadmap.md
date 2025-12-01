@@ -24,6 +24,18 @@
     - 列表：在现有 `LPUSH` / `RPUSH` / `LPOP` / `RPOP` / `LRANGE` 基础上补齐 `LLEN` / `LINDEX` / `LREM` / `LTRIM` 等。
     - 集合：围绕 `SADD` / `SREM` / `SMEMBERS` / `SCARD` / `SISMEMBER` / `SUNION` / `SINTER` / `SDIFF`，视需求增加 `SPOP` / `SRANDMEMBER` / `SMOVE` / `*STORE` 命令。
 
+- **1bis. Pub/Sub 基础能力（中优先级）**
+  - MVP 范围：
+    - 命令子集：`SUBSCRIBE` / `UNSUBSCRIBE` / `PUBLISH`，仅支持按 channel 订阅与广播，不实现模式订阅 `PSUBSCRIBE` / `PUNSUBSCRIBE`。
+    - 语义对齐：同一连接进入订阅模式后，仅允许 Redis 原生支持的少数命令（如 PING/QUIT/SUBSCRIBE/UNSUBSCRIBE），其他命令按 Redis 行为返回错误或忽略。
+    - 消息格式：遵循 Redis Pub/Sub 协议，推送 `message` 事件，RESP 表示形如：`["message", <channel>, <payload>]`。
+  - 实现要点：
+    - 为每个连接维护订阅状态与 channel 列表，接入全局 `PubSubHub`（channel -> subscribers）。
+    - 在连接处理循环中同时监听「客户端命令」与「来自 hub 的推送消息」，确保消息按订阅顺序可靠送达。
+  - 后续演进：
+    - 视需求补充 `PSUBSCRIBE` / `PUNSUBSCRIBE` 与 `PUBSUB` 系列查询命令。
+    - 为 Pub/Sub 增加简单的 QoS 保护（如单连接缓冲区长度、慢消费者处理策略），避免推送将单个连接或整个实例拖垮。
+
 ### 二、持久化与数据安全
 
 - **3. 持久化雏形与演进（高优先级）**

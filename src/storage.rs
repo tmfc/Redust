@@ -9,6 +9,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use rand::{seq::IteratorRandom, thread_rng};
+use rand::prelude::SliceRandom;
 
 #[derive(Debug, Clone)]
 enum StorageValue {
@@ -36,6 +37,14 @@ pub struct Storage {
     maxmemory_bytes: Option<u64>,
     last_access: Arc<DashMap<String, u64>>,
     access_counter: Arc<AtomicU64>,
+}
+
+// HINCRBY 专用错误类型，用于区分 WRONGTYPE / 非整数 / 溢出 / 超过 maxvalue 限制
+pub enum HincrError {
+    WrongType,
+    NotInteger,
+    Overflow,
+    MaxValueExceeded,
 }
 
 impl Default for Storage {
@@ -114,6 +123,146 @@ impl Storage {
         Ok(result)
     }
 
+    pub fn hkeys(&self, key: &str) -> Result<Vec<String>, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(Vec::new());
+        }
+
+        let (mut keys, should_touch) = {
+            let entry = self.data.get(key);
+            let map = match entry.as_ref().map(|e| e.value()) {
+                Some(StorageValue::Hash { value: m, .. }) => m,
+                None => return Ok(Vec::new()),
+                _ => return Err(()),
+            };
+
+            let keys: Vec<String> = map.keys().cloned().collect();
+            let touch = !keys.is_empty();
+            (keys, touch)
+        };
+
+        keys.sort();
+
+        if should_touch {
+            self.touch_key(key);
+        }
+
+        Ok(keys)
+    }
+
+    pub fn hvals(&self, key: &str) -> Result<Vec<String>, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(Vec::new());
+        }
+
+        let (mut vals, should_touch) = {
+            let entry = self.data.get(key);
+            let map = match entry.as_ref().map(|e| e.value()) {
+                Some(StorageValue::Hash { value: m, .. }) => m,
+                None => return Ok(Vec::new()),
+                _ => return Err(()),
+            };
+
+            let vals: Vec<String> = map.values().cloned().collect();
+            let touch = !vals.is_empty();
+            (vals, touch)
+        };
+
+        vals.sort();
+
+        if should_touch {
+            self.touch_key(key);
+        }
+
+        Ok(vals)
+    }
+
+    pub fn hmget(&self, key: &str, fields: &[String]) -> Result<Vec<Option<String>>, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(vec![None; fields.len()]);
+        }
+
+        let entry = self.data.get(key);
+        let map = match entry.as_ref().map(|e| e.value()) {
+            Some(StorageValue::Hash { value: m, .. }) => m,
+            None => return Ok(vec![None; fields.len()]),
+            _ => return Err(()),
+        };
+
+        let mut result = Vec::with_capacity(fields.len());
+        for f in fields {
+            result.push(map.get(f).cloned());
+        }
+
+        if !result.is_empty() {
+            self.touch_key(key);
+        }
+
+        Ok(result)
+    }
+
+    pub fn hincr_by(&self, key: &str, field: &str, delta: i64, max_value_bytes: Option<u64>) -> Result<i64, HincrError> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            // treat as non-existent hash
+        }
+
+        // Ensure the key exists and is a Hash
+        let mut entry = self
+            .data
+            .entry(key.to_string())
+            .or_insert(StorageValue::Hash {
+                value: HashMap::new(),
+                expires_at: None,
+            });
+
+        let map = match entry.value_mut() {
+            StorageValue::Hash { value: map, .. } => map,
+            _ => return Err(HincrError::WrongType),
+        };
+
+        // Default missing field to 0, then add delta
+        let current_s = map.get(field).cloned().unwrap_or_else(|| "0".to_string());
+        let current = current_s.parse::<i64>().map_err(|_| HincrError::NotInteger)?;
+        let new_val = current.checked_add(delta).ok_or(HincrError::Overflow)?;
+
+        let new_str = new_val.to_string();
+        if let Some(limit) = max_value_bytes {
+            if (new_str.as_bytes().len() as u64) > limit {
+                return Err(HincrError::MaxValueExceeded);
+            }
+        }
+
+        map.insert(field.to_string(), new_str);
+
+        self.touch_key(key);
+        self.maybe_evict_for_write();
+
+        Ok(new_val)
+    }
+
+    pub fn hlen(&self, key: &str) -> Result<usize, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(0);
+        }
+
+        let Some(entry) = self.data.get(key) else {
+            return Ok(0);
+        };
+
+        let len = if let StorageValue::Hash { value: map, .. } = entry.value() {
+            map.len()
+        } else {
+            return Err(());
+        };
+
+        Ok(len)
+    }
+
     pub fn hdel(&self, key: &str, fields: &[String]) -> Result<usize, ()> {
         let now = Instant::now();
         if self.remove_if_expired(key, now) {
@@ -142,6 +291,107 @@ impl Storage {
         }
 
         Ok(removed)
+    }
+
+    pub fn spop(&self, key: &str, count: Option<i64>) -> Result<Vec<String>, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(Vec::new());
+        }
+
+        let Some(mut entry) = self.data.get_mut(key) else {
+            return Ok(Vec::new());
+        };
+
+        let set = match entry.value_mut() {
+            StorageValue::Set { value: set, .. } => set,
+            _ => return Err(()),
+        };
+
+        let mut result = Vec::new();
+        let n = match count {
+            None => 1,
+            Some(c) => {
+                if c <= 0 {
+                    return Ok(Vec::new());
+                }
+                c as usize
+            }
+        };
+
+        if n == 0 || set.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut rng = thread_rng();
+        for _ in 0..n {
+            if let Some(chosen) = set.iter().choose(&mut rng).cloned() {
+                set.remove(&chosen);
+                result.push(chosen);
+                if set.is_empty() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if !result.is_empty() {
+            self.touch_key(key);
+        }
+
+        Ok(result)
+    }
+
+    pub fn srandmember(&self, key: &str, count: Option<i64>) -> Result<Vec<String>, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(Vec::new());
+        }
+
+        let entry = self.data.get(key);
+        let set = match entry.as_ref().map(|e| e.value()) {
+            Some(StorageValue::Set { value: set, .. }) => set,
+            None => return Ok(Vec::new()),
+            _ => return Err(()),
+        };
+
+        if set.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut rng = thread_rng();
+        let mut result = Vec::new();
+
+        match count {
+            None => {
+                if let Some(chosen) = set.iter().choose(&mut rng).cloned() {
+                    result.push(chosen);
+                }
+            }
+            Some(c) if c == 0 => {}
+            Some(c) if c > 0 => {
+                let n = c as usize;
+                let mut candidates: Vec<String> = set.iter().cloned().collect();
+                if n >= candidates.len() {
+                    result = candidates;
+                } else {
+                    candidates.shuffle(&mut rng);
+                    result.extend(candidates.into_iter().take(n));
+                }
+            }
+            Some(c) => {
+                let n = (-c) as usize;
+                let elems: Vec<&String> = set.iter().collect();
+                for _ in 0..n {
+                    if let Some(chosen) = elems.iter().choose(&mut rng) {
+                        result.push((*chosen).to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     pub fn hexists(&self, key: &str, field: &str) -> Result<bool, ()> {
@@ -865,6 +1115,123 @@ impl Storage {
         let mut members: Vec<String> = result.into_iter().collect();
         members.sort();
         Ok(members)
+    }
+
+    fn set_store_result(&self, dest: &str, members: HashSet<String>) -> usize {
+        let len = members.len();
+        self.data.insert(
+            dest.to_string(),
+            StorageValue::Set {
+                value: members,
+                expires_at: None,
+            },
+        );
+        if len > 0 {
+            self.touch_key(dest);
+            self.maybe_evict_for_write();
+        }
+        len
+    }
+
+    pub fn sunionstore(&self, dest: &str, keys: &[String]) -> Result<usize, ()> {
+        let now = Instant::now();
+        let mut result: HashSet<String> = HashSet::new();
+        for key in keys {
+            if self.remove_if_expired(key, now) {
+                continue;
+            }
+
+            if let Some(entry) = self.data.get(key) {
+                match entry.value() {
+                    StorageValue::Set { value: set, .. } => {
+                        for m in set {
+                            result.insert(m.clone());
+                        }
+                    }
+                    _ => return Err(()),
+                }
+            }
+        }
+
+        Ok(self.set_store_result(dest, result))
+    }
+
+    pub fn sinterstore(&self, dest: &str, keys: &[String]) -> Result<usize, ()> {
+        let now = Instant::now();
+        let mut iter = keys.iter();
+        let Some(first_key) = iter.next() else {
+            return Ok(0);
+        };
+
+        if self.remove_if_expired(first_key, now) {
+            return Ok(self.set_store_result(dest, HashSet::new()));
+        }
+
+        let mut result: HashSet<String> = match self.data.get(first_key) {
+            Some(entry) => match entry.value() {
+                StorageValue::Set { value: set, .. } => set.iter().cloned().collect(),
+                _ => return Err(()),
+            },
+            None => HashSet::new(),
+        };
+
+        for key in iter {
+            if self.remove_if_expired(key, now) {
+                result.clear();
+                break;
+            }
+
+            if let Some(entry) = self.data.get(key) {
+                match entry.value() {
+                    StorageValue::Set { value: set, .. } => {
+                        result.retain(|m| set.contains(m));
+                    }
+                    _ => return Err(()),
+                }
+            } else {
+                result.clear();
+                break;
+            }
+        }
+
+        Ok(self.set_store_result(dest, result))
+    }
+
+    pub fn sdiffstore(&self, dest: &str, keys: &[String]) -> Result<usize, ()> {
+        let now = Instant::now();
+        let mut iter = keys.iter();
+        let Some(first_key) = iter.next() else {
+            return Ok(0);
+        };
+
+        if self.remove_if_expired(first_key, now) {
+            return Ok(self.set_store_result(dest, HashSet::new()));
+        }
+
+        let mut result: HashSet<String> = match self.data.get(first_key) {
+            Some(entry) => match entry.value() {
+                StorageValue::Set { value: set, .. } => set.iter().cloned().collect(),
+                _ => return Err(()),
+            },
+            None => HashSet::new(),
+        };
+
+        for key in iter {
+            if self.remove_if_expired(key, now) {
+                continue;
+            }
+
+            if let Some(entry) = self.data.get(key) {
+                match entry.value() {
+                    StorageValue::Set { value: set, .. } => {
+                        result.retain(|m| !set.contains(m));
+                    }
+                    _ => return Err(()),
+                }
+            }
+        }
+
+        Ok(self.set_store_result(dest, result))
     }
 
     pub fn save_rdb<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {

@@ -2,10 +2,13 @@ use std::env;
 use tokio::io;
 use tokio::signal; // Import the signal module
 
+use log::info;
 use redust::run_server;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    // 初始化日志（仅在 main 中调用一次），默认 info 级别，可被 RUST_LOG 覆盖
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     // 解析简单的命令行参数：支持 --bind 和 --maxmemory-bytes
     let args: Vec<String> = env::args().skip(1).collect();
 
@@ -45,7 +48,7 @@ async fn main() -> io::Result<()> {
     // Create a future that resolves when Ctrl+C is received
     let shutdown_future = async {
         signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
-        println!("Ctrl+C received, shutting down gracefully...");
+        info!("Ctrl+C received, shutting down gracefully...");
     };
 
     run_server(&bind_addr, shutdown_future).await
