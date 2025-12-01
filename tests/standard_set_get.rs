@@ -44,6 +44,351 @@ async fn mset_and_mget_roundtrip() {
 }
 
 #[tokio::test]
+async fn setrange_does_not_truncate_tail() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let mut client = TestClient::connect(addr).await;
+
+    // 初始值为 abcdef
+    client.set("foo", "abcdef").await;
+
+    // 在偏移 3 位置写入 "X"，应只覆盖一个字节，不截断尾部
+    let new_len = client.setrange("foo", 3, "X").await;
+    assert_eq!(new_len, 6); // Redis 返回 key 的最终长度
+
+    let v = client.get("foo").await;
+    assert_eq!(v.as_deref(), Some("abcXef"));
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn msetnx_atomicity_and_existing_keys() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let mut client = TestClient::connect(addr).await;
+
+    // 所有 key 都不存在时，应一次性写入并返回 :1
+    client
+        .send_array(&["MSETNX", "k1", "v1", "k2", "v2"])
+        .await;
+    let line1 = client.read_simple_line().await;
+    assert_eq!(line1, ":1\r\n");
+
+    let v1 = client.get("k1").await;
+    let v2 = client.get("k2").await;
+    assert_eq!(v1.as_deref(), Some("v1"));
+    assert_eq!(v2.as_deref(), Some("v2"));
+
+    // 其中一个 key 已存在时，整个 MSETNX 不应写入任何 key
+    client.set("k3", "old").await;
+    client
+        .send_array(&["MSETNX", "k3", "new", "k4", "v4"])
+        .await;
+    let line2 = client.read_simple_line().await;
+    assert_eq!(line2, ":0\r\n");
+
+    let v3 = client.get("k3").await;
+    let v4 = client.get("k4").await;
+    assert_eq!(v3.as_deref(), Some("old"));
+    assert_eq!(v4, None);
+
+    // 对比：MSET 在参数合法时始终写入
+    client
+        .mset(&[("k5", "a"), ("k6", "b")])
+        .await;
+    let v5 = client.get("k5").await;
+    let v6 = client.get("k6").await;
+    assert_eq!(v5.as_deref(), Some("a"));
+    assert_eq!(v6.as_deref(), Some("b"));
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn incrbyfloat_roundtrip_and_error_cases() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let mut client = TestClient::connect(addr).await;
+
+    // 不存在的 key 视为 0，自增浮点
+    client
+        .send_array(&["INCRBYFLOAT", "f1", "1.5"])
+        .await;
+    let v1 = client.read_bulk().await;
+    assert_eq!(v1.as_deref(), Some("1.5"));
+
+    // 再加 2.25 -> 3.75
+    client
+        .send_array(&["INCRBYFLOAT", "f1", "2.25"])
+        .await;
+    let v2 = client.read_bulk().await;
+    assert_eq!(v2.as_deref(), Some("3.75"));
+
+    // 对已是浮点字符串的 key 调用 INCRBY 应返回整数错误，不修改值
+    client.send_array(&["INCRBY", "f1", "2"]).await;
+    let int_err = client.read_simple_line().await;
+    assert!(int_err.starts_with("-ERR value is not an integer or out of range"));
+
+    // 继续用 INCRBYFLOAT 自增：3.75 + 0.75 = 4.5
+    client
+        .send_array(&["INCRBYFLOAT", "f1", "0.75"])
+        .await;
+    let v4 = client.read_bulk().await;
+    assert_eq!(v4.as_deref(), Some("4.5"));
+
+    // 非数字值应返回浮点错误
+    client.set("notfloat", "abc").await;
+    client
+        .send_array(&["INCRBYFLOAT", "notfloat", "1.0"])
+        .await;
+    let err = client.read_simple_line().await;
+    assert!(err.starts_with("-ERR"));
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn getrange_and_setrange_roundtrip() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let mut client = TestClient::connect(addr).await;
+
+    // 对不存在的 key GETRANGE -> 空串
+    let r0 = client.getrange("missing", 0, -1).await;
+    assert_eq!(r0, "");
+
+    // 基本 GETRANGE 行为
+    client.set("foo", "foobar").await;
+    let r1 = client.getrange("foo", 0, 2).await;
+    assert_eq!(r1, "foo");
+    let r2 = client.getrange("foo", 3, -1).await;
+    assert_eq!(r2, "bar");
+    let r3 = client.getrange("foo", -2, -1).await;
+    assert_eq!(r3, "ar");
+
+    // 越界下标裁剪为合法范围
+    let r4 = client.getrange("foo", -100, 100).await;
+    assert_eq!(r4, "foobar");
+
+    // SETRANGE 覆盖已有值但不截断尾部：foobar -> fooZZr
+    let new_len = client.setrange("foo", 3, "ZZ").await;
+    assert_eq!(new_len, 6);
+    let v = client.get("foo").await;
+    assert_eq!(v.as_deref(), Some("fooZZr"));
+
+    // 非 string 类型调用 GETRANGE/SETRANGE -> WRONGTYPE
+    client.send_array(&["LPUSH", "list", "v1"]).await;
+    let _ = client.read_simple_line().await; // :1
+
+    client.send_array(&["GETRANGE", "list", "0", "-1"]).await;
+    let line = client.read_simple_line().await;
+    assert!(line.starts_with("-WRONGTYPE"));
+
+    client.send_array(&["SETRANGE", "list", "0", "x"]).await;
+    let line2 = client.read_simple_line().await;
+    assert!(line2.starts_with("-WRONGTYPE"));
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn set_with_nx_xx_semantics() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let mut client = TestClient::connect(addr).await;
+
+    // 初次 SET foo bar NX -> 应写入
+    client
+        .send_array(&["SET", "foo", "bar", "NX"])
+        .await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "+OK\r\n");
+
+    // 再次 SET foo baz NX -> 条件失败，返回 null bulk
+    client
+        .send_array(&["SET", "foo", "baz", "NX"])
+        .await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "$-1\r\n");
+
+    // SET foo qux XX -> 应覆盖
+    client
+        .send_array(&["SET", "foo", "qux", "XX"])
+        .await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "+OK\r\n");
+
+    let v = client.get("foo").await;
+    assert_eq!(v.as_deref(), Some("qux"));
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn set_with_get_option() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let mut client = TestClient::connect(addr).await;
+
+    // 初次 SET foo bar，无 GET
+    client.set("foo", "bar").await;
+
+    // SET foo baz GET -> 返回旧值 bar，key 变为 baz
+    client
+        .send_array(&["SET", "foo", "baz", "GET"])
+        .await;
+    let old = client.read_bulk().await;
+    assert_eq!(old.as_deref(), Some("bar"));
+
+    let v = client.get("foo").await;
+    assert_eq!(v.as_deref(), Some("baz"));
+
+    // SET foo qux NX GET，在 key 已存在时条件失败，返回当前值 baz 且不覆盖
+    client
+        .send_array(&["SET", "foo", "qux", "NX", "GET"])
+        .await;
+    let old2 = client.read_bulk().await;
+    assert_eq!(old2.as_deref(), Some("baz"));
+
+    let v2 = client.get("foo").await;
+    assert_eq!(v2.as_deref(), Some("baz"));
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn set_with_keepttl_option() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let mut client = TestClient::connect(addr).await;
+
+    // 使用 EX 设置带 TTL 的 key
+    client
+        .send_array(&["SET", "foo", "bar", "EX", "2"])
+        .await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "+OK\r\n");
+
+    // 读取 TTL，确认有 TTL 存在
+    client.send_array(&["TTL", "foo"]).await;
+    let ttl_before = client.read_simple_line().await;
+    assert!(ttl_before.starts_with(":"));
+
+    // 使用 KEEPTTL 覆盖 value，TTL 应保留
+    client
+        .send_array(&["SET", "foo", "baz", "KEEPTTL"])
+        .await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "+OK\r\n");
+
+    client.send_array(&["TTL", "foo"]).await;
+    let ttl_after = client.read_simple_line().await;
+    assert!(ttl_after.starts_with(":"));
+
+    // 等待一段时间后 key 应过期（说明 TTL 仍然生效）
+    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+    let v = client.get("foo").await;
+    assert_eq!(v, None);
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn getdel_basic_behaviour_and_wrongtype() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let mut client = TestClient::connect(addr).await;
+
+    // key 不存在时返回 nil
+    client.send_array(&["GETDEL", "missing"]).await;
+    let missing = client.read_bulk().await;
+    assert_eq!(missing, None);
+
+    // 基本 GETDEL 行为：返回旧值并删除 key
+    client.set("foo", "bar").await;
+    client.send_array(&["GETDEL", "foo"]).await;
+    let old = client.read_bulk().await;
+    assert_eq!(old.as_deref(), Some("bar"));
+
+    let after = client.get("foo").await;
+    assert_eq!(after, None);
+
+    // 非 string 类型调用 GETDEL -> WRONGTYPE
+    client.send_array(&["LPUSH", "list", "v1"]).await;
+    let _ = client.read_simple_line().await; // :1
+
+    client.send_array(&["GETDEL", "list"]).await;
+    let line = client.read_simple_line().await;
+    assert!(line.starts_with("-WRONGTYPE"));
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn getex_updates_ttl_and_persist_clears_it() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let mut client = TestClient::connect(addr).await;
+
+    // 使用 SET EX 设置初始 TTL
+    client
+        .send_array(&["SET", "foo", "bar", "EX", "1"]) // 1 秒过期
+        .await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "+OK\r\n");
+
+    // GETEX foo EX 3 -> 返回当前值，并将 TTL 延长到 ~3s
+    client
+        .send_array(&["GETEX", "foo", "EX", "3"])
+        .await;
+    let v = client.read_bulk().await;
+    assert_eq!(v.as_deref(), Some("bar"));
+
+    client.send_array(&["TTL", "foo"]).await;
+    let ttl_line = client.read_simple_line().await;
+    assert!(ttl_line.starts_with(":"));
+
+    // 使用 GETEX foo PX 500 缩短 TTL 到 500ms 内
+    client
+        .send_array(&["GETEX", "foo", "PX", "500"])
+        .await;
+    let v2 = client.read_bulk().await;
+    assert_eq!(v2.as_deref(), Some("bar"));
+
+    client.send_array(&["PTTL", "foo"]).await;
+    let pttl_line = client.read_simple_line().await;
+    assert!(pttl_line.starts_with(":"));
+
+    // 使用 GETEX foo PERSIST 清除 TTL
+    client
+        .send_array(&["GETEX", "foo", "PERSIST"])
+        .await;
+    let v3 = client.read_bulk().await;
+    assert_eq!(v3.as_deref(), Some("bar"));
+
+    client.send_array(&["TTL", "foo"]).await;
+    let ttl_after = client.read_simple_line().await;
+    assert_eq!(ttl_after, ":-1\r\n");
+
+    // 对不存在 key 的 GETEX -> 返回 nil，不设置 TTL
+    client.send_array(&["GETEX", "missing", "EX", "10"]).await;
+    let missing = client.read_bulk().await;
+    assert_eq!(missing, None);
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn command_argument_and_integer_errors_match_redis() {
     let (addr, shutdown, handle) = spawn_server().await;
 
@@ -215,6 +560,100 @@ async fn incrby_and_decrby_roundtrip() {
     handle.await.unwrap().unwrap();
 }
 
+#[tokio::test]
+async fn append_and_strlen_roundtrip() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let mut client = TestClient::connect(addr).await;
+
+    // 对不存在的 key append，相当于新建
+    let len1 = client.append("foo", "bar").await;
+    assert_eq!(len1, 3);
+    let v1 = client.get("foo").await;
+    assert_eq!(v1.as_deref(), Some("bar"));
+
+    // 再次 append
+    let len2 = client.append("foo", "baz").await;
+    assert_eq!(len2, 6);
+    let v2 = client.get("foo").await;
+    assert_eq!(v2.as_deref(), Some("barbaz"));
+
+    // STRLEN 返回长度
+    let slen = client.strlen("foo").await;
+    assert_eq!(slen, 6);
+
+    // 非 string 类型调用 APPEND/STRLEN -> WRONGTYPE
+    client.send_array(&["LPUSH", "list", "v1"]).await;
+    let _ = client.read_simple_line().await; // :1
+
+    client.send_array(&["APPEND", "list", "x"]).await;
+    let line = client.read_simple_line().await;
+    assert!(line.starts_with("-WRONGTYPE"));
+
+    client.send_array(&["STRLEN", "list"]).await;
+    let line2 = client.read_simple_line().await;
+    assert!(line2.starts_with("-WRONGTYPE"));
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn getset_basic_behaviour() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let mut client = TestClient::connect(addr).await;
+
+    // key 不存在时返回 nil，并设置新值
+    let old1 = client.getset("foo", "bar").await;
+    assert_eq!(old1, None);
+    let v1 = client.get("foo").await;
+    assert_eq!(v1.as_deref(), Some("bar"));
+
+    // key 存在时返回旧值并覆盖
+    let old2 = client.getset("foo", "baz").await;
+    assert_eq!(old2.as_deref(), Some("bar"));
+    let v2 = client.get("foo").await;
+    assert_eq!(v2.as_deref(), Some("baz"));
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn getset_preserves_ttl() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let mut client = TestClient::connect(addr).await;
+
+    // 先用 SET EX 设置 TTL
+    client
+        .send_array(&["SET", "foo", "bar", "EX", "1"])
+        .await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "+OK\r\n");
+
+    // 稍等一会儿，但先不要等到过期
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    // GETSET 返回旧值，并且不应清除 TTL
+    let old = client.getset("foo", "baz").await;
+    assert_eq!(old.as_deref(), Some("bar"));
+
+    // 立即 TTL，应仍然 >=0
+    client.send_array(&["TTL", "foo"]).await;
+    let ttl_line = client.read_simple_line().await;
+    assert!(ttl_line.starts_with(":"));
+
+    // 再等一会儿让 key 过期
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    let v = client.get("foo").await;
+    assert_eq!(v, None);
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
 struct TestClient {
     reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
     writer: tokio::net::tcp::OwnedWriteHalf,
@@ -367,6 +806,41 @@ impl TestClient {
 
     async fn dbsize(&mut self) -> i64 {
         self.send_array(&["DBSIZE"]).await;
+        let line = self.read_simple_line().await;
+        assert!(line.starts_with(":"));
+        line[1..line.len() - 2].parse().unwrap()
+    }
+
+    async fn append(&mut self, key: &str, value: &str) -> i64 {
+        self.send_array(&["APPEND", key, value]).await;
+        let line = self.read_simple_line().await;
+        assert!(line.starts_with(":"));
+        line[1..line.len() - 2].parse().unwrap()
+    }
+
+    async fn strlen(&mut self, key: &str) -> i64 {
+        self.send_array(&["STRLEN", key]).await;
+        let line = self.read_simple_line().await;
+        assert!(line.starts_with(":"));
+        line[1..line.len() - 2].parse().unwrap()
+    }
+
+    async fn getset(&mut self, key: &str, value: &str) -> Option<String> {
+        self.send_array(&["GETSET", key, value]).await;
+        self.read_bulk().await
+    }
+
+    async fn getrange(&mut self, key: &str, start: isize, end: isize) -> String {
+        let start_s = start.to_string();
+        let end_s = end.to_string();
+        self.send_array(&["GETRANGE", key, &start_s, &end_s]).await;
+        // GETRANGE 对不存在 key 返回空串（长度 0 的 bulk），不会返回 nil
+        self.read_bulk().await.unwrap_or_default()
+    }
+
+    async fn setrange(&mut self, key: &str, offset: usize, value: &str) -> i64 {
+        let off_s = offset.to_string();
+        self.send_array(&["SETRANGE", key, &off_s, value]).await;
         let line = self.read_simple_line().await;
         assert!(line.starts_with(":"));
         line[1..line.len() - 2].parse().unwrap()

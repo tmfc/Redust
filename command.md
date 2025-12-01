@@ -39,6 +39,14 @@
     - 未过期：返回 bulk string。
     - 过期/不存在：返回 `$-1`。
 
+- [x] **GETDEL key** / **GETEX key [EX seconds|PX milliseconds|PERSIST]**
+  - 当前：
+    - `GETDEL`：对 String 类型返回旧值并删除 key；不存在/过期返回 `$-1`；类型不为 String 时返回 WRONGTYPE 错误。
+    - `GETEX`：语义等价 `GET`，同时根据选项更新或清除 TTL：
+      - `EX seconds` / `PX milliseconds`：在成功返回当前值后设置新的相对过期时间（`seconds <= 0`/`millis <= 0` 时按照 EXPIRE/PEXPIRE 语义立刻删除）。
+      - `PERSIST`：清除已有过期时间，保留当前值。
+    - 对不存在/已过期的 key：只返回 `$-1`，不改变 TTL 状态。
+
 - [x] **INCR / DECR / INCRBY / DECRBY**
   - 当前：
     - `INCR` / `DECR`：基于字符串整数值 +1 / -1，非整数或溢出时报 `-ERR value is not an integer or out of range`。
@@ -46,10 +54,21 @@
     - 不存在的 key 视为 `0` 再进行运算。
   - TODO：后续可考虑 `INCRBYFLOAT` 等扩展命令。
 
+- [x] **INCRBYFLOAT key increment**
+  - 当前：
+    - 基于字符串值按 `f64` 做浮点自增，结果覆盖写回为十进制字符串（去掉多余尾随 0，与 Redis 行为接近）。
+    - 不存在或已过期的 key 视为 `0` 再进行运算。
+    - 参与计算的当前值或 increment 不是合法浮点，或结果为 `NaN` / `Inf` 时，返回 `-ERR value is not a valid float`，并保持原值不变。
+
 - [x] **MSET key value [key value ...] / MGET key [key ...]**
   - 当前：
     - `MSET`：要求参数个数为偶数且 >= 2，原子性简化为“要么全部 set，要么参数错误直接报错不写入”；成功返回 `+OK`。
     - `MGET`：对每个 key 独立调用当前 `GET` 语义，组成数组返回；不存在或类型不匹配的 key 返回 `nil`。
+
+- [x] **MSETNX key value [key value ...]**
+  - 当前：
+    - 仅当所有目标 key 当前都不存在或已过期时，才执行批量写入并返回 `:1`。
+    - 只要有任意一个目标 key 已存在且未过期，则整个命令不写入任何 key，返回 `:0`，保证 all-or-nothing 原子语义。
 
 - [x] **SETNX / SETEX / PSETEX**
   - 当前：
@@ -234,8 +253,8 @@
 - [x] KEYS
 - [ ] SCAN
 - [ ] RANDOMKEY
-- [ ] RENAME
-- [ ] RENAMENX
+- [x] RENAME
+- [x] RENAMENX
 - [ ] MOVE
 - [ ] DUMP
 - [ ] RESTORE
@@ -274,20 +293,20 @@
 - [x] GET
 - [x] INCR
 - [x] DECR
-- [ ] APPEND
-- [ ] GETSET
+- [x] APPEND
+- [x] GETSET
 - [x] MGET
 - [x] MSET
-- [ ] MSETNX
-- [ ] STRLEN
+- [x] MSETNX
+- [x] STRLEN
 - [x] INCRBY
 - [x] DECRBY
-- [ ] INCRBYFLOAT
+- [x] INCRBYFLOAT
 - [x] SETEX
 - [x] PSETEX
 - [x] SETNX
-- [ ] GETRANGE
-- [ ] SETRANGE
+- [x] GETRANGE
+- [x] SETRANGE
 - [ ] SUBSTR（已废弃，等价 GETRANGE）
 
 ### Hashes

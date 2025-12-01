@@ -11,10 +11,12 @@ use dashmap::DashMap;
 use rand::{seq::IteratorRandom, thread_rng};
 use rand::prelude::SliceRandom;
 
+type ByteString = Vec<u8>;
+
 #[derive(Debug, Clone)]
 enum StorageValue {
     String {
-        value: String,
+        value: ByteString,
         expires_at: Option<Instant>,
     },
     List {
@@ -47,6 +49,12 @@ pub enum HincrError {
     MaxValueExceeded,
 }
 
+pub enum HincrFloatError {
+    WrongType,
+    NotFloat,
+    MaxValueExceeded,
+}
+
 impl Default for Storage {
     fn default() -> Self {
         Storage::new(None)
@@ -61,6 +69,27 @@ impl Storage {
             last_access: Arc::new(DashMap::new()),
             access_counter: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub fn flushdb(&self, db: u8) {
+        let prefix = format!("{}:", db);
+        let keys_to_remove: Vec<String> = self
+            .data
+            .iter()
+            .map(|e| e.key().clone())
+            .filter(|k| k.starts_with(&prefix))
+            .collect();
+
+        for k in keys_to_remove {
+            self.data.remove(&k);
+            self.last_access.remove(&k);
+        }
+    }
+
+    pub fn flushall(&self) {
+        self.data.clear();
+        self.last_access.clear();
+        self.access_counter.store(0, Ordering::Relaxed);
     }
 
     pub fn hset(&self, key: &str, field: &str, value: String) -> Result<usize, ()> {
@@ -237,6 +266,57 @@ impl Storage {
         }
 
         map.insert(field.to_string(), new_str);
+
+        self.touch_key(key);
+        self.maybe_evict_for_write();
+
+        Ok(new_val)
+    }
+
+    pub fn hincr_by_float(&self, key: &str, field: &str, delta: f64, max_value_bytes: Option<u64>) -> Result<f64, HincrFloatError> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            // treat as non-existent hash
+        }
+
+        let mut entry = self
+            .data
+            .entry(key.to_string())
+            .or_insert(StorageValue::Hash {
+                value: HashMap::new(),
+                expires_at: None,
+            });
+
+        let map = match entry.value_mut() {
+            StorageValue::Hash { value: map, .. } => map,
+            _ => return Err(HincrFloatError::WrongType),
+        };
+
+        let current_s = map.get(field).cloned().unwrap_or_else(|| "0".to_string());
+        let current = current_s.parse::<f64>().map_err(|_| HincrFloatError::NotFloat)?;
+        let new_val = current + delta;
+        if !new_val.is_finite() {
+            return Err(HincrFloatError::NotFloat);
+        }
+
+        // 生成紧凑十进制表示，逻辑与 incr_by_float 保持一致
+        let mut s = new_val.to_string();
+        if s.contains('.') {
+            while s.ends_with('0') {
+                s.pop();
+            }
+            if s.ends_with('.') {
+                s.push('0');
+            }
+        }
+
+        if let Some(limit) = max_value_bytes {
+            if (s.as_bytes().len() as u64) > limit {
+                return Err(HincrFloatError::MaxValueExceeded);
+            }
+        }
+
+        map.insert(field.to_string(), s);
 
         self.touch_key(key);
         self.maybe_evict_for_write();
@@ -440,7 +520,7 @@ impl Storage {
         Ok(result)
     }
 
-    pub fn set(&self, key: String, value: String) {
+    pub fn set(&self, key: String, value: ByteString) {
         self.data.insert(
             key.clone(),
             StorageValue::String {
@@ -452,7 +532,7 @@ impl Storage {
         self.maybe_evict_for_write();
     }
 
-    pub fn get(&self, key: &str) -> Option<String> {
+    pub fn get(&self, key: &str) -> Option<ByteString> {
         let now = Instant::now();
         if self.remove_if_expired(key, now) {
             return None;
@@ -475,17 +555,236 @@ impl Storage {
         result
     }
 
-    pub fn mget(&self, keys: &[String]) -> Vec<Option<String>> {
+    pub fn getdel(&self, key: &str) -> Result<Option<ByteString>, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(None);
+        }
+
+        // 直接从 DashMap 中移除 key，避免在持有引用的同时再调用 remove
+        let removed = self.data.remove(key);
+
+        let Some((_k, value)) = removed else {
+            return Ok(None);
+        };
+
+        let result = match value {
+            StorageValue::String { value, .. } => Ok(Some(value)),
+            _ => Err(()),
+        }?;
+
+        // 删除访问记录
+        self.last_access.remove(key);
+
+        Ok(result)
+    }
+
+    pub fn getrange(&self, key: &str, start: isize, end: isize) -> Result<ByteString, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(ByteString::new());
+        }
+
+        let Some(entry) = self.data.get(key) else {
+            return Ok(ByteString::new());
+        };
+
+        let s = match entry.value() {
+            StorageValue::String { value, .. } => value,
+            _ => return Err(()),
+        };
+
+        let len = s.len() as isize;
+        if len == 0 {
+            return Ok(ByteString::new());
+        }
+
+        let mut start_idx = start;
+        let mut end_idx = end;
+
+        if start_idx < 0 {
+            start_idx += len;
+        }
+        if end_idx < 0 {
+            end_idx += len;
+        }
+
+        if start_idx < 0 {
+            start_idx = 0;
+        }
+        if end_idx >= len {
+            end_idx = len - 1;
+        }
+
+        if start_idx > end_idx || start_idx >= len {
+            return Ok(ByteString::new());
+        }
+
+        let start_u = start_idx as usize;
+        let end_u = end_idx as usize;
+        let slice = &s[start_u..=end_u];
+
+        Ok(slice.to_vec())
+    }
+
+    pub fn append(&self, key: &str, suffix: &[u8]) -> Result<usize, ()> {
+        let now = Instant::now();
+        self.remove_if_expired(key, now);
+        let len = if let Some(mut entry) = self.data.get_mut(key) {
+            match entry.value_mut() {
+                StorageValue::String { value, .. } => {
+                    value.extend_from_slice(suffix);
+                    value.len()
+                }
+                _ => return Err(()),
+            }
+        } else {
+            let value = suffix.to_vec();
+            let len = value.len();
+            self.data.insert(
+                key.to_string(),
+                StorageValue::String {
+                    value,
+                    expires_at: None,
+                },
+            );
+            len
+        };
+        if len > 0 {
+            self.touch_key(key);
+            self.maybe_evict_for_write();
+        }
+
+        Ok(len)
+    }
+
+    pub fn strlen(&self, key: &str) -> Result<usize, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(0);
+        }
+
+        let Some(entry) = self.data.get(key) else {
+            return Ok(0);
+        };
+
+        let len = match entry.value() {
+            StorageValue::String { value, .. } => value.len(),
+            _ => return Err(()),
+        };
+
+        Ok(len)
+    }
+
+    pub fn getset(&self, key: &str, value: ByteString) -> Result<Option<ByteString>, ()> {
+        let now = Instant::now();
+        self.remove_if_expired(key, now);
+
+        let mut old: Option<ByteString> = None;
+
+        if let Some(mut entry) = self.data.get_mut(key) {
+            match entry.value_mut() {
+                StorageValue::String { value: v, .. } => {
+                    old = Some(v.clone());
+                    *v = value;
+                }
+                _ => return Err(()),
+            }
+        } else {
+            self.data.insert(
+                key.to_string(),
+                StorageValue::String {
+                    value,
+                    expires_at: None,
+                },
+            );
+        }
+
+        self.touch_key(key);
+        self.maybe_evict_for_write();
+
+        Ok(old)
+    }
+
+    pub fn setrange(&self, key: &str, offset: usize, value: &[u8]) -> Result<usize, ()> {
+        let now = Instant::now();
+        self.remove_if_expired(key, now);
+
+        let new_len = if let Some(mut entry) = self.data.get_mut(key) {
+            match entry.value_mut() {
+                StorageValue::String { value: s, .. } => {
+                    let cur_len = s.len();
+                    if offset > cur_len {
+                        let pad_len = offset - cur_len;
+                        s.resize(cur_len + pad_len, 0);
+                    }
+                    let target_len = offset + value.len();
+                    if target_len > s.len() {
+                        s.resize(target_len, 0);
+                    }
+                    s[offset..offset + value.len()].copy_from_slice(value);
+                    s.len()
+                }
+                _ => return Err(()),
+            }
+        } else {
+            let mut s = vec![0u8; offset];
+            s.extend_from_slice(value);
+            let len = s.len();
+            self.data.insert(
+                key.to_string(),
+                StorageValue::String {
+                    value: s,
+                    expires_at: None,
+                },
+            );
+            len
+        };
+
+        if new_len > 0 {
+            self.touch_key(key);
+            self.maybe_evict_for_write();
+        }
+
+        Ok(new_len)
+    }
+
+    pub fn mget(&self, keys: &[String]) -> Vec<Option<ByteString>> {
         keys.iter().map(|k| self.get(k)).collect()
     }
 
-    pub fn mset(&self, pairs: &[(String, String)]) {
+    pub fn mset(&self, pairs: &[(String, ByteString)]) {
         for (k, v) in pairs {
             self.set(k.clone(), v.clone());
         }
     }
 
-    pub fn setnx(&self, key: &str, value: String) -> bool {
+    pub fn msetnx(&self, pairs: &[(String, ByteString)]) -> bool {
+        if pairs.is_empty() {
+            return false;
+        }
+
+        let now = Instant::now();
+
+        // 先检查是否有任意 key 已存在且未过期
+        for (k, _v) in pairs.iter() {
+            if self.remove_if_expired(k, now) {
+                continue;
+            }
+            if self.data.contains_key(k) {
+                return false;
+            }
+        }
+
+        // 所有 key 均不存在/已过期，执行写入
+        for (k, v) in pairs {
+            self.set(k.clone(), v.clone());
+        }
+
+        true
+    }
+
+    pub fn setnx(&self, key: &str, value: ByteString) -> bool {
         let now = Instant::now();
         if self.remove_if_expired(key, now) {
             // treat as non-existent
@@ -508,12 +807,12 @@ impl Storage {
         inserted
     }
 
-    pub fn set_with_expire_seconds(&self, key: String, value: String, seconds: i64) {
+    pub fn set_with_expire_seconds(&self, key: String, value: ByteString, seconds: i64) {
         self.set(key.clone(), value);
         self.expire_seconds(&key, seconds);
     }
 
-    pub fn set_with_expire_millis(&self, key: String, value: String, millis: i64) {
+    pub fn set_with_expire_millis(&self, key: String, value: ByteString, millis: i64) {
         self.set(key.clone(), value);
         self.expire_millis(&key, millis);
     }
@@ -538,6 +837,68 @@ impl Storage {
             .count()
     }
 
+    pub fn rename(&self, from: &str, to: &str) -> Result<(), ()> {
+        if from == to {
+            // Redis: RENAME key key 也是 OK，不做任何修改
+            if !self.data.contains_key(from) {
+                return Err(());
+            }
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        if self.remove_if_expired(from, now) {
+            return Err(());
+        }
+
+        let removed = self.data.remove(from);
+        let Some((_k, value)) = removed else {
+            return Err(());
+        };
+
+        // 删除旧的访问记录
+        self.last_access.remove(from);
+
+        // 插入新 key，保留 TTL 信息
+        self.data.insert(to.to_string(), value);
+        self.touch_key(to);
+
+        Ok(())
+    }
+
+    pub fn renamenx(&self, from: &str, to: &str) -> Result<bool, ()> {
+        let now = Instant::now();
+        if from == to {
+            // RENAME NX key key：如果 key 存在（且未过期），视为目标存在，返回 0；不存在则报错
+            if self.remove_if_expired(from, now) {
+                return Err(());
+            }
+            return if self.data.contains_key(from) { Ok(false) } else { Err(()) };
+        }
+
+        if self.remove_if_expired(from, now) {
+            return Err(());
+        }
+
+        // 目标 key 也需要尊重过期语义：已过期的 key 视为不存在
+        self.remove_if_expired(to, now);
+
+        if self.data.contains_key(to) {
+            return Ok(false);
+        }
+
+        let removed = self.data.remove(from);
+        let Some((_k, value)) = removed else {
+            return Err(());
+        };
+
+        self.last_access.remove(from);
+        self.data.insert(to.to_string(), value);
+        self.touch_key(to);
+
+        Ok(true)
+    }
+
     pub fn incr(&self, key: &str) -> Result<i64, ()> {
         self.incr_by(key, 1)
     }
@@ -553,7 +914,7 @@ impl Storage {
             self.data.insert(
                 key.to_string(),
                 StorageValue::String {
-                    value: "0".to_string(),
+                    value: b"0".to_vec(),
                     expires_at: None,
                 },
             );
@@ -563,7 +924,7 @@ impl Storage {
             .data
             .entry(key.to_string())
             .or_insert(StorageValue::String {
-                value: "0".to_string(),
+                value: b"0".to_vec(),
                 expires_at: None,
             });
 
@@ -572,9 +933,59 @@ impl Storage {
             _ => return Err(()), // Key exists but is not a string
         };
 
-        let value: i64 = current_val.parse().map_err(|_| ())?;
+        let current_str = std::str::from_utf8(current_val).map_err(|_| ())?;
+        let value: i64 = current_str.parse().map_err(|_| ())?;
         let new_val = value.checked_add(delta).ok_or(())?;
-        *current_val = new_val.to_string();
+        *current_val = new_val.to_string().into_bytes();
+        self.touch_key(key);
+        self.maybe_evict_for_write();
+        Ok(new_val)
+    }
+
+    pub fn incr_by_float(&self, key: &str, delta: f64) -> Result<f64, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            self.data.insert(
+                key.to_string(),
+                StorageValue::String {
+                    value: b"0".to_vec(),
+                    expires_at: None,
+                },
+            );
+        }
+
+        let mut entry = self
+            .data
+            .entry(key.to_string())
+            .or_insert(StorageValue::String {
+                value: b"0".to_vec(),
+                expires_at: None,
+            });
+
+        let current_val = match entry.value_mut() {
+            StorageValue::String { value, .. } => value,
+            _ => return Err(()),
+        };
+
+        let current_str = std::str::from_utf8(current_val).map_err(|_| ())?;
+        let current: f64 = current_str.parse().map_err(|_| ())?;
+        let new_val = current + delta;
+        if !new_val.is_finite() {
+            return Err(());
+        }
+
+        // 尽量生成紧凑的人类可读十进制表示，接近 Redis 行为
+        let mut s = new_val.to_string();
+        if s.contains('.') {
+            while s.ends_with('0') {
+                s.pop();
+            }
+            if s.ends_with('.') {
+                s.push('0');
+            }
+        }
+
+        *current_val = s.into_bytes();
         self.touch_key(key);
         self.maybe_evict_for_write();
         Ok(new_val)
@@ -1275,10 +1686,9 @@ impl Storage {
 
             match value {
                 StorageValue::String { value, .. } => {
-                    let v_bytes = value.as_bytes();
-                    let v_len = v_bytes.len() as u32;
+                    let v_len = value.len() as u32;
                     file.write_all(&v_len.to_le_bytes())?;
-                    file.write_all(v_bytes)?;
+                    file.write_all(value)?;
                 }
                 StorageValue::List { value: list, .. } => {
                     let len = list.len() as u32;
@@ -1405,13 +1815,7 @@ impl Storage {
                     if file.read_exact(&mut v).is_err() {
                         break;
                     }
-                    let s = match String::from_utf8(v) {
-                        Ok(s) => s,
-                        Err(_) => {
-                            return Ok(());
-                        }
-                    };
-                    StorageValue::String { value: s, expires_at }
+                    StorageValue::String { value: v, expires_at }
                 }
                 1 => {
                     let mut len_buf = [0u8; 4];

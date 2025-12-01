@@ -114,31 +114,221 @@ async fn handle_string_command(
             respond_simple_string(writer, "PONG").await?;
         }
         Command::Echo(value) => {
-            respond_bulk_string(writer, &value).await?;
+            respond_bulk_bytes(writer, &value).await?;
         }
         Command::Quit => {
             respond_simple_string(writer, "OK").await?;
         }
-        Command::Set { key, value, expire_millis } => {
+        Command::Set { key, value, expire_millis, nx, xx, keep_ttl, get } => {
             let physical = prefix_key(current_db, &key);
+
+            // 长度限制
             if let Some(limit) = current_max_value_bytes() {
-                if (value.as_bytes().len() as u64) > limit {
+                if (value.len() as u64) > limit {
                     respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
                     return Ok(());
                 }
             }
-            storage.set(physical.clone(), value);
-            if let Some(ms) = expire_millis {
-                storage.expire_millis(&physical, ms);
+
+            // 获取旧值（字符串类型才有意义）
+            let old_value = storage.get(&physical);
+
+            // 若指定 KEEPTTL，则在覆盖前先读取剩余 TTL
+            let keep_ttl_ms = if keep_ttl {
+                let ttl = storage.pttl_millis(&physical);
+                if ttl > 0 { Some(ttl) } else { None }
+            } else {
+                None
+            };
+
+            // 判断 key 是否存在（无论类型），用于 NX/XX
+            let existed = storage.type_of(&physical) != "none";
+
+            // 根据 NX / XX 判断是否写入
+            let should_write = if nx {
+                !existed
+            } else if xx {
+                existed
+            } else {
+                true
+            };
+
+            // 处理写入和 TTL
+            if should_write {
+                // 写入新值
+                storage.set(physical.clone(), value);
+
+                // TTL 处理优先级：
+                // 1. KEEPTTL：恢复旧 TTL（如果存在）
+                // 2. EX/PX：设置新的 TTL
+                // 3. 否则：清除已有 TTL
+                if let Some(ms) = keep_ttl_ms {
+                    storage.expire_millis(&physical, ms);
+                } else if let Some(ms) = expire_millis {
+                    storage.expire_millis(&physical, ms);
+                } else {
+                    let _ = storage.persist(&physical);
+                }
             }
-            respond_simple_string(writer, "OK").await?;
+
+            // 处理返回值
+            if get {
+                match old_value {
+                    Some(v) => respond_bulk_bytes(writer, &v).await?,
+                    None => respond_null_bulk(writer).await?,
+                }
+            } else if should_write {
+                respond_simple_string(writer, "OK").await?;
+            } else {
+                // 条件失败且无 GET 时，返回 null bulk（与 Redis 行为一致）
+                respond_null_bulk(writer).await?;
+            }
+        }
+        Command::Incrbyfloat { key, delta } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.incr_by_float(&physical, delta) {
+                Ok(value) => {
+                    let s = {
+                        let mut s = value.to_string();
+                        if s.contains('.') {
+                            while s.ends_with('0') {
+                                s.pop();
+                            }
+                            if s.ends_with('.') {
+                                s.push('0');
+                            }
+                        }
+                        s
+                    };
+                    respond_bulk_string(writer, &s).await?;
+                }
+                Err(_) => {
+                    respond_error(writer, "ERR value is not a valid float").await?;
+                }
+            }
         }
         Command::Get { key } => {
             let physical = prefix_key(current_db, &key);
             if let Some(value) = storage.get(&physical) {
-                respond_bulk_string(writer, &value).await?;
+                respond_bulk_bytes(writer, &value).await?;
             } else {
                 respond_null_bulk(writer).await?;
+            }
+        }
+        Command::Getdel { key } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.getdel(&physical) {
+                Ok(Some(value)) => {
+                    respond_bulk_bytes(writer, &value).await?;
+                }
+                Ok(None) => {
+                    respond_null_bulk(writer).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Getex { key, expire_millis, persist } => {
+            let physical = prefix_key(current_db, &key);
+
+            let value_opt = storage.get(&physical);
+
+            match value_opt {
+                Some(ref v) => {
+                    // 先返回当前值
+                    respond_bulk_bytes(writer, v).await?;
+
+                    // 然后根据选项更新 TTL
+                    if let Some(ms) = expire_millis {
+                        let _ = storage.expire_millis(&physical, ms);
+                    } else if persist {
+                        let _ = storage.persist(&physical);
+                    }
+                }
+                None => {
+                    // key 不存在/已过期: 返回 nil，不再尝试设置 TTL
+                    respond_null_bulk(writer).await?;
+                }
+            }
+        }
+        Command::Getrange { key, start, end } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.getrange(&physical, start, end) {
+                Ok(s) => {
+                    respond_bulk_bytes(writer, &s).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Setrange { key, offset, value } => {
+            let physical = prefix_key(current_db, &key);
+            if let Some(limit) = current_max_value_bytes() {
+                if (value.len() as u64) > limit {
+                    respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                    return Ok(());
+                }
+            }
+
+            match storage.setrange(&physical, offset, &value) {
+                Ok(len) => {
+                    respond_integer(writer, len as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Append { key, value } => {
+            let physical = prefix_key(current_db, &key);
+            if let Some(limit) = current_max_value_bytes() {
+                if (value.len() as u64) > limit {
+                    respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                    return Ok(());
+                }
+            }
+
+            match storage.append(&physical, &value) {
+                Ok(new_len) => {
+                    respond_integer(writer, new_len as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Strlen { key } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.strlen(&physical) {
+                Ok(len) => {
+                    respond_integer(writer, len as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Getset { key, value } => {
+            let physical = prefix_key(current_db, &key);
+            if let Some(limit) = current_max_value_bytes() {
+                if (value.len() as u64) > limit {
+                    respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                    return Ok(());
+                }
+            }
+
+            match storage.getset(&physical, value) {
+                Ok(Some(old)) => {
+                    respond_bulk_bytes(writer, &old).await?;
+                }
+                Ok(None) => {
+                    respond_null_bulk(writer).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
             }
         }
         Command::Sunionstore { dest, keys } => {
@@ -320,6 +510,25 @@ async fn handle_string_command(
                 .collect();
             storage.mset(&mapped);
             respond_simple_string(writer, "OK").await?;
+        }
+        Command::Msetnx { pairs } => {
+            if let Some(limit) = current_max_value_bytes() {
+                for (_k, v) in pairs.iter() {
+                    if (v.as_bytes().len() as u64) > limit {
+                        respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                        return Ok(());
+                    }
+                }
+            }
+
+            let mapped: Vec<(String, String)> = pairs
+                .into_iter()
+                .map(|(k, v)| (prefix_key(current_db, &k), v))
+                .collect();
+
+            let ok = storage.msetnx(&mapped);
+            let v = if ok { 1 } else { 0 };
+            respond_integer(writer, v).await?;
         }
         Command::Setnx { key, value } => {
             let physical = prefix_key(current_db, &key);
@@ -884,6 +1093,33 @@ async fn handle_hash_command(
                 }
             }
         }
+        Command::Hincrbyfloat { key, field, delta } => {
+            let physical = prefix_key(current_db, &key);
+            let max = current_max_value_bytes();
+            match storage.hincr_by_float(&physical, &field, delta, max) {
+                Ok(value) => {
+                    let mut s = value.to_string();
+                    if s.contains('.') {
+                        while s.ends_with('0') {
+                            s.pop();
+                        }
+                        if s.ends_with('.') {
+                            s.push('0');
+                        }
+                    }
+                    respond_bulk_string(writer, &s).await?;
+                }
+                Err(crate::storage::HincrFloatError::WrongType) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+                Err(crate::storage::HincrFloatError::NotFloat) => {
+                    respond_error(writer, "ERR hash value is not a valid float").await?;
+                }
+                Err(crate::storage::HincrFloatError::MaxValueExceeded) => {
+                    respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                }
+            }
+        }
         Command::Hlen { key } => {
             let physical = prefix_key(current_db, &key);
             match storage.hlen(&physical) {
@@ -974,6 +1210,41 @@ async fn handle_key_meta_command(
             let prefix = format!("{}:", current_db);
             let count = all.into_iter().filter(|k| k.starts_with(&prefix)).count();
             respond_integer(writer, count as i64).await?;
+        }
+        Command::Rename { key, newkey } => {
+            let from = prefix_key(current_db, &key);
+            let to = prefix_key(current_db, &newkey);
+            match storage.rename(&from, &to) {
+                Ok(()) => {
+                    respond_simple_string(writer, "OK").await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "ERR no such key").await?;
+                }
+            }
+        }
+        Command::Renamenx { key, newkey } => {
+            let from = prefix_key(current_db, &key);
+            let to = prefix_key(current_db, &newkey);
+            match storage.renamenx(&from, &to) {
+                Ok(true) => {
+                    respond_integer(writer, 1).await?;
+                }
+                Ok(false) => {
+                    respond_integer(writer, 0).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "ERR no such key").await?;
+                }
+            }
+        }
+        Command::Flushdb => {
+            storage.flushdb(current_db);
+            respond_simple_string(writer, "OK").await?;
+        }
+        Command::Flushall => {
+            storage.flushall();
+            respond_simple_string(writer, "OK").await?;
         }
         _ => {}
     }
@@ -1162,14 +1433,23 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
             | Command::Echo(_)
             | Command::Set { .. }
             | Command::Get { .. }
+            | Command::Getdel { .. }
+            | Command::Getex { .. }
+            | Command::Getrange { .. }
+            | Command::Setrange { .. }
+            | Command::Append { .. }
+            | Command::Strlen { .. }
+            | Command::Getset { .. }
             | Command::Incr { .. }
             | Command::Decr { .. }
             | Command::Incrby { .. }
             | Command::Decrby { .. }
+            | Command::Incrbyfloat { .. }
             | Command::Del { .. }
             | Command::Exists { .. }
             | Command::Mget { .. }
             | Command::Mset { .. }
+            | Command::Msetnx { .. }
             | Command::Setnx { .. }
             | Command::Setex { .. }
             | Command::Psetex { .. } => {
@@ -1221,6 +1501,7 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
             | Command::Hvals { .. }
             | Command::Hmget { .. }
             | Command::Hincrby { .. }
+            | Command::Hincrbyfloat { .. }
             | Command::Hlen { .. } => {
                 handle_hash_command(cmd, &storage, &mut write_half, current_db).await?;
             }
@@ -1233,7 +1514,11 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
             | Command::Persist { .. }
             | Command::Type { .. }
             | Command::Keys { .. }
-            | Command::Dbsize => {
+            | Command::Dbsize
+            | Command::Rename { .. }
+            | Command::Renamenx { .. }
+            | Command::Flushdb
+            | Command::Flushall => {
                 handle_key_meta_command(cmd, &storage, &mut write_half, current_db).await?;
             }
 

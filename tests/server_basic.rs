@@ -161,6 +161,173 @@ async fn responds_to_basic_commands() {
 }
 
 #[tokio::test]
+async fn rename_and_flush_commands_behaviour() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 在 DB0: SET k v0
+    write_half
+        .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$2\r\nv0\r\n")
+        .await
+        .unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // RENAME k k2 -> OK, k 消失, k2 变为 v0
+    write_half
+        .write_all(b"*3\r\n$6\r\nRENAME\r\n$1\r\nk\r\n$2\r\nk2\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // GET k -> nil
+    write_half
+        .write_all(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "$-1\r\n");
+
+    // GET k2 -> v0
+    write_half
+        .write_all(b"*2\r\n$3\r\nGET\r\n$2\r\nk2\r\n")
+        .await
+        .unwrap();
+    let mut bulk_header = String::new();
+    let mut value = String::new();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(bulk_header, "$2\r\n");
+    assert_eq!(value, "v0\r\n");
+
+    // RENAME missing -> ERR no such key
+    write_half
+        .write_all(b"*3\r\n$6\r\nRENAME\r\n$7\r\nmissing\r\n$1\r\nx\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "-ERR no such key\r\n");
+
+    // 准备 RENAMENX: SET a 1, SET b 2
+    write_half
+        .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    write_half
+        .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // RENAMENX a b -> 0 (b 已存在)
+    write_half
+        .write_all(b"*3\r\n$8\r\nRENAMENX\r\n$1\r\na\r\n$1\r\nb\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":0\r\n");
+
+    // RENAMENX a c -> 1 (a -> c)
+    write_half
+        .write_all(b"*3\r\n$8\r\nRENAMENX\r\n$1\r\na\r\n$1\r\nc\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":1\r\n");
+
+    // 切换到 DB1
+    write_half
+        .write_all(b"*2\r\n$6\r\nSELECT\r\n$1\r\n1\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // 在 DB1: SET x v1
+    write_half
+        .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nx\r\n$2\r\nv1\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // FLUSHDB (当前 DB1)
+    write_half
+        .write_all(b"*1\r\n$7\r\nFLUSHDB\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // DB1 中 GET x -> nil
+    write_half
+        .write_all(b"*2\r\n$3\r\nGET\r\n$1\r\nx\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "$-1\r\n");
+
+    // 切回 DB0，确认在 FLUSHALL 前还有 key
+    write_half
+        .write_all(b"*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // DBSIZE 应该大于 0
+    write_half
+        .write_all(b"*1\r\n$6\r\nDBSIZE\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with(":"));
+
+    // FLUSHALL 清空所有 DB
+    write_half
+        .write_all(b"*1\r\n$8\r\nFLUSHALL\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // DBSIZE 再次查看，应为 0
+    write_half
+        .write_all(b"*1\r\n$6\r\nDBSIZE\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":0\r\n");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn wrongtype_errors_for_sets_and_hashes() {
     let (addr, shutdown, handle) = spawn_server().await;
 
@@ -372,8 +539,25 @@ async fn prometheus_metrics_exporter_basic() {
     reader.read_line(&mut line).await.unwrap();
     assert_eq!(line, "+PONG\r\n");
 
-    // Now scrape /metrics from the exporter.
-    let mut metrics_stream = TcpStream::connect("127.0.0.1:9898").await.unwrap();
+    // Now scrape /metrics from the exporter. 由于 metrics 监听与主服务器并行启动，
+    // 这里增加一个带最大重试次数的小循环，避免偶发的连接建立时序问题导致测试 flakiness。
+    let mut last_err = None;
+    let mut metrics_stream = None;
+    for _ in 0..20 {
+        match TcpStream::connect("127.0.0.1:9898").await {
+            Ok(s) => {
+                metrics_stream = Some(s);
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    let mut metrics_stream = metrics_stream
+        .unwrap_or_else(|| panic!("failed to connect to metrics exporter: {:?}", last_err));
     metrics_stream
         .write_all(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n")
         .await
@@ -383,7 +567,7 @@ async fn prometheus_metrics_exporter_basic() {
     {
         use tokio::io::AsyncReadExt;
         let mut reader = BufReader::new(metrics_stream); // reuse BufReader for HTTP response
-        reader.read_to_string(&mut buf).await.unwrap();
+        reader.read_to_string(&mut buf).await.expect("failed to read /metrics response");
     }
 
     assert!(buf.contains("redust_uptime_seconds"));

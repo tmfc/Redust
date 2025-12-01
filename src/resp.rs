@@ -7,7 +7,7 @@ const MAX_ARRAY_SIZE: usize = 1024 * 1024;
 
 pub async fn read_resp_array(
     reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
-) -> io::Result<Option<Vec<String>>> {
+) -> io::Result<Option<Vec<Vec<u8>>>> {
     let mut header = String::new();
     let read = reader.read_line(&mut header).await?;
     if read == 0 {
@@ -16,7 +16,7 @@ pub async fn read_resp_array(
 
     let header = header.trim_end();
     if !header.starts_with('*') {
-        return Ok(Some(vec![header.to_string()]));
+        return Ok(Some(vec![header.as_bytes().to_vec()]));
     }
 
     let array_len: usize = header[1..]
@@ -78,8 +78,7 @@ pub async fn read_resp_array(
             ));
         }
 
-        let value = String::from_utf8_lossy(&buf).into_owned();
-        parts.push(value);
+        parts.push(buf);
     }
 
     Ok(Some(parts))
@@ -89,8 +88,17 @@ pub async fn respond_bulk_string(
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
     value: &str,
 ) -> io::Result<()> {
-    let response = format!("${}\r\n{}\r\n", value.len(), value);
-    writer.write_all(response.as_bytes()).await
+    respond_bulk_bytes(writer, value.as_bytes()).await
+}
+
+pub async fn respond_bulk_bytes(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    value: &[u8],
+) -> io::Result<()> {
+    let header = format!("${}\r\n", value.len());
+    writer.write_all(header.as_bytes()).await?;
+    writer.write_all(value).await?;
+    writer.write_all(b"\r\n").await
 }
 
 pub async fn respond_simple_string(
@@ -151,7 +159,7 @@ mod tests {
     async fn parses_simple_resp_array() {
         let (mut reader, _listener) = setup_test_client(b"*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n".to_vec()).await;
         let parts = read_resp_array(&mut reader).await.unwrap().unwrap();
-        assert_eq!(parts, vec!["ECHO".to_string(), "hello".to_string()]);
+        assert_eq!(parts, vec![b"ECHO".to_vec(), b"hello".to_vec()]);
     }
 
     #[tokio::test]
