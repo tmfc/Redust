@@ -341,3 +341,40 @@ async fn unsubscribe_without_args_sends_one_event_per_channel() {
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn slow_subscriber_drops_old_messages_but_stays_subscribed() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let mut sub = RespClient::connect(addr).await;
+    let mut pub_client = RespClient::connect(addr).await;
+
+    sub.send_array(&[b"SUBSCRIBE", b"news"]).await;
+    let _ = sub.read_array().await;
+
+    // Send a burst larger than broadcast buffer without reading subscriber messages
+    for i in 0..1500 {
+        let payload = format!("msg{}", i);
+        pub_client
+            .send_array(&[b"PUBLISH", b"news", payload.as_bytes()])
+            .await;
+        let _ = pub_client.read_integer().await;
+    }
+
+    // Now publish a final marker and ensure subscriber still receives it
+    pub_client
+        .send_array(&[b"PUBLISH", b"news", b"final"])
+        .await;
+    let _ = pub_client.read_integer().await;
+
+    // Drain messages until we see "final" (earlier ones may have been dropped)
+    loop {
+        let msg = sub.read_array().await;
+        if msg[2] == b"final" {
+            break;
+        }
+    }
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}

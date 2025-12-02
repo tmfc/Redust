@@ -2017,8 +2017,17 @@ async fn handle_connection(
                         let mut rx = pubsub.subscribe_channel(&channel);
                         let tx = msg_tx.clone();
                         let handle = tokio::spawn(async move {
-                            while let Ok(message) = rx.recv().await {
-                                let _ = tx.send(message);
+                            loop {
+                                match rx.recv().await {
+                                    Ok(message) => {
+                                        let _ = tx.send(message);
+                                    }
+                                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                                        // Drop old messages when receiver is slow; keep subscription alive.
+                                        continue;
+                                    }
+                                    Err(broadcast::error::RecvError::Closed) => break,
+                                }
                             }
                         });
                         channel_subscriptions.insert(channel.clone(), handle);
@@ -2059,8 +2068,16 @@ async fn handle_connection(
                         let mut rx = pubsub.subscribe_pattern(&pattern);
                         let tx = msg_tx.clone();
                         let handle = tokio::spawn(async move {
-                            while let Ok(message) = rx.recv().await {
-                                let _ = tx.send(message);
+                            loop {
+                                match rx.recv().await {
+                                    Ok(message) => {
+                                        let _ = tx.send(message);
+                                    }
+                                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                                        continue;
+                                    }
+                                    Err(broadcast::error::RecvError::Closed) => break,
+                                }
                             }
                         });
                         pattern_subscriptions.insert(pattern.clone(), handle);
