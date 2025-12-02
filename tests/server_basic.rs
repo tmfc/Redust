@@ -1,5 +1,5 @@
-use std::net::SocketAddr;
 use std::env;
+use std::net::SocketAddr;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -8,21 +8,29 @@ use tokio::time::{Duration, Instant};
 
 use redust::server::serve;
 
-async fn spawn_server(
-) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<tokio::io::Result<()>>) {
+async fn spawn_server() -> (
+    SocketAddr,
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<tokio::io::Result<()>>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
     let addr = listener.local_addr().expect("local addr");
     let (tx, rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
-        serve(
-            listener,
-            async move {
-                let _ = rx.await;
-            },
-        )
+        serve(listener, async move {
+            let _ = rx.await;
+        })
         .await
     });
     (addr, tx, handle)
+}
+
+async fn send_array(writer: &mut tokio::net::tcp::OwnedWriteHalf, parts: &[&str]) {
+    let mut buf = format!("*{}\r\n", parts.len());
+    for p in parts {
+        buf.push_str(&format!("${}\r\n{}\r\n", p.len(), p));
+    }
+    writer.write_all(buf.as_bytes()).await.unwrap();
 }
 
 #[tokio::test]
@@ -155,6 +163,173 @@ async fn responds_to_basic_commands() {
     let mut key_value = String::new();
     reader.read_line(&mut key_value).await.unwrap();
     assert_eq!(key_value, "cnt\r\n");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn rename_and_flush_commands_behaviour() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 在 DB0: SET k v0
+    write_half
+        .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$2\r\nv0\r\n")
+        .await
+        .unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // RENAME k k2 -> OK, k 消失, k2 变为 v0
+    write_half
+        .write_all(b"*3\r\n$6\r\nRENAME\r\n$1\r\nk\r\n$2\r\nk2\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // GET k -> nil
+    write_half
+        .write_all(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "$-1\r\n");
+
+    // GET k2 -> v0
+    write_half
+        .write_all(b"*2\r\n$3\r\nGET\r\n$2\r\nk2\r\n")
+        .await
+        .unwrap();
+    let mut bulk_header = String::new();
+    let mut value = String::new();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(bulk_header, "$2\r\n");
+    assert_eq!(value, "v0\r\n");
+
+    // RENAME missing -> ERR no such key
+    write_half
+        .write_all(b"*3\r\n$6\r\nRENAME\r\n$7\r\nmissing\r\n$1\r\nx\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "-ERR no such key\r\n");
+
+    // 准备 RENAMENX: SET a 1, SET b 2
+    write_half
+        .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    write_half
+        .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // RENAMENX a b -> 0 (b 已存在)
+    write_half
+        .write_all(b"*3\r\n$8\r\nRENAMENX\r\n$1\r\na\r\n$1\r\nb\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":0\r\n");
+
+    // RENAMENX a c -> 1 (a -> c)
+    write_half
+        .write_all(b"*3\r\n$8\r\nRENAMENX\r\n$1\r\na\r\n$1\r\nc\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":1\r\n");
+
+    // 切换到 DB1
+    write_half
+        .write_all(b"*2\r\n$6\r\nSELECT\r\n$1\r\n1\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // 在 DB1: SET x v1
+    write_half
+        .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nx\r\n$2\r\nv1\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // FLUSHDB (当前 DB1)
+    write_half
+        .write_all(b"*1\r\n$7\r\nFLUSHDB\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // DB1 中 GET x -> nil
+    write_half
+        .write_all(b"*2\r\n$3\r\nGET\r\n$1\r\nx\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "$-1\r\n");
+
+    // 切回 DB0，确认在 FLUSHALL 前还有 key
+    write_half
+        .write_all(b"*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // DBSIZE 应该大于 0
+    write_half
+        .write_all(b"*1\r\n$6\r\nDBSIZE\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with(":"));
+
+    // FLUSHALL 清空所有 DB
+    write_half
+        .write_all(b"*1\r\n$8\r\nFLUSHALL\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    // DBSIZE 再次查看，应为 0
+    write_half
+        .write_all(b"*1\r\n$6\r\nDBSIZE\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":0\r\n");
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
@@ -354,8 +529,11 @@ async fn select_command_isolates_databases() {
 
 #[tokio::test]
 async fn prometheus_metrics_exporter_basic() {
-    // Enable metrics exporter on a fixed local port for this test.
-    env::set_var("REDUST_METRICS_ADDR", "127.0.0.1:9898");
+    // Enable metrics exporter on an available local port to avoid conflicts across tests.
+    let metrics_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind metrics port");
+    let metrics_addr = metrics_listener.local_addr().unwrap();
+    drop(metrics_listener);
+    env::set_var("REDUST_METRICS_ADDR", metrics_addr.to_string());
 
     let (addr, shutdown, handle) = spawn_server().await;
 
@@ -364,16 +542,30 @@ async fn prometheus_metrics_exporter_basic() {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    write_half
-        .write_all(b"*1\r\n$4\r\nPING\r\n")
-        .await
-        .unwrap();
+    write_half.write_all(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
     let mut line = String::new();
     reader.read_line(&mut line).await.unwrap();
     assert_eq!(line, "+PONG\r\n");
 
-    // Now scrape /metrics from the exporter.
-    let mut metrics_stream = TcpStream::connect("127.0.0.1:9898").await.unwrap();
+    // Now scrape /metrics from the exporter. 由于 metrics 监听与主服务器并行启动，
+    // 这里增加一个带最大重试次数的小循环，避免偶发的连接建立时序问题导致测试 flakiness。
+    let mut last_err = None;
+    let mut metrics_stream = None;
+    for _ in 0..20 {
+        match TcpStream::connect(metrics_addr).await {
+            Ok(s) => {
+                metrics_stream = Some(s);
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    let mut metrics_stream = metrics_stream
+        .unwrap_or_else(|| panic!("failed to connect to metrics exporter: {:?}", last_err));
     metrics_stream
         .write_all(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n")
         .await
@@ -383,7 +575,10 @@ async fn prometheus_metrics_exporter_basic() {
     {
         use tokio::io::AsyncReadExt;
         let mut reader = BufReader::new(metrics_stream); // reuse BufReader for HTTP response
-        reader.read_to_string(&mut buf).await.unwrap();
+        reader
+            .read_to_string(&mut buf)
+            .await
+            .expect("failed to read /metrics response");
     }
 
     assert!(buf.contains("redust_uptime_seconds"));
@@ -438,7 +633,9 @@ async fn lists_extended_commands() {
 
     // RPUSH mylist a b a c -> 4
     write_half
-        .write_all(b"*6\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\na\r\n$1\r\nc\r\n")
+        .write_all(
+            b"*6\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\na\r\n$1\r\nc\r\n",
+        )
         .await
         .unwrap();
     let mut line = String::new();
@@ -712,10 +909,7 @@ async fn info_basic_fields() {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    write_half
-        .write_all(b"*1\r\n$4\r\nINFO\r\n")
-        .await
-        .unwrap();
+    write_half.write_all(b"*1\r\n$4\r\nINFO\r\n").await.unwrap();
 
     let mut buf = String::new();
     // 读取若干行，直到 EOF 或已经包含我们关心的 Keyspace 行
@@ -1083,7 +1277,202 @@ async fn sets_union_behaviour() {
     }
 
     members.sort();
-    assert_eq!(members, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    assert_eq!(
+        members,
+        vec!["a".to_string(), "b".to_string(), "c".to_string()]
+    );
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn sets_store_and_random_commands() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // Prepare source sets
+    send_array(&mut write_half, &["SADD", "set1", "a", "b", "c"]).await;
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":3\r\n");
+
+    send_array(&mut write_half, &["SADD", "set2", "b", "c", "d"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":3\r\n");
+
+    // SUNIONSTORE dest set1 set2 -> 4 members
+    send_array(&mut write_half, &["SUNIONSTORE", "dest", "set1", "set2"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":4\r\n");
+
+    // SMEMBERS dest -> a, b, c, d (order not guaranteed)
+    send_array(&mut write_half, &["SMEMBERS", "dest"]).await;
+    let mut arr_header = String::new();
+    reader.read_line(&mut arr_header).await.unwrap();
+    assert_eq!(arr_header, "*4\r\n");
+    eprintln!("stage: smembers dest header");
+    let mut members = Vec::new();
+    for _ in 0..4 {
+        let mut bulk_header = String::new();
+        let mut value = String::new();
+        reader.read_line(&mut bulk_header).await.unwrap();
+        reader.read_line(&mut value).await.unwrap();
+        assert!(bulk_header.starts_with("$"));
+        members.push(value.trim_end_matches("\r\n").to_string());
+    }
+    members.sort();
+    assert_eq!(
+        members,
+        vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string()
+        ]
+    );
+    eprintln!("stage: union members read");
+
+    // Set a TTL on dest, then SINTERSTORE should drop the expiry
+    send_array(&mut write_half, &["PEXPIRE", "dest", "100"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":1\r\n");
+
+    send_array(&mut write_half, &["SINTERSTORE", "dest", "set1", "set2"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":2\r\n");
+
+    // PTTL dest should be -1 (no expiry) after store operation
+    send_array(&mut write_half, &["PTTL", "dest"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":-1\r\n");
+
+    // Members now should be intersection: b, c
+    send_array(&mut write_half, &["SMEMBERS", "dest"]).await;
+    arr_header.clear();
+    reader.read_line(&mut arr_header).await.unwrap();
+    assert_eq!(arr_header, "*2\r\n");
+    members.clear();
+    for _ in 0..2 {
+        let mut bulk_header = String::new();
+        let mut value = String::new();
+        reader.read_line(&mut bulk_header).await.unwrap();
+        reader.read_line(&mut value).await.unwrap();
+        members.push(value.trim_end_matches("\r\n").to_string());
+    }
+    members.sort();
+    assert_eq!(members, vec!["b".to_string(), "c".to_string()]);
+
+    // SDIFFSTORE dest set1 set2 -> a
+    send_array(&mut write_half, &["SDIFFSTORE", "dest", "set1", "set2"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":1\r\n");
+
+    send_array(&mut write_half, &["SMEMBERS", "dest"]).await;
+    arr_header.clear();
+    reader.read_line(&mut arr_header).await.unwrap();
+    assert_eq!(arr_header, "*1\r\n");
+    let mut bulk_header = String::new();
+    let mut value = String::new();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(value, "a\r\n");
+
+    // Wrongtype in source should error and keep dest unchanged
+    send_array(&mut write_half, &["SET", "strkey", "x"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    send_array(&mut write_half, &["SUNIONSTORE", "dest", "set1", "strkey"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(
+        line,
+        "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+    );
+
+    // dest should still hold the previous SDIFFSTORE result (a)
+    write_half
+        .write_all(b"*2\r\n$8\r\nSMEMBERS\r\n$4\r\ndest\r\n")
+        .await
+        .unwrap();
+    arr_header.clear();
+    reader.read_line(&mut arr_header).await.unwrap();
+    assert_eq!(arr_header, "*1\r\n");
+    bulk_header.clear();
+    value.clear();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(value, "a\r\n");
+
+    // SPOP with count should remove that many distinct members
+    send_array(&mut write_half, &["SADD", "popset", "x", "y", "z"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":3\r\n");
+
+    send_array(&mut write_half, &["SPOP", "popset", "2"]).await;
+    arr_header.clear();
+    reader.read_line(&mut arr_header).await.unwrap();
+    assert_eq!(arr_header, "*2\r\n");
+    // drain two bulk entries
+    for _ in 0..2 {
+        bulk_header.clear();
+        value.clear();
+        reader.read_line(&mut bulk_header).await.unwrap();
+        reader.read_line(&mut value).await.unwrap();
+        assert!(bulk_header.starts_with("$"));
+    }
+
+    send_array(&mut write_half, &["SCARD", "popset"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":1\r\n");
+
+    // Final SPOP should return the last element and empty the set
+    send_array(&mut write_half, &["SPOP", "popset"]).await;
+    bulk_header.clear();
+    value.clear();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut value).await.unwrap();
+    assert!(bulk_header.starts_with("$"));
+
+    send_array(&mut write_half, &["SCARD", "popset"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":0\r\n");
+
+    // SRANDMEMBER with negative count should return duplicates without mutation
+    send_array(&mut write_half, &["SADD", "randset", "a", "b", "c"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":3\r\n");
+
+    send_array(&mut write_half, &["SRANDMEMBER", "randset", "-5"]).await;
+    arr_header.clear();
+    reader.read_line(&mut arr_header).await.unwrap();
+    assert_eq!(arr_header, "*5\r\n");
+    for _ in 0..5 {
+        bulk_header.clear();
+        value.clear();
+        reader.read_line(&mut bulk_header).await.unwrap();
+        reader.read_line(&mut value).await.unwrap();
+        assert!(bulk_header.starts_with("$"));
+    }
+
+    send_array(&mut write_half, &["SCARD", "randset"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":3\r\n");
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
@@ -1405,10 +1794,7 @@ async fn continues_after_unknown_command() {
     reader.read_line(&mut error_line).await.unwrap();
     assert_eq!(error_line, "-ERR unknown command 'COMMAND DOCS'\r\n");
 
-    write_half
-        .write_all(b"*1\r\n$4\r\nPING\r\n")
-        .await
-        .unwrap();
+    write_half.write_all(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
     let mut pong = String::new();
     reader.read_line(&mut pong).await.unwrap();
     assert_eq!(pong, "+PONG\r\n");
@@ -1424,10 +1810,7 @@ async fn handles_quit_and_connection_close() {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    write_half
-        .write_all(b"*1\r\n$4\r\nQUIT\r\n")
-        .await
-        .unwrap();
+    write_half.write_all(b"*1\r\n$4\r\nQUIT\r\n").await.unwrap();
     let mut ok = String::new();
     reader.read_line(&mut ok).await.unwrap();
     assert_eq!(ok, "+OK\r\n");
@@ -1446,17 +1829,18 @@ async fn performance_ping_round_trips() {
     let iterations = 200;
     let start = Instant::now();
     for _ in 0..iterations {
-        write_half
-            .write_all(b"*1\r\n$4\r\nPING\r\n")
-            .await
-            .unwrap();
+        write_half.write_all(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
         assert_eq!(line, "+PONG\r\n");
         line.clear();
     }
     let elapsed = start.elapsed();
-    assert!(elapsed < Duration::from_secs(2), "Ping loop took too long: {:?}", elapsed);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "Ping loop took too long: {:?}",
+        elapsed
+    );
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();

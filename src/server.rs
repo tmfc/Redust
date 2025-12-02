@@ -1,21 +1,24 @@
-use std::future::Future;
-use std::sync::{Arc, atomic::{AtomicU64, AtomicUsize, Ordering}};
-use std::time::Instant;
+use std::collections::HashMap;
 use std::env;
+use std::future::Future;
+use std::sync::{
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+    Arc,
+};
+use std::time::Instant;
 
+use dashmap::DashMap;
 use tokio::io::{self, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{broadcast, mpsc};
 use tokio::time::sleep;
 
-use log::{info, error};
+use log::{error, info};
 
 use crate::command::{read_command, Command, CommandError}; // Import CommandError
 use crate::resp::{
-    respond_bulk_string,
+    respond_bulk_bytes, respond_bulk_string, respond_error, respond_integer, respond_null_bulk,
     respond_simple_string,
-    respond_error,
-    respond_integer,
-    respond_null_bulk,
 };
 use crate::storage::Storage;
 
@@ -24,6 +27,201 @@ struct Metrics {
     connected_clients: AtomicUsize,
     total_commands: AtomicU64,
     tcp_port: u16,
+    pubsub_channel_subs: AtomicU64,
+    pubsub_pattern_subs: AtomicU64,
+    pubsub_shard_subs: AtomicU64,
+    pubsub_messages_delivered: AtomicU64,
+    pubsub_messages_dropped: AtomicU64,
+}
+
+#[derive(Clone)]
+struct PubSubHub {
+    channels: Arc<DashMap<String, broadcast::Sender<PubMessage>>>,
+    patterns: Arc<DashMap<String, broadcast::Sender<PubMessage>>>,
+    shard_channels: Arc<DashMap<String, broadcast::Sender<PubMessage>>>,
+}
+
+const PUBSUB_BUFFER: usize = 128;
+
+impl PubSubHub {
+    fn new() -> Self {
+        PubSubHub {
+            channels: Arc::new(DashMap::new()),
+            patterns: Arc::new(DashMap::new()),
+            shard_channels: Arc::new(DashMap::new()),
+        }
+    }
+
+    fn subscribe_channel(&self, channel: &str) -> broadcast::Receiver<PubMessage> {
+        let tx = self
+            .channels
+            .entry(channel.to_string())
+            .or_insert_with(|| broadcast::channel(PUBSUB_BUFFER).0)
+            .clone();
+        tx.subscribe()
+    }
+
+    fn subscribe_pattern(&self, pattern: &str) -> broadcast::Receiver<PubMessage> {
+        let tx = self
+            .patterns
+            .entry(pattern.to_string())
+            .or_insert_with(|| broadcast::channel(PUBSUB_BUFFER).0)
+            .clone();
+        tx.subscribe()
+    }
+
+    fn subscribe_shard_channel(&self, channel: &str) -> broadcast::Receiver<PubMessage> {
+        let tx = self
+            .shard_channels
+            .entry(channel.to_string())
+            .or_insert_with(|| broadcast::channel(PUBSUB_BUFFER).0)
+            .clone();
+        tx.subscribe()
+    }
+
+    fn cleanup_stale(&self) {
+        let mut drop_channels = Vec::new();
+        for entry in self.channels.iter() {
+            if entry.value().receiver_count() == 0 {
+                drop_channels.push(entry.key().clone());
+            }
+        }
+        for ch in drop_channels {
+            self.channels.remove(&ch);
+        }
+
+        let mut drop_patterns = Vec::new();
+        for entry in self.patterns.iter() {
+            if entry.value().receiver_count() == 0 {
+                drop_patterns.push(entry.key().clone());
+            }
+        }
+        for pat in drop_patterns {
+            self.patterns.remove(&pat);
+        }
+
+        let mut drop_shard = Vec::new();
+        for entry in self.shard_channels.iter() {
+            if entry.value().receiver_count() == 0 {
+                drop_shard.push(entry.key().clone());
+            }
+        }
+        for ch in drop_shard {
+            self.shard_channels.remove(&ch);
+        }
+    }
+
+    fn publish(&self, channel: &str, payload: &[u8]) -> usize {
+        self.cleanup_stale();
+
+        let payload = Arc::new(payload.to_vec());
+        let mut delivered = 0usize;
+        let channel_name = channel.to_string();
+
+        if let Some(sender) = self.channels.get(channel) {
+            let message = PubMessage::Channel {
+                channel: channel_name.clone(),
+                payload: payload.clone(),
+            };
+            delivered += sender.send(message).unwrap_or(0);
+        }
+
+        for entry in self.patterns.iter() {
+            if pattern_match(entry.key(), channel) {
+                let message = PubMessage::Pattern {
+                    pattern: entry.key().clone(),
+                    channel: channel_name.clone(),
+                    payload: payload.clone(),
+                };
+                delivered += entry.value().send(message).unwrap_or(0);
+            }
+        }
+
+        delivered
+    }
+
+    fn publish_shard(&self, channel: &str, payload: &[u8]) -> usize {
+        self.cleanup_stale();
+
+        let payload = Arc::new(payload.to_vec());
+        if let Some(sender) = self.shard_channels.get(channel) {
+            let message = PubMessage::Channel {
+                channel: channel.to_string(),
+                payload,
+            };
+            sender.send(message).unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    fn active_channels(&self, pattern: Option<&str>) -> Vec<String> {
+        self.cleanup_stale();
+
+        let mut channels: Vec<String> = self
+            .channels
+            .iter()
+            .filter(|entry| entry.value().receiver_count() > 0)
+            .filter_map(|entry| {
+                let name = entry.key();
+                if let Some(pat) = pattern {
+                    if !pattern_match(pat, name) {
+                        return None;
+                    }
+                }
+                Some(name.clone())
+            })
+            .collect();
+        channels.sort();
+        channels
+    }
+
+    fn channel_subscribers(&self, channel: &str) -> usize {
+        self.cleanup_stale();
+
+        self.channels
+            .get(channel)
+            .map(|sender| sender.receiver_count())
+            .unwrap_or(0)
+    }
+
+    fn shard_channel_subscribers(&self, channel: &str) -> usize {
+        self.cleanup_stale();
+        self.shard_channels
+            .get(channel)
+            .map(|sender| sender.receiver_count())
+            .unwrap_or(0)
+    }
+
+    fn active_shard_channels(&self, pattern: Option<&str>) -> Vec<String> {
+        self.cleanup_stale();
+
+        let mut channels: Vec<String> = self
+            .shard_channels
+            .iter()
+            .filter(|entry| entry.value().receiver_count() > 0)
+            .filter_map(|entry| {
+                let name = entry.key();
+                if let Some(pat) = pattern {
+                    if !pattern_match(pat, name) {
+                        return None;
+                    }
+                }
+                Some(name.clone())
+            })
+            .collect();
+        channels.sort();
+        channels
+    }
+
+    fn pattern_subscription_count(&self) -> usize {
+        self.cleanup_stale();
+
+        self.patterns
+            .iter()
+            .map(|entry| entry.value().receiver_count())
+            .sum()
+    }
 }
 
 fn parse_maxmemory_bytes(input: &str) -> Option<u64> {
@@ -72,8 +270,89 @@ fn format_bytes(bytes: u64) -> String {
     format!("{}B", bytes)
 }
 
+fn pattern_match(pattern: &str, value: &str) -> bool {
+    fn match_set(p: &[u8], ch: u8) -> Option<(bool, usize)> {
+        let mut ranges: Vec<(u8, u8)> = Vec::new();
+        let mut i = 1; // skip '['
+        while i < p.len() {
+            if p[i] == b']' {
+                let matched = ranges.iter().any(|(s, e)| ch >= *s && ch <= *e);
+                return Some((matched, i + 1));
+            }
+
+            let mut start = p[i];
+            i += 1;
+            if start == b'\\' && i < p.len() {
+                start = p[i];
+                i += 1;
+            }
+
+            if i + 1 < p.len() && p[i] == b'-' {
+                let mut end = p[i + 1];
+                let mut consumed = 2;
+                if end == b'\\' && (i + 2) < p.len() {
+                    end = p[i + 2];
+                    consumed = 3;
+                }
+                ranges.push((start, end));
+                i += consumed;
+            } else {
+                ranges.push((start, start));
+            }
+        }
+        None
+    }
+
+    fn helper(pat: &[u8], pi: usize, val: &[u8], vi: usize) -> bool {
+        if pi == pat.len() {
+            return vi == val.len();
+        }
+        match pat[pi] {
+            b'*' => {
+                let mut i = vi;
+                while i <= val.len() {
+                    if helper(pat, pi + 1, val, i) {
+                        return true;
+                    }
+                    if i == val.len() {
+                        break;
+                    }
+                    i += 1;
+                }
+                false
+            }
+            b'?' => vi < val.len() && helper(pat, pi + 1, val, vi + 1),
+            b'\\' => {
+                if pi + 1 >= pat.len() || vi >= val.len() {
+                    false
+                } else if pat[pi + 1] == val[vi] {
+                    helper(pat, pi + 2, val, vi + 1)
+                } else {
+                    false
+                }
+            }
+            b'[' => {
+                if vi >= val.len() {
+                    return false;
+                }
+                if let Some((ok, next_pi)) = match_set(&pat[pi..], val[vi]) {
+                    ok && helper(pat, pi + next_pi, val, vi + 1)
+                } else {
+                    false
+                }
+            }
+            c => vi < val.len() && c == val[vi] && helper(pat, pi + 1, val, vi + 1),
+        }
+    }
+
+    helper(pattern.as_bytes(), 0, value.as_bytes(), 0)
+}
+
 fn current_max_value_bytes() -> Option<u64> {
-    env::var("REDUST_MAXVALUE_BYTES").ok().and_then(|s| parse_maxmemory_bytes(&s)).filter(|v| *v > 0)
+    env::var("REDUST_MAXVALUE_BYTES")
+        .ok()
+        .and_then(|s| parse_maxmemory_bytes(&s))
+        .filter(|v| *v > 0)
 }
 
 fn build_prometheus_metrics(storage: &Storage, metrics: &Metrics) -> String {
@@ -81,6 +360,11 @@ fn build_prometheus_metrics(storage: &Storage, metrics: &Metrics) -> String {
     let connected = metrics.connected_clients.load(Ordering::Relaxed);
     let total_cmds = metrics.total_commands.load(Ordering::Relaxed);
     let keys = storage.keys("*").len();
+    let pubsub_channels = metrics.pubsub_channel_subs.load(Ordering::Relaxed);
+    let pubsub_patterns = metrics.pubsub_pattern_subs.load(Ordering::Relaxed);
+    let pubsub_shards = metrics.pubsub_shard_subs.load(Ordering::Relaxed);
+    let pubsub_delivered = metrics.pubsub_messages_delivered.load(Ordering::Relaxed);
+    let pubsub_dropped = metrics.pubsub_messages_dropped.load(Ordering::Relaxed);
 
     let mut buf = String::new();
 
@@ -96,11 +380,157 @@ fn build_prometheus_metrics(storage: &Storage, metrics: &Metrics) -> String {
     buf.push_str("# TYPE redust_keyspace_keys gauge\n");
     buf.push_str(&format!("redust_keyspace_keys{{db=\"0\"}} {}\n", keys));
 
+    buf.push_str("# TYPE redust_pubsub_channel_subscriptions gauge\n");
+    buf.push_str(&format!(
+        "redust_pubsub_channel_subscriptions {}\n",
+        pubsub_channels
+    ));
+
+    buf.push_str("# TYPE redust_pubsub_pattern_subscriptions gauge\n");
+    buf.push_str(&format!(
+        "redust_pubsub_pattern_subscriptions {}\n",
+        pubsub_patterns
+    ));
+
+    buf.push_str("# TYPE redust_pubsub_shard_subscriptions gauge\n");
+    buf.push_str(&format!(
+        "redust_pubsub_shard_subscriptions {}\n",
+        pubsub_shards
+    ));
+
+    buf.push_str("# TYPE redust_pubsub_messages_delivered counter\n");
+    buf.push_str(&format!(
+        "redust_pubsub_messages_delivered {}\n",
+        pubsub_delivered
+    ));
+
+    buf.push_str("# TYPE redust_pubsub_messages_dropped counter\n");
+    buf.push_str(&format!(
+        "redust_pubsub_messages_dropped {}\n",
+        pubsub_dropped
+    ));
+
     buf
 }
 
 fn prefix_key(db: u8, key: &str) -> String {
     format!("{}:{}", db, key)
+}
+
+#[derive(Clone)]
+enum PubMessage {
+    Channel {
+        channel: String,
+        payload: Arc<Vec<u8>>,
+    },
+    Pattern {
+        pattern: String,
+        channel: String,
+        payload: Arc<Vec<u8>>,
+    },
+    Lagged,
+}
+
+#[derive(Clone, Copy)]
+enum PubSubOverflowStrategy {
+    Drop,
+    Disconnect,
+}
+
+async fn write_subscribe_event(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    kind: &str,
+    channel: &str,
+    count: usize,
+) -> io::Result<()> {
+    writer
+        .write_all(
+            format!(
+                "*3\r\n${}\r\n{}\r\n${}\r\n{}\r\n:{}\r\n",
+                kind.len(),
+                kind,
+                channel.len(),
+                channel,
+                count
+            )
+            .as_bytes(),
+        )
+        .await
+}
+
+async fn write_message_event(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    channel: &str,
+    payload: &[u8],
+) -> io::Result<()> {
+    writer
+        .write_all(
+            format!(
+                "*3\r\n$7\r\nmessage\r\n${}\r\n{}\r\n",
+                channel.len(),
+                channel
+            )
+            .as_bytes(),
+        )
+        .await?;
+    writer
+        .write_all(format!("${}\r\n", payload.len()).as_bytes())
+        .await?;
+    writer.write_all(payload).await?;
+    writer.write_all(b"\r\n").await
+}
+
+async fn write_pmessage_event(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    pattern: &str,
+    channel: &str,
+    payload: &[u8],
+) -> io::Result<()> {
+    writer
+        .write_all(
+            format!(
+                "*4\r\n$8\r\npmessage\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                pattern.len(),
+                pattern,
+                channel.len(),
+                channel
+            )
+            .as_bytes(),
+        )
+        .await?;
+    writer
+        .write_all(format!("${}\r\n", payload.len()).as_bytes())
+        .await?;
+    writer.write_all(payload).await?;
+    writer.write_all(b"\r\n").await
+}
+
+async fn write_pub_message_event(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    message: &PubMessage,
+) -> io::Result<()> {
+    match message {
+        PubMessage::Channel { channel, payload } => {
+            write_message_event(writer, channel, payload).await
+        }
+        PubMessage::Pattern {
+            pattern,
+            channel,
+            payload,
+        } => write_pmessage_event(writer, pattern, channel, payload).await,
+        PubMessage::Lagged => Ok(()),
+    }
+}
+
+async fn write_pong_event(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    payload: &[u8],
+) -> io::Result<()> {
+    writer
+        .write_all(format!("*2\r\n$4\r\npong\r\n${}\r\n", payload.len()).as_bytes())
+        .await?;
+    writer.write_all(payload).await?;
+    writer.write_all(b"\r\n").await
 }
 
 async fn handle_string_command(
@@ -113,124 +543,264 @@ async fn handle_string_command(
         Command::Ping => {
             respond_simple_string(writer, "PONG").await?;
         }
+        Command::PingWithPayload(payload) => {
+            respond_bulk_bytes(writer, &payload).await?;
+        }
         Command::Echo(value) => {
-            respond_bulk_string(writer, &value).await?;
+            respond_bulk_bytes(writer, &value).await?;
         }
         Command::Quit => {
             respond_simple_string(writer, "OK").await?;
         }
-        Command::Set { key, value, expire_millis } => {
+        Command::Set {
+            key,
+            value,
+            expire_millis,
+            nx,
+            xx,
+            keep_ttl,
+            get,
+        } => {
             let physical = prefix_key(current_db, &key);
+
+            // 长度限制
             if let Some(limit) = current_max_value_bytes() {
-                if (value.as_bytes().len() as u64) > limit {
+                if (value.len() as u64) > limit {
                     respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
                     return Ok(());
                 }
             }
-            storage.set(physical.clone(), value);
-            if let Some(ms) = expire_millis {
-                storage.expire_millis(&physical, ms);
+
+            // 获取旧值（字符串类型才有意义）
+            let old_value = storage.get(&physical);
+
+            // 若指定 KEEPTTL，则在覆盖前先读取剩余 TTL
+            let keep_ttl_ms = if keep_ttl {
+                let ttl = storage.pttl_millis(&physical);
+                if ttl > 0 {
+                    Some(ttl)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // 判断 key 是否存在（无论类型），用于 NX/XX
+            let existed = storage.type_of(&physical) != "none";
+
+            // 根据 NX / XX 判断是否写入
+            let should_write = if nx {
+                !existed
+            } else if xx {
+                existed
+            } else {
+                true
+            };
+
+            // 处理写入和 TTL
+            if should_write {
+                // 写入新值
+                storage.set(physical.clone(), value);
+
+                // TTL 处理优先级：
+                // 1. KEEPTTL：恢复旧 TTL（如果存在）
+                // 2. EX/PX：设置新的 TTL
+                // 3. 否则：清除已有 TTL
+                if let Some(ms) = keep_ttl_ms {
+                    storage.expire_millis(&physical, ms);
+                } else if let Some(ms) = expire_millis {
+                    storage.expire_millis(&physical, ms);
+                } else {
+                    let _ = storage.persist(&physical);
+                }
             }
-            respond_simple_string(writer, "OK").await?;
+
+            // 处理返回值
+            if get {
+                match old_value {
+                    Some(v) => respond_bulk_bytes(writer, &v).await?,
+                    None => respond_null_bulk(writer).await?,
+                }
+            } else if should_write {
+                respond_simple_string(writer, "OK").await?;
+            } else {
+                // 条件失败且无 GET 时，返回 null bulk（与 Redis 行为一致）
+                respond_null_bulk(writer).await?;
+            }
+        }
+        Command::Incrbyfloat { key, delta } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.incr_by_float(&physical, delta) {
+                Ok(value) => {
+                    let s = {
+                        let mut s = value.to_string();
+                        if s.contains('.') {
+                            while s.ends_with('0') {
+                                s.pop();
+                            }
+                            if s.ends_with('.') {
+                                s.push('0');
+                            }
+                        }
+                        s
+                    };
+                    respond_bulk_string(writer, &s).await?;
+                }
+                Err(_) => {
+                    respond_error(writer, "ERR value is not a valid float").await?;
+                }
+            }
         }
         Command::Get { key } => {
             let physical = prefix_key(current_db, &key);
             if let Some(value) = storage.get(&physical) {
-                respond_bulk_string(writer, &value).await?;
+                respond_bulk_bytes(writer, &value).await?;
             } else {
                 respond_null_bulk(writer).await?;
             }
         }
-        Command::Sunionstore { dest, keys } => {
-            let physical_keys: Vec<String> = keys
-                .into_iter()
-                .map(|k| prefix_key(current_db, &k))
-                .collect();
-            let physical_dest = prefix_key(current_db, &dest);
-            match storage.sunionstore(&physical_dest, &physical_keys) {
-                Ok(len) => {
-                    respond_integer(writer, len as i64).await?;
-                }
-                Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
-                }
-            }
-        }
-        Command::Sinterstore { dest, keys } => {
-            let physical_keys: Vec<String> = keys
-                .into_iter()
-                .map(|k| prefix_key(current_db, &k))
-                .collect();
-            let physical_dest = prefix_key(current_db, &dest);
-            match storage.sinterstore(&physical_dest, &physical_keys) {
-                Ok(len) => {
-                    respond_integer(writer, len as i64).await?;
-                }
-                Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
-                }
-            }
-        }
-        Command::Sdiffstore { dest, keys } => {
-            let physical_keys: Vec<String> = keys
-                .into_iter()
-                .map(|k| prefix_key(current_db, &k))
-                .collect();
-            let physical_dest = prefix_key(current_db, &dest);
-            match storage.sdiffstore(&physical_dest, &physical_keys) {
-                Ok(len) => {
-                    respond_integer(writer, len as i64).await?;
-                }
-                Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
-                }
-            }
-        }
-        Command::Spop { key, count } => {
+        Command::Getdel { key } => {
             let physical = prefix_key(current_db, &key);
-            match storage.spop(&physical, count) {
-                Ok(values) => {
-                    if count.is_none() {
-                        if let Some(v) = values.into_iter().next() {
-                            let resp = format!("${}\r\n{}\r\n", v.len(), v);
-                            writer.write_all(resp.as_bytes()).await?;
-                        } else {
-                            writer.write_all(b"$-1\r\n").await?;
-                        }
-                    } else {
-                        let mut resp = format!("*{}\r\n", values.len());
-                        for v in values {
-                            resp.push_str(&format!("${}\r\n{}\r\n", v.len(), v));
-                        }
-                        writer.write_all(resp.as_bytes()).await?;
+            match storage.getdel(&physical) {
+                Ok(Some(value)) => {
+                    respond_bulk_bytes(writer, &value).await?;
+                }
+                Ok(None) => {
+                    respond_null_bulk(writer).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Getex {
+            key,
+            expire_millis,
+            persist,
+        } => {
+            let physical = prefix_key(current_db, &key);
+
+            let value_opt = storage.get(&physical);
+
+            match value_opt {
+                Some(ref v) => {
+                    // 先返回当前值
+                    respond_bulk_bytes(writer, v).await?;
+
+                    // 然后根据选项更新 TTL
+                    if let Some(ms) = expire_millis {
+                        let _ = storage.expire_millis(&physical, ms);
+                    } else if persist {
+                        let _ = storage.persist(&physical);
                     }
                 }
-                Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                None => {
+                    // key 不存在/已过期: 返回 nil，不再尝试设置 TTL
+                    respond_null_bulk(writer).await?;
                 }
             }
         }
-        Command::Srandmember { key, count } => {
+        Command::Getrange { key, start, end } => {
             let physical = prefix_key(current_db, &key);
-            match storage.srandmember(&physical, count) {
-                Ok(values) => {
-                    if count.is_none() {
-                        if let Some(v) = values.into_iter().next() {
-                            let resp = format!("${}\r\n{}\r\n", v.len(), v);
-                            writer.write_all(resp.as_bytes()).await?;
-                        } else {
-                            writer.write_all(b"$-1\r\n").await?;
-                        }
-                    } else {
-                        let mut resp = format!("*{}\r\n", values.len());
-                        for v in values {
-                            resp.push_str(&format!("${}\r\n{}\r\n", v.len(), v));
-                        }
-                        writer.write_all(resp.as_bytes()).await?;
-                    }
+            match storage.getrange(&physical, start, end) {
+                Ok(s) => {
+                    respond_bulk_bytes(writer, &s).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Setrange { key, offset, value } => {
+            let physical = prefix_key(current_db, &key);
+            if let Some(limit) = current_max_value_bytes() {
+                if (value.len() as u64) > limit {
+                    respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                    return Ok(());
+                }
+            }
+
+            match storage.setrange(&physical, offset, &value) {
+                Ok(len) => {
+                    respond_integer(writer, len as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Append { key, value } => {
+            let physical = prefix_key(current_db, &key);
+            if let Some(limit) = current_max_value_bytes() {
+                if (value.len() as u64) > limit {
+                    respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                    return Ok(());
+                }
+            }
+
+            match storage.append(&physical, &value) {
+                Ok(new_len) => {
+                    respond_integer(writer, new_len as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Strlen { key } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.strlen(&physical) {
+                Ok(len) => {
+                    respond_integer(writer, len as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Getset { key, value } => {
+            let physical = prefix_key(current_db, &key);
+            if let Some(limit) = current_max_value_bytes() {
+                if (value.len() as u64) > limit {
+                    respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                    return Ok(());
+                }
+            }
+
+            match storage.getset(&physical, value) {
+                Ok(Some(old)) => {
+                    respond_bulk_bytes(writer, &old).await?;
+                }
+                Ok(None) => {
+                    respond_null_bulk(writer).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -279,52 +849,85 @@ async fn handle_string_command(
             }
         }
         Command::Del { keys } => {
-            let physical: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
+            let physical: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
             let removed = storage.del(&physical);
             respond_integer(writer, removed as i64).await?;
         }
         Command::Exists { keys } => {
-            let physical: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
+            let physical: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
             let count = storage.exists(&physical);
             respond_integer(writer, count as i64).await?;
         }
         Command::Mget { keys } => {
-            let physical: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
+            let physical: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
             let values = storage.mget(&physical);
-            let mut response = format!("*{}\r\n", values.len());
+            writer
+                .write_all(format!("*{}\r\n", values.len()).as_bytes())
+                .await?;
             for v in values {
                 match v {
                     Some(s) => {
-                        response.push_str(&format!("${}\r\n{}\r\n", s.len(), s));
+                        writer
+                            .write_all(format!("${}\r\n", s.len()).as_bytes())
+                            .await?;
+                        writer.write_all(&s).await?;
+                        writer.write_all(b"\r\n").await?;
                     }
                     None => {
-                        response.push_str("$-1\r\n");
+                        writer.write_all(b"$-1\r\n").await?;
                     }
                 }
             }
-            writer.write_all(response.as_bytes()).await?;
         }
         Command::Mset { pairs } => {
             if let Some(limit) = current_max_value_bytes() {
                 for (_k, v) in pairs.iter() {
-                    if (v.as_bytes().len() as u64) > limit {
+                    if (v.len() as u64) > limit {
                         respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
                         return Ok(());
                     }
                 }
             }
 
-            let mapped: Vec<(String, String)> = pairs
+            let mapped: Vec<(String, Vec<u8>)> = pairs
                 .into_iter()
                 .map(|(k, v)| (prefix_key(current_db, &k), v))
                 .collect();
             storage.mset(&mapped);
             respond_simple_string(writer, "OK").await?;
         }
+        Command::Msetnx { pairs } => {
+            if let Some(limit) = current_max_value_bytes() {
+                for (_k, v) in pairs.iter() {
+                    if (v.len() as u64) > limit {
+                        respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                        return Ok(());
+                    }
+                }
+            }
+
+            let mapped: Vec<(String, Vec<u8>)> = pairs
+                .into_iter()
+                .map(|(k, v)| (prefix_key(current_db, &k), v))
+                .collect();
+
+            let ok = storage.msetnx(&mapped);
+            let v = if ok { 1 } else { 0 };
+            respond_integer(writer, v).await?;
+        }
         Command::Setnx { key, value } => {
             let physical = prefix_key(current_db, &key);
             if let Some(limit) = current_max_value_bytes() {
-                if (value.as_bytes().len() as u64) > limit {
+                if (value.len() as u64) > limit {
                     respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
                     return Ok(());
                 }
@@ -333,10 +936,14 @@ async fn handle_string_command(
             let v = if inserted { 1 } else { 0 };
             respond_integer(writer, v).await?;
         }
-        Command::Setex { key, seconds, value } => {
+        Command::Setex {
+            key,
+            seconds,
+            value,
+        } => {
             let physical = prefix_key(current_db, &key);
             if let Some(limit) = current_max_value_bytes() {
-                if (value.as_bytes().len() as u64) > limit {
+                if (value.len() as u64) > limit {
                     respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
                     return Ok(());
                 }
@@ -347,7 +954,7 @@ async fn handle_string_command(
         Command::Psetex { key, millis, value } => {
             let physical = prefix_key(current_db, &key);
             if let Some(limit) = current_max_value_bytes() {
-                if (value.as_bytes().len() as u64) > limit {
+                if (value.len() as u64) > limit {
                     respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
                     return Ok(());
                 }
@@ -383,7 +990,11 @@ async fn handle_list_command(
                     respond_integer(writer, len as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -398,7 +1009,11 @@ async fn handle_list_command(
                     writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -413,7 +1028,11 @@ async fn handle_list_command(
                     writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -435,7 +1054,11 @@ async fn handle_list_command(
                     writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -454,7 +1077,11 @@ async fn handle_list_command(
                     respond_integer(writer, len as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -469,7 +1096,11 @@ async fn handle_list_command(
                     writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -483,7 +1114,11 @@ async fn handle_list_command(
                     respond_null_bulk(writer).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -497,7 +1132,11 @@ async fn handle_list_command(
                     respond_null_bulk(writer).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -508,7 +1147,11 @@ async fn handle_list_command(
                     respond_integer(writer, len as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -522,7 +1165,11 @@ async fn handle_list_command(
                     respond_null_bulk(writer).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -533,7 +1180,11 @@ async fn handle_list_command(
                     respond_integer(writer, removed as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -544,7 +1195,11 @@ async fn handle_list_command(
                     respond_simple_string(writer, "OK").await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -576,7 +1231,11 @@ async fn handle_set_command(
                     respond_integer(writer, added as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -587,7 +1246,11 @@ async fn handle_set_command(
                     respond_integer(writer, removed as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -602,7 +1265,11 @@ async fn handle_set_command(
                     writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -613,7 +1280,11 @@ async fn handle_set_command(
                     respond_integer(writer, card as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -625,12 +1296,19 @@ async fn handle_set_command(
                     respond_integer(writer, v).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
         Command::Sunion { keys } => {
-            let physical: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
+            let physical: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
             match storage.sunion(&physical) {
                 Ok(members) => {
                     let mut response = format!("*{}\r\n", members.len());
@@ -640,12 +1318,19 @@ async fn handle_set_command(
                     writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
         Command::Sinter { keys } => {
-            let physical: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
+            let physical: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
             match storage.sinter(&physical) {
                 Ok(members) => {
                     let mut response = format!("*{}\r\n", members.len());
@@ -655,12 +1340,19 @@ async fn handle_set_command(
                     writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
         Command::Sdiff { keys } => {
-            let physical: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
+            let physical: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
             match storage.sdiff(&physical) {
                 Ok(members) => {
                     let mut response = format!("*{}\r\n", members.len());
@@ -670,7 +1362,68 @@ async fn handle_set_command(
                     writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Sunionstore { dest, keys } => {
+            let physical_keys: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
+            let physical_dest = prefix_key(current_db, &dest);
+            match storage.sunionstore(&physical_dest, &physical_keys) {
+                Ok(len) => {
+                    respond_integer(writer, len as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Sinterstore { dest, keys } => {
+            let physical_keys: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
+            let physical_dest = prefix_key(current_db, &dest);
+            match storage.sinterstore(&physical_dest, &physical_keys) {
+                Ok(len) => {
+                    respond_integer(writer, len as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Sdiffstore { dest, keys } => {
+            let physical_keys: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
+            let physical_dest = prefix_key(current_db, &dest);
+            match storage.sdiffstore(&physical_dest, &physical_keys) {
+                Ok(len) => {
+                    respond_integer(writer, len as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -697,33 +1450,39 @@ async fn handle_set_command(
                     }
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
         Command::Srandmember { key, count } => {
             let physical = prefix_key(current_db, &key);
             match storage.srandmember(&physical, count) {
-                Ok(members) => {
-                    match count {
-                        None => {
-                            if let Some(m) = members.into_iter().next() {
-                                respond_bulk_string(writer, &m).await?;
-                            } else {
-                                respond_null_bulk(writer).await?;
-                            }
-                        }
-                        Some(_) => {
-                            let mut response = format!("*{}\r\n", members.len());
-                            for m in members {
-                                response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
-                            }
-                            writer.write_all(response.as_bytes()).await?;
+                Ok(members) => match count {
+                    None => {
+                        if let Some(m) = members.into_iter().next() {
+                            respond_bulk_string(writer, &m).await?;
+                        } else {
+                            respond_null_bulk(writer).await?;
                         }
                     }
-                }
+                    Some(_) => {
+                        let mut response = format!("*{}\r\n", members.len());
+                        for m in members {
+                            response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
+                        }
+                        writer.write_all(response.as_bytes()).await?;
+                    }
+                },
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -753,7 +1512,11 @@ async fn handle_hash_command(
                     respond_integer(writer, added as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -767,7 +1530,11 @@ async fn handle_hash_command(
                     respond_null_bulk(writer).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -778,7 +1545,11 @@ async fn handle_hash_command(
                     respond_integer(writer, removed as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -790,7 +1561,11 @@ async fn handle_hash_command(
                     respond_integer(writer, v).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -806,7 +1581,11 @@ async fn handle_hash_command(
                     writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -821,7 +1600,11 @@ async fn handle_hash_command(
                     writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -836,7 +1619,11 @@ async fn handle_hash_command(
                     writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -859,7 +1646,11 @@ async fn handle_hash_command(
                     writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -871,7 +1662,11 @@ async fn handle_hash_command(
                     respond_integer(writer, value).await?;
                 }
                 Err(crate::storage::HincrError::WrongType) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
                 Err(crate::storage::HincrError::NotInteger) => {
                     respond_error(writer, "ERR hash value is not an integer").await?;
@@ -884,6 +1679,37 @@ async fn handle_hash_command(
                 }
             }
         }
+        Command::Hincrbyfloat { key, field, delta } => {
+            let physical = prefix_key(current_db, &key);
+            let max = current_max_value_bytes();
+            match storage.hincr_by_float(&physical, &field, delta, max) {
+                Ok(value) => {
+                    let mut s = value.to_string();
+                    if s.contains('.') {
+                        while s.ends_with('0') {
+                            s.pop();
+                        }
+                        if s.ends_with('.') {
+                            s.push('0');
+                        }
+                    }
+                    respond_bulk_string(writer, &s).await?;
+                }
+                Err(crate::storage::HincrFloatError::WrongType) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::HincrFloatError::NotFloat) => {
+                    respond_error(writer, "ERR hash value is not a valid float").await?;
+                }
+                Err(crate::storage::HincrFloatError::MaxValueExceeded) => {
+                    respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                }
+            }
+        }
         Command::Hlen { key } => {
             let physical = prefix_key(current_db, &key);
             match storage.hlen(&physical) {
@@ -891,7 +1717,11 @@ async fn handle_hash_command(
                     respond_integer(writer, len as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -975,6 +1805,41 @@ async fn handle_key_meta_command(
             let count = all.into_iter().filter(|k| k.starts_with(&prefix)).count();
             respond_integer(writer, count as i64).await?;
         }
+        Command::Rename { key, newkey } => {
+            let from = prefix_key(current_db, &key);
+            let to = prefix_key(current_db, &newkey);
+            match storage.rename(&from, &to) {
+                Ok(()) => {
+                    respond_simple_string(writer, "OK").await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "ERR no such key").await?;
+                }
+            }
+        }
+        Command::Renamenx { key, newkey } => {
+            let from = prefix_key(current_db, &key);
+            let to = prefix_key(current_db, &newkey);
+            match storage.renamenx(&from, &to) {
+                Ok(true) => {
+                    respond_integer(writer, 1).await?;
+                }
+                Ok(false) => {
+                    respond_integer(writer, 0).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "ERR no such key").await?;
+                }
+            }
+        }
+        Command::Flushdb => {
+            storage.flushdb(current_db);
+            respond_simple_string(writer, "OK").await?;
+        }
+        Command::Flushall => {
+            storage.flushall();
+            respond_simple_string(writer, "OK").await?;
+        }
         _ => {}
     }
 
@@ -1007,6 +1872,26 @@ async fn handle_info_command(
     info.push_str(&format!("connected_clients:{}\r\n", connected));
     info.push_str("\r\n# Stats\r\n");
     info.push_str(&format!("total_commands_processed:{}\r\n", total_cmds));
+    info.push_str(&format!(
+        "pubsub_channel_subscriptions:{}\r\n",
+        metrics.pubsub_channel_subs.load(Ordering::Relaxed)
+    ));
+    info.push_str(&format!(
+        "pubsub_pattern_subscriptions:{}\r\n",
+        metrics.pubsub_pattern_subs.load(Ordering::Relaxed)
+    ));
+    info.push_str(&format!(
+        "pubsub_shard_subscriptions:{}\r\n",
+        metrics.pubsub_shard_subs.load(Ordering::Relaxed)
+    ));
+    info.push_str(&format!(
+        "pubsub_messages_delivered:{}\r\n",
+        metrics.pubsub_messages_delivered.load(Ordering::Relaxed)
+    ));
+    info.push_str(&format!(
+        "pubsub_messages_dropped:{}\r\n",
+        metrics.pubsub_messages_dropped.load(Ordering::Relaxed)
+    ));
     info.push_str("\r\n# Keyspace\r\n");
 
     let all_keys = storage.keys("*");
@@ -1069,7 +1954,11 @@ async fn handle_metrics_connection(
     Ok(())
 }
 
-async fn run_metrics_exporter(bind_addr: &str, storage: Storage, metrics: Arc<Metrics>) -> io::Result<()> {
+async fn run_metrics_exporter(
+    bind_addr: &str,
+    storage: Storage,
+    metrics: Arc<Metrics>,
+) -> io::Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
     info!("[metrics] exporter listening on {}", listener.local_addr()?);
 
@@ -1086,7 +1975,13 @@ async fn run_metrics_exporter(bind_addr: &str, storage: Storage, metrics: Arc<Me
     }
 }
 
-async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Metrics>) -> io::Result<()> {
+async fn handle_connection(
+    stream: TcpStream,
+    storage: Storage,
+    metrics: Arc<Metrics>,
+    pubsub: PubSubHub,
+    overflow_strategy: PubSubOverflowStrategy,
+) -> io::Result<()> {
     let peer_addr = stream.peer_addr().ok();
     info!("[conn] new connection from {:?}", peer_addr);
 
@@ -1096,11 +1991,34 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
     let mut reader = BufReader::new(read_half);
     let mut current_db: u8 = 0;
 
-    let auth_password = env::var("REDUST_AUTH_PASSWORD").ok().filter(|s| !s.is_empty());
+    let auth_password = env::var("REDUST_AUTH_PASSWORD")
+        .ok()
+        .filter(|s| !s.is_empty());
     let mut authenticated = auth_password.is_none();
+    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<PubMessage>();
+    let mut channel_subscriptions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut pattern_subscriptions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut shard_subscriptions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut subscribed_mode = false;
 
     loop {
-        let cmd_result = read_command(&mut reader).await;
+        let cmd_result = if subscribed_mode {
+            tokio::select! {
+                maybe_msg = msg_rx.recv() => {
+                    if let Some(msg) = maybe_msg {
+                        if let PubMessage::Lagged = msg {
+                            break;
+                        }
+                        write_pub_message_event(&mut write_half, &msg).await?;
+                        continue;
+                    }
+                    read_command(&mut reader).await
+                }
+                cmd = read_command(&mut reader) => cmd,
+            }
+        } else {
+            read_command(&mut reader).await
+        };
         let cmd = match cmd_result {
             Ok(Some(command)) => command,
             Ok(None) => break, // Connection closed or no more data
@@ -1136,11 +2054,15 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
                         authenticated = true;
                         respond_simple_string(&mut write_half, "OK").await?;
                     } else {
-                        respond_error(&mut write_half, "WRONGPASS invalid username-password pair or user is disabled").await?;
+                        respond_error(
+                            &mut write_half,
+                            "WRONGPASS invalid username-password pair or user is disabled",
+                        )
+                        .await?;
                     }
                     continue;
                 }
-                Command::Ping | Command::Echo(_) | Command::Quit => {
+                Command::Ping | Command::PingWithPayload(_) | Command::Echo(_) | Command::Quit => {
                     // 这些命令在未认证时仍然允许
                 }
                 _ => {
@@ -1156,20 +2078,59 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
             continue;
         }
 
+        if subscribed_mode {
+            match cmd {
+                Command::Subscribe { .. }
+                | Command::Unsubscribe { .. }
+                | Command::Ssubscribe { .. }
+                | Command::Sunsubscribe { .. }
+                | Command::Psubscribe { .. }
+                | Command::Punsubscribe { .. }
+                | Command::Ping
+                | Command::PingWithPayload(_)
+                | Command::Quit => {}
+                _ => {
+                    respond_error(&mut write_half, "ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context").await?;
+                    continue;
+                }
+            }
+            match cmd {
+                Command::Ping => {
+                    write_pong_event(&mut write_half, b"").await?;
+                    continue;
+                }
+                Command::PingWithPayload(payload) => {
+                    write_pong_event(&mut write_half, &payload).await?;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
         match cmd {
             // string / generic key-value 命令
             Command::Ping
+            | Command::PingWithPayload(_)
             | Command::Echo(_)
             | Command::Set { .. }
             | Command::Get { .. }
+            | Command::Getdel { .. }
+            | Command::Getex { .. }
+            | Command::Getrange { .. }
+            | Command::Setrange { .. }
+            | Command::Append { .. }
+            | Command::Strlen { .. }
+            | Command::Getset { .. }
             | Command::Incr { .. }
             | Command::Decr { .. }
             | Command::Incrby { .. }
             | Command::Decrby { .. }
+            | Command::Incrbyfloat { .. }
             | Command::Del { .. }
             | Command::Exists { .. }
             | Command::Mget { .. }
             | Command::Mset { .. }
+            | Command::Msetnx { .. }
             | Command::Setnx { .. }
             | Command::Setex { .. }
             | Command::Psetex { .. } => {
@@ -1221,6 +2182,7 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
             | Command::Hvals { .. }
             | Command::Hmget { .. }
             | Command::Hincrby { .. }
+            | Command::Hincrbyfloat { .. }
             | Command::Hlen { .. } => {
                 handle_hash_command(cmd, &storage, &mut write_half, current_db).await?;
             }
@@ -1233,7 +2195,11 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
             | Command::Persist { .. }
             | Command::Type { .. }
             | Command::Keys { .. }
-            | Command::Dbsize => {
+            | Command::Dbsize
+            | Command::Rename { .. }
+            | Command::Renamenx { .. }
+            | Command::Flushdb
+            | Command::Flushall => {
                 handle_key_meta_command(cmd, &storage, &mut write_half, current_db).await?;
             }
 
@@ -1247,6 +2213,324 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
                 current_db = db;
                 respond_simple_string(&mut write_half, "OK").await?;
             }
+            // Pub/Sub 发布
+            Command::Publish { channel, message } => {
+                if let Some(limit) = current_max_value_bytes() {
+                    if (message.len() as u64) > limit {
+                        respond_error(&mut write_half, "ERR value exceeds REDUST_MAXVALUE_BYTES")
+                            .await?;
+                        continue;
+                    }
+                }
+                let receivers = pubsub.publish(&channel, &message);
+                metrics
+                    .pubsub_messages_delivered
+                    .fetch_add(receivers as u64, Ordering::Relaxed);
+                respond_integer(&mut write_half, receivers as i64).await?;
+            }
+            Command::Spublish { channel, message } => {
+                if let Some(limit) = current_max_value_bytes() {
+                    if (message.len() as u64) > limit {
+                        respond_error(&mut write_half, "ERR value exceeds REDUST_MAXVALUE_BYTES")
+                            .await?;
+                        continue;
+                    }
+                }
+                let receivers = pubsub.publish_shard(&channel, &message);
+                metrics
+                    .pubsub_messages_delivered
+                    .fetch_add(receivers as u64, Ordering::Relaxed);
+                respond_integer(&mut write_half, receivers as i64).await?;
+            }
+            // Pub/Sub 订阅
+            Command::Subscribe { channels } => {
+                for channel in channels {
+                    if !channel_subscriptions.contains_key(&channel) {
+                        let mut rx = pubsub.subscribe_channel(&channel);
+                        let tx = msg_tx.clone();
+                        let metrics_clone = metrics.clone();
+                        let handle = tokio::spawn(async move {
+                            loop {
+                                match rx.recv().await {
+                                    Ok(message) => {
+                                        let _ = tx.send(message);
+                                    }
+                                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                                        metrics_clone
+                                            .pubsub_messages_dropped
+                                            .fetch_add(n as u64, Ordering::Relaxed);
+                                        if matches!(
+                                            overflow_strategy,
+                                            PubSubOverflowStrategy::Disconnect
+                                        ) {
+                                            let _ = tx.send(PubMessage::Lagged);
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    Err(broadcast::error::RecvError::Closed) => {
+                                        if matches!(
+                                            overflow_strategy,
+                                            PubSubOverflowStrategy::Disconnect
+                                        ) {
+                                            let _ = tx.send(PubMessage::Lagged);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                        channel_subscriptions.insert(channel.clone(), handle);
+                        metrics.pubsub_channel_subs.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let count = channel_subscriptions.len()
+                        + pattern_subscriptions.len()
+                        + shard_subscriptions.len();
+                    write_subscribe_event(&mut write_half, "subscribe", &channel, count).await?;
+                }
+                subscribed_mode = (channel_subscriptions.len()
+                    + pattern_subscriptions.len()
+                    + shard_subscriptions.len())
+                    > 0;
+            }
+            Command::Unsubscribe { channels } => {
+                let targets: Vec<String> = if channels.is_empty() {
+                    let mut v: Vec<String> = channel_subscriptions.keys().cloned().collect();
+                    v.sort();
+                    v
+                } else {
+                    channels
+                };
+
+                if targets.is_empty() {
+                    let count = channel_subscriptions.len()
+                        + pattern_subscriptions.len()
+                        + shard_subscriptions.len();
+                    write_subscribe_event(&mut write_half, "unsubscribe", "", count).await?;
+                } else {
+                    for ch in targets {
+                        if let Some(handle) = channel_subscriptions.remove(&ch) {
+                            handle.abort();
+                            metrics.pubsub_channel_subs.fetch_sub(1, Ordering::Relaxed);
+                        }
+                        let count = channel_subscriptions.len()
+                            + pattern_subscriptions.len()
+                            + shard_subscriptions.len();
+                        write_subscribe_event(&mut write_half, "unsubscribe", &ch, count).await?;
+                    }
+                }
+                subscribed_mode = (channel_subscriptions.len()
+                    + pattern_subscriptions.len()
+                    + shard_subscriptions.len())
+                    > 0;
+                pubsub.cleanup_stale();
+            }
+            Command::Ssubscribe { channels } => {
+                for channel in channels {
+                    if !shard_subscriptions.contains_key(&channel) {
+                        let mut rx = pubsub.subscribe_shard_channel(&channel);
+                        let tx = msg_tx.clone();
+                        let metrics_clone = metrics.clone();
+                        let handle = tokio::spawn(async move {
+                            loop {
+                                match rx.recv().await {
+                                    Ok(message) => {
+                                        let _ = tx.send(message);
+                                    }
+                                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                                        metrics_clone
+                                            .pubsub_messages_dropped
+                                            .fetch_add(n as u64, Ordering::Relaxed);
+                                        if matches!(
+                                            overflow_strategy,
+                                            PubSubOverflowStrategy::Disconnect
+                                        ) {
+                                            let _ = tx.send(PubMessage::Lagged);
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    Err(broadcast::error::RecvError::Closed) => {
+                                        if matches!(
+                                            overflow_strategy,
+                                            PubSubOverflowStrategy::Disconnect
+                                        ) {
+                                            let _ = tx.send(PubMessage::Lagged);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                        shard_subscriptions.insert(channel.clone(), handle);
+                        metrics.pubsub_shard_subs.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let count = channel_subscriptions.len()
+                        + pattern_subscriptions.len()
+                        + shard_subscriptions.len();
+                    write_subscribe_event(&mut write_half, "ssubscribe", &channel, count).await?;
+                }
+                subscribed_mode = (channel_subscriptions.len()
+                    + pattern_subscriptions.len()
+                    + shard_subscriptions.len())
+                    > 0;
+            }
+            Command::Sunsubscribe { channels } => {
+                let targets: Vec<String> = if channels.is_empty() {
+                    let mut v: Vec<String> = shard_subscriptions.keys().cloned().collect();
+                    v.sort();
+                    v
+                } else {
+                    channels
+                };
+
+                if targets.is_empty() {
+                    let count = channel_subscriptions.len()
+                        + pattern_subscriptions.len()
+                        + shard_subscriptions.len();
+                    write_subscribe_event(&mut write_half, "sunsubscribe", "", count).await?;
+                } else {
+                    for ch in targets {
+                        if let Some(handle) = shard_subscriptions.remove(&ch) {
+                            handle.abort();
+                            metrics.pubsub_shard_subs.fetch_sub(1, Ordering::Relaxed);
+                        }
+                        let count = channel_subscriptions.len()
+                            + pattern_subscriptions.len()
+                            + shard_subscriptions.len();
+                        write_subscribe_event(&mut write_half, "sunsubscribe", &ch, count).await?;
+                    }
+                }
+                subscribed_mode = (channel_subscriptions.len()
+                    + pattern_subscriptions.len()
+                    + shard_subscriptions.len())
+                    > 0;
+                pubsub.cleanup_stale();
+            }
+            // 模式订阅
+            Command::Psubscribe { patterns } => {
+                for pattern in patterns {
+                    if !pattern_subscriptions.contains_key(&pattern) {
+                        let mut rx = pubsub.subscribe_pattern(&pattern);
+                        let tx = msg_tx.clone();
+                        let metrics_clone = metrics.clone();
+                        let handle = tokio::spawn(async move {
+                            loop {
+                                match rx.recv().await {
+                                    Ok(message) => {
+                                        let _ = tx.send(message);
+                                    }
+                                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                                        metrics_clone
+                                            .pubsub_messages_dropped
+                                            .fetch_add(n as u64, Ordering::Relaxed);
+                                        if matches!(
+                                            overflow_strategy,
+                                            PubSubOverflowStrategy::Disconnect
+                                        ) {
+                                            let _ = tx.send(PubMessage::Lagged);
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    Err(broadcast::error::RecvError::Closed) => {
+                                        if matches!(
+                                            overflow_strategy,
+                                            PubSubOverflowStrategy::Disconnect
+                                        ) {
+                                            let _ = tx.send(PubMessage::Lagged);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                        pattern_subscriptions.insert(pattern.clone(), handle);
+                        metrics.pubsub_pattern_subs.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let count = channel_subscriptions.len() + pattern_subscriptions.len();
+                    write_subscribe_event(&mut write_half, "psubscribe", &pattern, count).await?;
+                }
+                subscribed_mode = (channel_subscriptions.len() + pattern_subscriptions.len()) > 0;
+            }
+            Command::Punsubscribe { patterns } => {
+                let targets: Vec<String> = if patterns.is_empty() {
+                    let mut v: Vec<String> = pattern_subscriptions.keys().cloned().collect();
+                    v.sort();
+                    v
+                } else {
+                    patterns
+                };
+
+                if targets.is_empty() {
+                    let count = channel_subscriptions.len() + pattern_subscriptions.len();
+                    write_subscribe_event(&mut write_half, "punsubscribe", "", count).await?;
+                } else {
+                    for pat in targets {
+                        if let Some(handle) = pattern_subscriptions.remove(&pat) {
+                            handle.abort();
+                            metrics.pubsub_pattern_subs.fetch_sub(1, Ordering::Relaxed);
+                        }
+                        let count = channel_subscriptions.len() + pattern_subscriptions.len();
+                        write_subscribe_event(&mut write_half, "punsubscribe", &pat, count).await?;
+                    }
+                }
+                subscribed_mode = (channel_subscriptions.len() + pattern_subscriptions.len()) > 0;
+                pubsub.cleanup_stale();
+            }
+            Command::PubsubChannels { pattern } => {
+                let channels = pubsub.active_channels(pattern.as_deref());
+                let header = format!("*{}\r\n", channels.len());
+                write_half.write_all(header.as_bytes()).await?;
+                for ch in channels {
+                    respond_bulk_string(&mut write_half, &ch).await?;
+                }
+            }
+            Command::PubsubNumsub { channels } => {
+                let header = format!("*{}\r\n", channels.len() * 2);
+                write_half.write_all(header.as_bytes()).await?;
+                for ch in channels {
+                    respond_bulk_string(&mut write_half, &ch).await?;
+                    let subscribers = pubsub.channel_subscribers(&ch);
+                    respond_integer(&mut write_half, subscribers as i64).await?;
+                }
+            }
+            Command::PubsubNumpat => {
+                let total = pubsub.pattern_subscription_count();
+                respond_integer(&mut write_half, total as i64).await?;
+            }
+            Command::PubsubShardchannels { pattern } => {
+                let channels = pubsub.active_shard_channels(pattern.as_deref());
+                let header = format!("*{}\r\n", channels.len());
+                write_half.write_all(header.as_bytes()).await?;
+                for ch in channels {
+                    respond_bulk_string(&mut write_half, &ch).await?;
+                }
+            }
+            Command::PubsubShardnumsub { channels } => {
+                let header = format!("*{}\r\n", channels.len() * 2);
+                write_half.write_all(header.as_bytes()).await?;
+                for ch in channels {
+                    respond_bulk_string(&mut write_half, &ch).await?;
+                    let subscribers = pubsub.shard_channel_subscribers(&ch);
+                    respond_integer(&mut write_half, subscribers as i64).await?;
+                }
+            }
+            Command::PubsubHelp => {
+                let lines = [
+                    "PUBSUB <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                    "CHANNELS [<pattern>] -- Return the currently active channels matching a pattern (default: all).",
+                    "NUMSUB [<channel> ...] -- Return the number of subscribers for the specified channels.",
+                    "NUMPAT -- Return the number of subscriptions to patterns.",
+                    "SHARDCHANNELS [<pattern>] -- Return the currently active shard channels.",
+                    "SHARDNUMSUB [<channel> ...] -- Return the number of subscribers for shard channels.",
+                ];
+                let header = format!("*{}\r\n", lines.len());
+                write_half.write_all(header.as_bytes()).await?;
+                for line in lines {
+                    respond_bulk_string(&mut write_half, line).await?;
+                }
+            }
 
             Command::Auth { .. } => {
                 unreachable!();
@@ -1259,12 +2543,41 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
 
             // 未知命令
             Command::Unknown(parts) => {
-                let joined = parts.join(" ");
+                let joined = parts
+                    .iter()
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 let msg = format!("ERR unknown command '{}'", joined);
                 respond_error(&mut write_half, &msg).await?;
             }
         }
     }
+
+    let chan_len = channel_subscriptions.len();
+    for (_, handle) in channel_subscriptions.drain() {
+        handle.abort();
+    }
+    let pat_len = pattern_subscriptions.len();
+    for (_, handle) in pattern_subscriptions.drain() {
+        handle.abort();
+    }
+    let shard_len = shard_subscriptions.len();
+    for (_, handle) in shard_subscriptions.drain() {
+        handle.abort();
+    }
+
+    metrics
+        .pubsub_channel_subs
+        .fetch_sub(chan_len as u64, Ordering::Relaxed);
+    metrics
+        .pubsub_pattern_subs
+        .fetch_sub(pat_len as u64, Ordering::Relaxed);
+    metrics
+        .pubsub_shard_subs
+        .fetch_sub(shard_len as u64, Ordering::Relaxed);
+
+    pubsub.cleanup_stale();
 
     metrics.connected_clients.fetch_sub(1, Ordering::Relaxed);
 
@@ -1335,14 +2648,22 @@ pub async fn serve(
         connected_clients: AtomicUsize::new(0),
         total_commands: AtomicU64::new(0),
         tcp_port: port,
+        pubsub_channel_subs: AtomicU64::new(0),
+        pubsub_pattern_subs: AtomicU64::new(0),
+        pubsub_shard_subs: AtomicU64::new(0),
+        pubsub_messages_delivered: AtomicU64::new(0),
+        pubsub_messages_dropped: AtomicU64::new(0),
     });
+    let pubsub = PubSubHub::new();
 
     if let Ok(metrics_addr) = env::var("REDUST_METRICS_ADDR") {
         if !metrics_addr.is_empty() {
             let storage_clone = storage.clone();
             let metrics_clone = metrics.clone();
             tokio::spawn(async move {
-                if let Err(e) = run_metrics_exporter(&metrics_addr, storage_clone, metrics_clone).await {
+                if let Err(e) =
+                    run_metrics_exporter(&metrics_addr, storage_clone, metrics_clone).await
+                {
                     error!("[metrics] exporter failed: {}", e);
                 }
             });
@@ -1355,9 +2676,17 @@ pub async fn serve(
                 let (stream, addr) = res?;
                 let storage = storage.clone();
                 let metrics = metrics.clone();
+                let pubsub = pubsub.clone();
+                let overflow_strategy = match env::var("REDUST_PUBSUB_OVERFLOW") {
+                    Ok(v) => match v.to_ascii_lowercase().as_str() {
+                        "disconnect" => PubSubOverflowStrategy::Disconnect,
+                        _ => PubSubOverflowStrategy::Drop,
+                    },
+                    Err(_) => PubSubOverflowStrategy::Drop,
+                };
                 info!("Accepted connection from {}", addr);
                 tokio::spawn(async move {
-                    if let Err(err) = handle_connection(stream, storage, metrics).await {
+                    if let Err(err) = handle_connection(stream, storage, metrics, pubsub, overflow_strategy).await {
                         error!("Connection error: {}", err);
                     }
                 });

@@ -16,18 +16,16 @@ fn temp_path(name: &str) -> PathBuf {
 async fn rdb_basic_roundtrip_via_storage() {
     let storage = Storage::default();
 
-    storage.set("foo".to_string(), "bar".to_string());
+    storage.set("foo".to_string(), b"bar".to_vec());
     storage
         .lpush("mylist", &vec!["a".to_string(), "b".to_string()])
         .unwrap();
     storage
         .sadd("myset", &vec!["x".to_string(), "y".to_string()])
         .unwrap();
-    storage
-        .hset("myhash", "field", "val".to_string())
-        .unwrap();
+    storage.hset("myhash", "field", "val".to_string()).unwrap();
 
-    storage.set("ttl_key".to_string(), "tv".to_string());
+    storage.set("ttl_key".to_string(), b"tv".to_vec());
     let _ = storage.expire_seconds("ttl_key", 10);
 
     let path = temp_path("roundtrip");
@@ -36,7 +34,7 @@ async fn rdb_basic_roundtrip_via_storage() {
     let restored = Storage::default();
     restored.load_rdb(&path).unwrap();
 
-    assert_eq!(restored.get("foo").as_deref(), Some("bar"));
+    assert_eq!(restored.get("foo").as_deref(), Some("bar".as_bytes()));
 
     let lvals = restored.lrange("mylist", 0, -1).unwrap();
     // Redis 语义：LPUSH mylist a b -> 列表内容为 ["b", "a"]
@@ -58,7 +56,7 @@ async fn rdb_basic_roundtrip_via_storage() {
 #[tokio::test]
 async fn rdb_does_not_restore_expired_keys() {
     let storage = Storage::default();
-    storage.set("k".to_string(), "v".to_string());
+    storage.set("k".to_string(), b"v".to_vec());
     let _ = storage.expire_millis("k", 1);
 
     std::thread::sleep(std::time::Duration::from_millis(5));

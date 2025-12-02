@@ -5,18 +5,18 @@ use tokio::sync::oneshot;
 
 use redust::server::serve;
 
-async fn spawn_server(
-) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<tokio::io::Result<()>>) {
+async fn spawn_server() -> (
+    SocketAddr,
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<tokio::io::Result<()>>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
     let addr = listener.local_addr().expect("local addr");
     let (tx, rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
-        serve(
-            listener,
-            async move {
-                let _ = rx.await;
-            },
-        )
+        serve(listener, async move {
+            let _ = rx.await;
+        })
         .await
     });
     (addr, tx, handle)
@@ -118,10 +118,8 @@ async fn redis_rs_hash_commands_roundtrip() {
     assert_eq!(v, "value");
 
     // HGETALL myhash -> map 中包含 field/value
-    let map: std::collections::HashMap<String, String> = conn
-        .hgetall("myhash")
-        .await
-        .expect("HGETALL via redis-rs");
+    let map: std::collections::HashMap<String, String> =
+        conn.hgetall("myhash").await.expect("HGETALL via redis-rs");
     assert_eq!(map.get("field").map(String::as_str), Some("value"));
 
     shutdown.send(()).unwrap();

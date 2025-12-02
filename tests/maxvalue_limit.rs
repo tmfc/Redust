@@ -9,18 +9,18 @@ use redust::server::serve;
 mod env_guard;
 use env_guard::{set_env, ENV_LOCK};
 
-async fn spawn_server(
-) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<tokio::io::Result<()>>) {
+async fn spawn_server() -> (
+    SocketAddr,
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<tokio::io::Result<()>>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
     let addr = listener.local_addr().expect("local addr");
     let (tx, rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
-        serve(
-            listener,
-            async move {
-                let _ = rx.await;
-            },
-        )
+        serve(listener, async move {
+            let _ = rx.await;
+        })
         .await
     });
     (addr, tx, handle)
@@ -36,7 +36,10 @@ impl TestClient {
         let stream = TcpStream::connect(addr).await.unwrap();
         let (read_half, write_half) = stream.into_split();
         let reader = BufReader::new(read_half);
-        TestClient { reader, writer: write_half }
+        TestClient {
+            reader,
+            writer: write_half,
+        }
     }
 
     async fn send_array(&mut self, parts: &[&str]) {
@@ -95,7 +98,9 @@ async fn hincrby_respects_limit() {
     assert_eq!(line, ":1\r\n");
 
     // 多次 HINCRBY 使结果变为 10000（长度 5），超过 4 字节限制
-    client.send_array(&["HINCRBY", "numhash", "f", "9991"]).await;
+    client
+        .send_array(&["HINCRBY", "numhash", "f", "9991"])
+        .await;
     let line = client.read_simple_line().await;
     assert!(line.starts_with("-ERR value exceeds REDUST_MAXVALUE_BYTES"));
 
@@ -112,7 +117,9 @@ async fn mset_respects_limit() {
     let mut client = TestClient::connect(addr).await;
 
     // v1 ok, v2 too large
-    client.send_array(&["MSET", "a", "12345678", "b", "123456789"]).await;
+    client
+        .send_array(&["MSET", "a", "12345678", "b", "123456789"])
+        .await;
     let line = client.read_simple_line().await;
     assert!(line.starts_with("-ERR value exceeds REDUST_MAXVALUE_BYTES"));
 
