@@ -114,6 +114,39 @@ async fn subscribe_and_receive_publish() {
 }
 
 #[tokio::test]
+async fn ssubscribe_and_spublish() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let mut sub = RespClient::connect(addr).await;
+    let mut pub_client = RespClient::connect(addr).await;
+
+    sub.send_array(&[b"SSUBSCRIBE", b"news"]).await;
+    let ack = sub.read_array().await;
+    assert_eq!(ack[0], b"ssubscribe");
+    assert_eq!(ack[1], b"news");
+    assert_eq!(ack[2], b"1");
+
+    pub_client
+        .send_array(&[b"SPUBLISH", b"news", b"hello shard"])
+        .await;
+    let receivers = pub_client.read_integer().await;
+    assert_eq!(receivers, 1);
+
+    let message = sub.read_array().await;
+    assert_eq!(message[0], b"message");
+    assert_eq!(message[1], b"news");
+    assert_eq!(message[2], b"hello shard");
+
+    sub.send_array(&[b"SUNSUBSCRIBE"]).await;
+    let unsub = sub.read_array().await;
+    assert_eq!(unsub[0], b"sunsubscribe");
+    assert_eq!(unsub[2], b"0");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn unsubscribe_leaves_sub_mode() {
     let (addr, shutdown, handle) = spawn_server().await;
     let mut client = RespClient::connect(addr).await;
@@ -150,6 +183,12 @@ async fn subscribe_mode_restricts_commands_and_supports_ping() {
     let pong = client.read_array().await;
     assert_eq!(pong[0], b"pong");
     assert_eq!(pong[1], b"");
+
+    // PING with payload echoes payload
+    client.send_array(&[b"PING", b"hi"]).await;
+    let pong2 = client.read_array().await;
+    assert_eq!(pong2[0], b"pong");
+    assert_eq!(pong2[1], b"hi");
 
     // Non-allowed command should error
     client.send_array(&[b"SET", b"foo", b"bar"]).await;
@@ -209,6 +248,16 @@ async fn punsubscribe_allows_commands_again() {
     client.reader.read_line(&mut line).await.unwrap();
     assert_eq!(line, "+PONG\r\n");
 
+    client.send_array(&[b"PING", b"hi"]).await;
+    let mut bulk = String::new();
+    client.reader.read_line(&mut bulk).await.unwrap();
+    assert_eq!(bulk, "$2\r\n");
+    let mut payload = vec![0u8; 2];
+    client.reader.read_exact(&mut payload).await.unwrap();
+    let mut crlf = [0u8; 2];
+    client.reader.read_exact(&mut crlf).await.unwrap();
+    assert_eq!(payload, b"hi");
+
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
 }
@@ -219,12 +268,16 @@ async fn pubsub_introspection_counts_channels_and_patterns() {
 
     let mut sub1 = RespClient::connect(addr).await;
     let mut sub2 = RespClient::connect(addr).await;
+    let mut sub3 = RespClient::connect(addr).await;
 
     sub1.send_array(&[b"SUBSCRIBE", b"alpha"]).await;
     let _ = sub1.read_array().await;
 
     sub2.send_array(&[b"PSUBSCRIBE", b"a*"]).await;
     let _ = sub2.read_array().await;
+
+    sub3.send_array(&[b"SSUBSCRIBE", b"alpha"]).await;
+    let _ = sub3.read_array().await;
 
     let mut client = RespClient::connect(addr).await;
     client.send_array(&[b"PUBSUB", b"CHANNELS"]).await;
@@ -257,8 +310,33 @@ async fn pubsub_introspection_counts_channels_and_patterns() {
     let numpat = client.read_integer().await;
     assert_eq!(numpat, 1);
 
+    // Shard introspection currently reuses active channels / zeros
+    client
+        .send_array(&[b"PUBSUB", b"SHARDCHANNELS", b"a*"])
+        .await;
+    let shard_channels = client.read_array().await;
+    assert_eq!(shard_channels, vec![b"alpha".to_vec()]);
+
+    client
+        .send_array(&[b"PUBSUB", b"SHARDNUMSUB", b"alpha", b"beta"])
+        .await;
+    let shard_counts = client.read_array().await;
+    assert_eq!(
+        shard_counts,
+        vec![
+            b"alpha".to_vec(),
+            b"1".to_vec(),
+            b"beta".to_vec(),
+            b"0".to_vec()
+        ]
+    );
+
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
+
+    drop(sub1);
+    drop(sub2);
+    drop(sub3);
 }
 
 #[tokio::test]
@@ -337,6 +415,53 @@ async fn unsubscribe_without_args_sends_one_event_per_channel() {
         final_evt,
         vec![b"punsubscribe".to_vec(), b"p*".to_vec(), b"0".to_vec()]
     );
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn psubscribe_supports_glob_sets_and_escapes() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let mut sub = RespClient::connect(addr).await;
+    let mut pub_client = RespClient::connect(addr).await;
+
+    sub.send_array(&[b"PSUBSCRIBE", b"n[ae]ws?"]).await;
+    let _ = sub.read_array().await;
+
+    pub_client
+        .send_array(&[b"PUBLISH", b"news1", b"hello"])
+        .await;
+    let _ = pub_client.read_integer().await;
+
+    pub_client.send_array(&[b"PUBLISH", b"naws2", b"hi"]).await;
+    let _ = pub_client.read_integer().await;
+
+    // should not match
+    pub_client
+        .send_array(&[b"PUBLISH", b"nbws2", b"skip"])
+        .await;
+    let _ = pub_client.read_integer().await;
+
+    let first = sub.read_array().await;
+    let second = sub.read_array().await;
+    assert_eq!(first[0], b"pmessage");
+    assert_eq!(second[0], b"pmessage");
+    assert_ne!(first[2], second[2]); // matched two different channels
+
+    // Escape should match literal '*'
+    sub.send_array(&[b"PUNSUBSCRIBE", b"n[ae]ws?"]).await;
+    let _ = sub.read_array().await;
+    sub.send_array(&[b"PSUBSCRIBE", b"literal\\*"]).await;
+    let _ = sub.read_array().await;
+    pub_client
+        .send_array(&[b"PUBLISH", b"literal*", b"ok"])
+        .await;
+    let _ = pub_client.read_integer().await;
+    let msg = sub.read_array().await;
+    assert_eq!(msg[2], b"literal*");
+    assert_eq!(msg[3], b"ok");
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();

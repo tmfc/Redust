@@ -11,7 +11,7 @@ Redust 是一个使用 Rust 编写的、兼容 Redis 协议的轻量级服务。
     - Lists：`LPUSH`、`RPUSH`、`LPOP`、`RPOP`、`LRANGE` 等。
     - Sets：`SADD`、`SREM`、`SMEMBERS`、`SCARD`、`SISMEMBER`、`SUNION`、`SINTER`、`SDIFF`，支持 `SPOP` / `SRANDMEMBER` 以及 `SUNIONSTORE` / `SINTERSTORE` / `SDIFFSTORE`。
     - Hashes：`HSET`、`HGET`、`HGETALL`、`HDEL`、`HEXISTS`、`HINCRBY` 等常用命令。
-    - Pub/Sub：`PUBLISH`、`SUBSCRIBE`/`PSUBSCRIBE`、`UNSUBSCRIBE`/`PUNSUBSCRIBE`，以及 `PUBSUB CHANNELS|NUMSUB|NUMPAT`。
+    - Pub/Sub：`PUBLISH`、`SUBSCRIBE`/`PSUBSCRIBE`、`UNSUBSCRIBE`/`PUNSUBSCRIBE`，分片版 `SPUBLISH`/`SSUBSCRIBE`/`SUNSUBSCRIBE`，以及 `PUBSUB CHANNELS|NUMSUB|NUMPAT|SHARDCHANNELS|SHARDNUMSUB`。
   - 更完整、实时的命令支持情况请参考仓库根目录的 `command.md`。
   - 协议层基于 RESP2，实现了数组解析与 Bulk String 编解码。
 - **异步高并发**：基于 Tokio 运行时，每个 TCP 连接在独立任务中处理，支持多客户端并发访问同一存储。

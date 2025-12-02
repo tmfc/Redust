@@ -4,27 +4,20 @@
 
 ---
 
-## 当前聚焦的小类工作（从 roadmap 挑选）
+## 当前聚焦的小类工作（Pub/Sub 差异清单）
 
-- [x] **统一日志框架替代 println!（日志与可观测性）**
-  - 目标：用一个简单的日志库替换当前散落在各处的 `println!` / `eprintln!`，至少支持日志等级（info/warn/error）和模块前缀（如 [conn] / [resp] / [rdb]）。
-  - 初版范围：只在 server 启动、连接处理、RDB 加载/保存、metrics 导出等关键路径接入，不做复杂配置系统。
+- [x] **分片 Pub/Sub（Redis 7 SHARD 系列）**
+  - 已支持 `SSUBSCRIBE` / `SUNSUBSCRIBE` / `SPUBLISH`，复用现有 hub 发送 `message` 事件；`PUBSUB SHARDCHANNELS/SHARDNUMSUB` 也已返回订阅列表与计数。
 
-- [x] **扩展客户端兼容性测试（redis-cli / go-redis 子集）**（已在 `future.md` 中登记为后续工作）
-  - 目标：在现有 redis-rs 端到端测试基础上，增加一组基于 `redis-cli` 与 Go `go-redis` 的基础命令回归，用于发现协议/行为差异。
-  - 初版范围：覆盖 string（SET/GET/INCR）、list（RPUSH/LRANGE）、hash（HSET/HGET/HGETALL）和基本过期命令（EXPIRE/TTL）。
+- [x] **PUBSUB 子命令补全**
+  - 已补充 HELP / SHARDCHANNELS / SHARDNUMSUB，保持与 Redis 接口一致（SHARD 系列当前返回本地订阅结果）。
 
-- [x] **在现有类型上补常用命令（Hash & Set & SET 扩展）**
-  - Hash：`HINCRBY` / `HLEN` / `HKEYS` / `HVALS` / `HMGET` 等高频命令已补全，并有端到端测试覆盖。
-  - Set：补充 `SPOP` / `SRANDMEMBER` / `SUNIONSTORE` / `SINTERSTORE` / `SDIFFSTORE` 等操作，完善集合读写与运算语义。
-  - SET 扩展：从未来规划中提前实现完整 `SET` 选项组合，支持 `NX` / `XX` / `KEEPTTL` / `GET` 等，并与现有 EX/PX 实现对齐 Redis 行为。
+- [x] **订阅模式下 PING 兼容性**
+  - 已支持携带 payload 的 `PING`，订阅模式下返回 `pong <payload>`，并添加端到端测试覆盖。
 
-- [x] **Pub/Sub MVP（SUBSCRIBE / UNSUBSCRIBE / PUBLISH 子集）**
-  - 已实现：channel 级订阅与广播、订阅模式下命令限制、`subscribe`/`unsubscribe`/`message` 事件、订阅模式的 `PING`。
-  - 后续扩展（向 Redis 对齐）：
-    - [x] 模式订阅：`PSUBSCRIBE` / `PUNSUBSCRIBE`，推送 `pmessage` 事件。
-    - [x] 查询命令：`PUBSUB CHANNELS|NUMSUB|NUMPAT`，含 pattern 统计。
-    - [x] 订阅生命周期：连接关闭后自动退订，空 channel / pattern 订阅回收。
-    - [x] 兼容性细节：`UNSUBSCRIBE` 无参数时的返回形态、多 channel 退订的计数一致性测试。
-    - [x] backpressure：广播缓冲策略改为跳过滞后的消息并保持订阅，新增慢订阅者回归测试。
-    - [x] AUTH 交互：未认证禁止发布/订阅，认证后保持订阅。
+- [ ] **投递与缓冲策略对齐 Redis**
+  - 现状：滞后时直接丢弃旧消息以保持订阅；Redis 使用输出缓冲策略（可能阻塞或断开）。
+  - 目标：实现可配置的输出缓冲/断开策略，并暴露观察指标。
+
+- [x] **指标与观测**
+  - 已在 Prometheus/INFO 暴露订阅数量、分片订阅数量，以及消息投递/丢弃计数。

@@ -34,6 +34,7 @@ impl std::error::Error for CommandError {}
 #[derive(Debug)]
 pub enum Command {
     Ping,
+    PingWithPayload(Binary),
     Echo(Binary),
     Quit,
     Set {
@@ -297,6 +298,12 @@ pub enum Command {
     Unsubscribe {
         channels: Vec<String>,
     },
+    Ssubscribe {
+        channels: Vec<String>,
+    },
+    Sunsubscribe {
+        channels: Vec<String>,
+    },
     Psubscribe {
         patterns: Vec<String>,
     },
@@ -307,6 +314,10 @@ pub enum Command {
         channel: String,
         message: Binary,
     },
+    Spublish {
+        channel: String,
+        message: Binary,
+    },
     PubsubChannels {
         pattern: Option<String>,
     },
@@ -314,6 +325,13 @@ pub enum Command {
         channels: Vec<String>,
     },
     PubsubNumpat,
+    PubsubShardchannels {
+        pattern: Option<String>,
+    },
+    PubsubShardnumsub {
+        channels: Vec<String>,
+    },
+    PubsubHelp,
     Unknown(Vec<Binary>),
     /// Represents an error that should be sent back to the client.
     Error(String),
@@ -387,10 +405,14 @@ pub async fn read_command(
     };
     let cmd = match upper.as_str() {
         "PING" => {
-            if iter.next().is_some() {
-                return Ok(Some(err_wrong_args("ping")));
+            if let Some(payload) = iter.next() {
+                if iter.next().is_some() {
+                    return Ok(Some(err_wrong_args("ping")));
+                }
+                Command::PingWithPayload(payload)
+            } else {
+                Command::Ping
             }
-            Command::Ping
         }
         "ECHO" => {
             let Some(value) = iter.next() else {
@@ -1682,6 +1704,29 @@ pub async fn read_command(
             }
             Command::Unsubscribe { channels }
         }
+        "SSUBSCRIBE" => {
+            let mut channels = Vec::new();
+            for b in iter {
+                match parse_bulk_string(b) {
+                    Ok(c) => channels.push(c),
+                    Err(e) => return Ok(Some(e)),
+                }
+            }
+            if channels.is_empty() {
+                return Ok(Some(err_wrong_args("ssubscribe")));
+            }
+            Command::Ssubscribe { channels }
+        }
+        "SUNSUBSCRIBE" => {
+            let mut channels = Vec::new();
+            for b in iter {
+                match parse_bulk_string(b) {
+                    Ok(c) => channels.push(c),
+                    Err(e) => return Ok(Some(e)),
+                }
+            }
+            Command::Sunsubscribe { channels }
+        }
         "PSUBSCRIBE" => {
             let mut patterns = Vec::new();
             for b in iter {
@@ -1720,6 +1765,22 @@ pub async fn read_command(
                 Err(e) => return Ok(Some(e)),
             };
             Command::Publish { channel, message }
+        }
+        "SPUBLISH" => {
+            let Some(channel_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("spublish")));
+            };
+            let Some(message) = iter.next() else {
+                return Ok(Some(err_wrong_args("spublish")));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("spublish")));
+            }
+            let channel = match parse_bulk_string(channel_bytes) {
+                Ok(c) => c,
+                Err(e) => return Ok(Some(e)),
+            };
+            Command::Spublish { channel, message }
         }
         "PUBSUB" => {
             let Some(subcmd_bytes) = iter.next() else {
@@ -1761,6 +1822,37 @@ pub async fn read_command(
                         return Ok(Some(err_pubsub_args()));
                     }
                     Command::PubsubNumpat
+                }
+                "SHARDCHANNELS" => {
+                    let pattern = if let Some(pat_bytes) = iter.next() {
+                        let pat = match parse_bulk_string(pat_bytes) {
+                            Ok(p) => p,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        if iter.next().is_some() {
+                            return Ok(Some(err_pubsub_args()));
+                        }
+                        Some(pat)
+                    } else {
+                        None
+                    };
+                    Command::PubsubShardchannels { pattern }
+                }
+                "SHARDNUMSUB" => {
+                    let mut channels = Vec::new();
+                    for b in iter {
+                        match parse_bulk_string(b) {
+                            Ok(c) => channels.push(c),
+                            Err(e) => return Ok(Some(e)),
+                        }
+                    }
+                    Command::PubsubShardnumsub { channels }
+                }
+                "HELP" => {
+                    if iter.next().is_some() {
+                        return Ok(Some(err_pubsub_args()));
+                    }
+                    Command::PubsubHelp
                 }
                 _ => return Ok(Some(err_pubsub_args())),
             }
@@ -1921,9 +2013,14 @@ mod tests {
                 .write_all(b"*2\r\n$7\r\nCOMMAND\r\n$4\r\nDOCS\r\n")
                 .await
                 .unwrap();
-            // Test too many arguments for PING
+            // Test payload for PING
             stream
                 .write_all(b"*2\r\n$4\r\nPING\r\n$1\r\nX\r\n")
+                .await
+                .unwrap();
+            // Test too many arguments for PING
+            stream
+                .write_all(b"*3\r\n$4\r\nPING\r\n$1\r\nY\r\n$1\r\nZ\r\n")
                 .await
                 .unwrap();
             // Test too few arguments for ECHO
@@ -1975,7 +2072,18 @@ mod tests {
             panic!("expected Unknown command");
         }
 
-        // PING X (Error)
+        // PING X payload
+        if let Some(cmd) = read_command(&mut reader).await.unwrap() {
+            if let Command::PingWithPayload(p) = cmd {
+                assert_eq!(p, b"X".to_vec());
+            } else {
+                panic!("expected PING with payload");
+            }
+        } else {
+            panic!("expected PING payload command");
+        }
+
+        // PING with too many args -> Error
         if let Some(cmd) = read_command(&mut reader).await.unwrap() {
             if let Command::Error(msg) = cmd {
                 assert_eq!(msg, "ERR wrong number of arguments for 'ping' command");

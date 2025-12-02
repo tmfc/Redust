@@ -27,12 +27,18 @@ struct Metrics {
     connected_clients: AtomicUsize,
     total_commands: AtomicU64,
     tcp_port: u16,
+    pubsub_channel_subs: AtomicU64,
+    pubsub_pattern_subs: AtomicU64,
+    pubsub_shard_subs: AtomicU64,
+    pubsub_messages_delivered: AtomicU64,
+    pubsub_messages_dropped: AtomicU64,
 }
 
 #[derive(Clone)]
 struct PubSubHub {
     channels: Arc<DashMap<String, broadcast::Sender<PubMessage>>>,
     patterns: Arc<DashMap<String, broadcast::Sender<PubMessage>>>,
+    shard_channels: Arc<DashMap<String, broadcast::Sender<PubMessage>>>,
 }
 
 impl PubSubHub {
@@ -40,6 +46,7 @@ impl PubSubHub {
         PubSubHub {
             channels: Arc::new(DashMap::new()),
             patterns: Arc::new(DashMap::new()),
+            shard_channels: Arc::new(DashMap::new()),
         }
     }
 
@@ -56,6 +63,15 @@ impl PubSubHub {
         let tx = self
             .patterns
             .entry(pattern.to_string())
+            .or_insert_with(|| broadcast::channel(1024).0)
+            .clone();
+        tx.subscribe()
+    }
+
+    fn subscribe_shard_channel(&self, channel: &str) -> broadcast::Receiver<PubMessage> {
+        let tx = self
+            .shard_channels
+            .entry(channel.to_string())
             .or_insert_with(|| broadcast::channel(1024).0)
             .clone();
         tx.subscribe()
@@ -80,6 +96,16 @@ impl PubSubHub {
         }
         for pat in drop_patterns {
             self.patterns.remove(&pat);
+        }
+
+        let mut drop_shard = Vec::new();
+        for entry in self.shard_channels.iter() {
+            if entry.value().receiver_count() == 0 {
+                drop_shard.push(entry.key().clone());
+            }
+        }
+        for ch in drop_shard {
+            self.shard_channels.remove(&ch);
         }
     }
 
@@ -112,6 +138,21 @@ impl PubSubHub {
         delivered
     }
 
+    fn publish_shard(&self, channel: &str, payload: &[u8]) -> usize {
+        self.cleanup_stale();
+
+        let payload = Arc::new(payload.to_vec());
+        if let Some(sender) = self.shard_channels.get(channel) {
+            let message = PubMessage::Channel {
+                channel: channel.to_string(),
+                payload,
+            };
+            sender.send(message).unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
     fn active_channels(&self, pattern: Option<&str>) -> Vec<String> {
         self.cleanup_stale();
 
@@ -140,6 +181,35 @@ impl PubSubHub {
             .get(channel)
             .map(|sender| sender.receiver_count())
             .unwrap_or(0)
+    }
+
+    fn shard_channel_subscribers(&self, channel: &str) -> usize {
+        self.cleanup_stale();
+        self.shard_channels
+            .get(channel)
+            .map(|sender| sender.receiver_count())
+            .unwrap_or(0)
+    }
+
+    fn active_shard_channels(&self, pattern: Option<&str>) -> Vec<String> {
+        self.cleanup_stale();
+
+        let mut channels: Vec<String> = self
+            .shard_channels
+            .iter()
+            .filter(|entry| entry.value().receiver_count() > 0)
+            .filter_map(|entry| {
+                let name = entry.key();
+                if let Some(pat) = pattern {
+                    if !pattern_match(pat, name) {
+                        return None;
+                    }
+                }
+                Some(name.clone())
+            })
+            .collect();
+        channels.sort();
+        channels
     }
 
     fn pattern_subscription_count(&self) -> usize {
@@ -199,20 +269,81 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn pattern_match(pattern: &str, value: &str) -> bool {
-    fn helper(pattern: &[u8], value: &[u8]) -> bool {
-        if pattern.is_empty() {
-            return value.is_empty();
-        }
-        match pattern[0] {
-            b'*' => {
-                helper(&pattern[1..], value) || (!value.is_empty() && helper(pattern, &value[1..]))
+    fn match_set(p: &[u8], ch: u8) -> Option<(bool, usize)> {
+        let mut ranges: Vec<(u8, u8)> = Vec::new();
+        let mut i = 1; // skip '['
+        while i < p.len() {
+            if p[i] == b']' {
+                let matched = ranges.iter().any(|(s, e)| ch >= *s && ch <= *e);
+                return Some((matched, i + 1));
             }
-            b'?' => !value.is_empty() && helper(&pattern[1..], &value[1..]),
-            c => !value.is_empty() && c == value[0] && helper(&pattern[1..], &value[1..]),
+
+            let mut start = p[i];
+            i += 1;
+            if start == b'\\' && i < p.len() {
+                start = p[i];
+                i += 1;
+            }
+
+            if i + 1 < p.len() && p[i] == b'-' {
+                let mut end = p[i + 1];
+                let mut consumed = 2;
+                if end == b'\\' && (i + 2) < p.len() {
+                    end = p[i + 2];
+                    consumed = 3;
+                }
+                ranges.push((start, end));
+                i += consumed;
+            } else {
+                ranges.push((start, start));
+            }
+        }
+        None
+    }
+
+    fn helper(pat: &[u8], pi: usize, val: &[u8], vi: usize) -> bool {
+        if pi == pat.len() {
+            return vi == val.len();
+        }
+        match pat[pi] {
+            b'*' => {
+                let mut i = vi;
+                while i <= val.len() {
+                    if helper(pat, pi + 1, val, i) {
+                        return true;
+                    }
+                    if i == val.len() {
+                        break;
+                    }
+                    i += 1;
+                }
+                false
+            }
+            b'?' => vi < val.len() && helper(pat, pi + 1, val, vi + 1),
+            b'\\' => {
+                if pi + 1 >= pat.len() || vi >= val.len() {
+                    false
+                } else if pat[pi + 1] == val[vi] {
+                    helper(pat, pi + 2, val, vi + 1)
+                } else {
+                    false
+                }
+            }
+            b'[' => {
+                if vi >= val.len() {
+                    return false;
+                }
+                if let Some((ok, next_pi)) = match_set(&pat[pi..], val[vi]) {
+                    ok && helper(pat, pi + next_pi, val, vi + 1)
+                } else {
+                    false
+                }
+            }
+            c => vi < val.len() && c == val[vi] && helper(pat, pi + 1, val, vi + 1),
         }
     }
 
-    helper(pattern.as_bytes(), value.as_bytes())
+    helper(pattern.as_bytes(), 0, value.as_bytes(), 0)
 }
 
 fn current_max_value_bytes() -> Option<u64> {
@@ -227,6 +358,11 @@ fn build_prometheus_metrics(storage: &Storage, metrics: &Metrics) -> String {
     let connected = metrics.connected_clients.load(Ordering::Relaxed);
     let total_cmds = metrics.total_commands.load(Ordering::Relaxed);
     let keys = storage.keys("*").len();
+    let pubsub_channels = metrics.pubsub_channel_subs.load(Ordering::Relaxed);
+    let pubsub_patterns = metrics.pubsub_pattern_subs.load(Ordering::Relaxed);
+    let pubsub_shards = metrics.pubsub_shard_subs.load(Ordering::Relaxed);
+    let pubsub_delivered = metrics.pubsub_messages_delivered.load(Ordering::Relaxed);
+    let pubsub_dropped = metrics.pubsub_messages_dropped.load(Ordering::Relaxed);
 
     let mut buf = String::new();
 
@@ -241,6 +377,36 @@ fn build_prometheus_metrics(storage: &Storage, metrics: &Metrics) -> String {
 
     buf.push_str("# TYPE redust_keyspace_keys gauge\n");
     buf.push_str(&format!("redust_keyspace_keys{{db=\"0\"}} {}\n", keys));
+
+    buf.push_str("# TYPE redust_pubsub_channel_subscriptions gauge\n");
+    buf.push_str(&format!(
+        "redust_pubsub_channel_subscriptions {}\n",
+        pubsub_channels
+    ));
+
+    buf.push_str("# TYPE redust_pubsub_pattern_subscriptions gauge\n");
+    buf.push_str(&format!(
+        "redust_pubsub_pattern_subscriptions {}\n",
+        pubsub_patterns
+    ));
+
+    buf.push_str("# TYPE redust_pubsub_shard_subscriptions gauge\n");
+    buf.push_str(&format!(
+        "redust_pubsub_shard_subscriptions {}\n",
+        pubsub_shards
+    ));
+
+    buf.push_str("# TYPE redust_pubsub_messages_delivered counter\n");
+    buf.push_str(&format!(
+        "redust_pubsub_messages_delivered {}\n",
+        pubsub_delivered
+    ));
+
+    buf.push_str("# TYPE redust_pubsub_messages_dropped counter\n");
+    buf.push_str(&format!(
+        "redust_pubsub_messages_dropped {}\n",
+        pubsub_dropped
+    ));
 
     buf
 }
@@ -366,6 +532,9 @@ async fn handle_string_command(
     match cmd {
         Command::Ping => {
             respond_simple_string(writer, "PONG").await?;
+        }
+        Command::PingWithPayload(payload) => {
+            respond_bulk_bytes(writer, &payload).await?;
         }
         Command::Echo(value) => {
             respond_bulk_bytes(writer, &value).await?;
@@ -1693,6 +1862,26 @@ async fn handle_info_command(
     info.push_str(&format!("connected_clients:{}\r\n", connected));
     info.push_str("\r\n# Stats\r\n");
     info.push_str(&format!("total_commands_processed:{}\r\n", total_cmds));
+    info.push_str(&format!(
+        "pubsub_channel_subscriptions:{}\r\n",
+        metrics.pubsub_channel_subs.load(Ordering::Relaxed)
+    ));
+    info.push_str(&format!(
+        "pubsub_pattern_subscriptions:{}\r\n",
+        metrics.pubsub_pattern_subs.load(Ordering::Relaxed)
+    ));
+    info.push_str(&format!(
+        "pubsub_shard_subscriptions:{}\r\n",
+        metrics.pubsub_shard_subs.load(Ordering::Relaxed)
+    ));
+    info.push_str(&format!(
+        "pubsub_messages_delivered:{}\r\n",
+        metrics.pubsub_messages_delivered.load(Ordering::Relaxed)
+    ));
+    info.push_str(&format!(
+        "pubsub_messages_dropped:{}\r\n",
+        metrics.pubsub_messages_dropped.load(Ordering::Relaxed)
+    ));
     info.push_str("\r\n# Keyspace\r\n");
 
     let all_keys = storage.keys("*");
@@ -1798,6 +1987,7 @@ async fn handle_connection(
     let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<PubMessage>();
     let mut channel_subscriptions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut pattern_subscriptions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut shard_subscriptions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut subscribed_mode = false;
 
     loop {
@@ -1858,7 +2048,7 @@ async fn handle_connection(
                     }
                     continue;
                 }
-                Command::Ping | Command::Echo(_) | Command::Quit => {
+                Command::Ping | Command::PingWithPayload(_) | Command::Echo(_) | Command::Quit => {
                     // 这些命令在未认证时仍然允许
                 }
                 _ => {
@@ -1878,24 +2068,35 @@ async fn handle_connection(
             match cmd {
                 Command::Subscribe { .. }
                 | Command::Unsubscribe { .. }
+                | Command::Ssubscribe { .. }
+                | Command::Sunsubscribe { .. }
                 | Command::Psubscribe { .. }
                 | Command::Punsubscribe { .. }
                 | Command::Ping
+                | Command::PingWithPayload(_)
                 | Command::Quit => {}
                 _ => {
                     respond_error(&mut write_half, "ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context").await?;
                     continue;
                 }
             }
-            if let Command::Ping = cmd {
-                write_pong_event(&mut write_half, b"").await?;
-                continue;
+            match cmd {
+                Command::Ping => {
+                    write_pong_event(&mut write_half, b"").await?;
+                    continue;
+                }
+                Command::PingWithPayload(payload) => {
+                    write_pong_event(&mut write_half, &payload).await?;
+                    continue;
+                }
+                _ => {}
             }
         }
 
         match cmd {
             // string / generic key-value 命令
             Command::Ping
+            | Command::PingWithPayload(_)
             | Command::Echo(_)
             | Command::Set { .. }
             | Command::Get { .. }
@@ -2008,6 +2209,23 @@ async fn handle_connection(
                     }
                 }
                 let receivers = pubsub.publish(&channel, &message);
+                metrics
+                    .pubsub_messages_delivered
+                    .fetch_add(receivers as u64, Ordering::Relaxed);
+                respond_integer(&mut write_half, receivers as i64).await?;
+            }
+            Command::Spublish { channel, message } => {
+                if let Some(limit) = current_max_value_bytes() {
+                    if (message.len() as u64) > limit {
+                        respond_error(&mut write_half, "ERR value exceeds REDUST_MAXVALUE_BYTES")
+                            .await?;
+                        continue;
+                    }
+                }
+                let receivers = pubsub.publish_shard(&channel, &message);
+                metrics
+                    .pubsub_messages_delivered
+                    .fetch_add(receivers as u64, Ordering::Relaxed);
                 respond_integer(&mut write_half, receivers as i64).await?;
             }
             // Pub/Sub 订阅
@@ -2016,14 +2234,17 @@ async fn handle_connection(
                     if !channel_subscriptions.contains_key(&channel) {
                         let mut rx = pubsub.subscribe_channel(&channel);
                         let tx = msg_tx.clone();
+                        let metrics_clone = metrics.clone();
                         let handle = tokio::spawn(async move {
                             loop {
                                 match rx.recv().await {
                                     Ok(message) => {
                                         let _ = tx.send(message);
                                     }
-                                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                                        // Drop old messages when receiver is slow; keep subscription alive.
+                                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                                        metrics_clone
+                                            .pubsub_messages_dropped
+                                            .fetch_add(n as u64, Ordering::Relaxed);
                                         continue;
                                     }
                                     Err(broadcast::error::RecvError::Closed) => break,
@@ -2031,11 +2252,17 @@ async fn handle_connection(
                             }
                         });
                         channel_subscriptions.insert(channel.clone(), handle);
+                        metrics.pubsub_channel_subs.fetch_add(1, Ordering::Relaxed);
                     }
-                    let count = channel_subscriptions.len() + pattern_subscriptions.len();
+                    let count = channel_subscriptions.len()
+                        + pattern_subscriptions.len()
+                        + shard_subscriptions.len();
                     write_subscribe_event(&mut write_half, "subscribe", &channel, count).await?;
                 }
-                subscribed_mode = (channel_subscriptions.len() + pattern_subscriptions.len()) > 0;
+                subscribed_mode = (channel_subscriptions.len()
+                    + pattern_subscriptions.len()
+                    + shard_subscriptions.len())
+                    > 0;
             }
             Command::Unsubscribe { channels } => {
                 let targets: Vec<String> = if channels.is_empty() {
@@ -2047,18 +2274,93 @@ async fn handle_connection(
                 };
 
                 if targets.is_empty() {
-                    let count = channel_subscriptions.len() + pattern_subscriptions.len();
+                    let count = channel_subscriptions.len()
+                        + pattern_subscriptions.len()
+                        + shard_subscriptions.len();
                     write_subscribe_event(&mut write_half, "unsubscribe", "", count).await?;
                 } else {
                     for ch in targets {
                         if let Some(handle) = channel_subscriptions.remove(&ch) {
                             handle.abort();
+                            metrics.pubsub_channel_subs.fetch_sub(1, Ordering::Relaxed);
                         }
-                        let count = channel_subscriptions.len() + pattern_subscriptions.len();
+                        let count = channel_subscriptions.len()
+                            + pattern_subscriptions.len()
+                            + shard_subscriptions.len();
                         write_subscribe_event(&mut write_half, "unsubscribe", &ch, count).await?;
                     }
                 }
-                subscribed_mode = (channel_subscriptions.len() + pattern_subscriptions.len()) > 0;
+                subscribed_mode = (channel_subscriptions.len()
+                    + pattern_subscriptions.len()
+                    + shard_subscriptions.len())
+                    > 0;
+                pubsub.cleanup_stale();
+            }
+            Command::Ssubscribe { channels } => {
+                for channel in channels {
+                    if !shard_subscriptions.contains_key(&channel) {
+                        let mut rx = pubsub.subscribe_shard_channel(&channel);
+                        let tx = msg_tx.clone();
+                        let metrics_clone = metrics.clone();
+                        let handle = tokio::spawn(async move {
+                            loop {
+                                match rx.recv().await {
+                                    Ok(message) => {
+                                        let _ = tx.send(message);
+                                    }
+                                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                                        metrics_clone
+                                            .pubsub_messages_dropped
+                                            .fetch_add(n as u64, Ordering::Relaxed);
+                                        continue;
+                                    }
+                                    Err(broadcast::error::RecvError::Closed) => break,
+                                }
+                            }
+                        });
+                        shard_subscriptions.insert(channel.clone(), handle);
+                        metrics.pubsub_shard_subs.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let count = channel_subscriptions.len()
+                        + pattern_subscriptions.len()
+                        + shard_subscriptions.len();
+                    write_subscribe_event(&mut write_half, "ssubscribe", &channel, count).await?;
+                }
+                subscribed_mode = (channel_subscriptions.len()
+                    + pattern_subscriptions.len()
+                    + shard_subscriptions.len())
+                    > 0;
+            }
+            Command::Sunsubscribe { channels } => {
+                let targets: Vec<String> = if channels.is_empty() {
+                    let mut v: Vec<String> = shard_subscriptions.keys().cloned().collect();
+                    v.sort();
+                    v
+                } else {
+                    channels
+                };
+
+                if targets.is_empty() {
+                    let count = channel_subscriptions.len()
+                        + pattern_subscriptions.len()
+                        + shard_subscriptions.len();
+                    write_subscribe_event(&mut write_half, "sunsubscribe", "", count).await?;
+                } else {
+                    for ch in targets {
+                        if let Some(handle) = shard_subscriptions.remove(&ch) {
+                            handle.abort();
+                            metrics.pubsub_shard_subs.fetch_sub(1, Ordering::Relaxed);
+                        }
+                        let count = channel_subscriptions.len()
+                            + pattern_subscriptions.len()
+                            + shard_subscriptions.len();
+                        write_subscribe_event(&mut write_half, "sunsubscribe", &ch, count).await?;
+                    }
+                }
+                subscribed_mode = (channel_subscriptions.len()
+                    + pattern_subscriptions.len()
+                    + shard_subscriptions.len())
+                    > 0;
                 pubsub.cleanup_stale();
             }
             // 模式订阅
@@ -2067,13 +2369,17 @@ async fn handle_connection(
                     if !pattern_subscriptions.contains_key(&pattern) {
                         let mut rx = pubsub.subscribe_pattern(&pattern);
                         let tx = msg_tx.clone();
+                        let metrics_clone = metrics.clone();
                         let handle = tokio::spawn(async move {
                             loop {
                                 match rx.recv().await {
                                     Ok(message) => {
                                         let _ = tx.send(message);
                                     }
-                                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                                        metrics_clone
+                                            .pubsub_messages_dropped
+                                            .fetch_add(n as u64, Ordering::Relaxed);
                                         continue;
                                     }
                                     Err(broadcast::error::RecvError::Closed) => break,
@@ -2081,6 +2387,7 @@ async fn handle_connection(
                             }
                         });
                         pattern_subscriptions.insert(pattern.clone(), handle);
+                        metrics.pubsub_pattern_subs.fetch_add(1, Ordering::Relaxed);
                     }
                     let count = channel_subscriptions.len() + pattern_subscriptions.len();
                     write_subscribe_event(&mut write_half, "psubscribe", &pattern, count).await?;
@@ -2103,6 +2410,7 @@ async fn handle_connection(
                     for pat in targets {
                         if let Some(handle) = pattern_subscriptions.remove(&pat) {
                             handle.abort();
+                            metrics.pubsub_pattern_subs.fetch_sub(1, Ordering::Relaxed);
                         }
                         let count = channel_subscriptions.len() + pattern_subscriptions.len();
                         write_subscribe_event(&mut write_half, "punsubscribe", &pat, count).await?;
@@ -2132,6 +2440,38 @@ async fn handle_connection(
                 let total = pubsub.pattern_subscription_count();
                 respond_integer(&mut write_half, total as i64).await?;
             }
+            Command::PubsubShardchannels { pattern } => {
+                let channels = pubsub.active_shard_channels(pattern.as_deref());
+                let header = format!("*{}\r\n", channels.len());
+                write_half.write_all(header.as_bytes()).await?;
+                for ch in channels {
+                    respond_bulk_string(&mut write_half, &ch).await?;
+                }
+            }
+            Command::PubsubShardnumsub { channels } => {
+                let header = format!("*{}\r\n", channels.len() * 2);
+                write_half.write_all(header.as_bytes()).await?;
+                for ch in channels {
+                    respond_bulk_string(&mut write_half, &ch).await?;
+                    let subscribers = pubsub.shard_channel_subscribers(&ch);
+                    respond_integer(&mut write_half, subscribers as i64).await?;
+                }
+            }
+            Command::PubsubHelp => {
+                let lines = [
+                    "PUBSUB <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                    "CHANNELS [<pattern>] -- Return the currently active channels matching a pattern (default: all).",
+                    "NUMSUB [<channel> ...] -- Return the number of subscribers for the specified channels.",
+                    "NUMPAT -- Return the number of subscriptions to patterns.",
+                    "SHARDCHANNELS [<pattern>] -- Return the currently active shard channels.",
+                    "SHARDNUMSUB [<channel> ...] -- Return the number of subscribers for shard channels.",
+                ];
+                let header = format!("*{}\r\n", lines.len());
+                write_half.write_all(header.as_bytes()).await?;
+                for line in lines {
+                    respond_bulk_string(&mut write_half, line).await?;
+                }
+            }
 
             Command::Auth { .. } => {
                 unreachable!();
@@ -2155,12 +2495,28 @@ async fn handle_connection(
         }
     }
 
-    for (_, handle) in channel_subscriptions {
+    let chan_len = channel_subscriptions.len();
+    for (_, handle) in channel_subscriptions.drain() {
         handle.abort();
     }
-    for (_, handle) in pattern_subscriptions {
+    let pat_len = pattern_subscriptions.len();
+    for (_, handle) in pattern_subscriptions.drain() {
         handle.abort();
     }
+    let shard_len = shard_subscriptions.len();
+    for (_, handle) in shard_subscriptions.drain() {
+        handle.abort();
+    }
+
+    metrics
+        .pubsub_channel_subs
+        .fetch_sub(chan_len as u64, Ordering::Relaxed);
+    metrics
+        .pubsub_pattern_subs
+        .fetch_sub(pat_len as u64, Ordering::Relaxed);
+    metrics
+        .pubsub_shard_subs
+        .fetch_sub(shard_len as u64, Ordering::Relaxed);
 
     pubsub.cleanup_stale();
 
@@ -2233,6 +2589,11 @@ pub async fn serve(
         connected_clients: AtomicUsize::new(0),
         total_commands: AtomicU64::new(0),
         tcp_port: port,
+        pubsub_channel_subs: AtomicU64::new(0),
+        pubsub_pattern_subs: AtomicU64::new(0),
+        pubsub_shard_subs: AtomicU64::new(0),
+        pubsub_messages_delivered: AtomicU64::new(0),
+        pubsub_messages_dropped: AtomicU64::new(0),
     });
     let pubsub = PubSubHub::new();
 
