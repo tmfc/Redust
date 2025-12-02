@@ -40,7 +40,10 @@ pub enum Command {
     Set {
         key: String,
         value: Binary,
+        // 相对过期时间（EX/PX），单位：毫秒
         expire_millis: Option<i64>,
+        // 绝对过期时间（EXAT/PXAT），Unix 毫秒时间戳
+        expire_at_millis: Option<i64>,
         nx: bool,
         xx: bool,
         keep_ttl: bool,
@@ -101,6 +104,29 @@ pub enum Command {
     Incrbyfloat {
         key: String,
         delta: f64,
+    },
+    Scan {
+        cursor: u64,
+        pattern: Option<String>,
+        count: Option<u64>,
+    },
+    Sscan {
+        key: String,
+        cursor: u64,
+        pattern: Option<String>,
+        count: Option<u64>,
+    },
+    Hscan {
+        key: String,
+        cursor: u64,
+        pattern: Option<String>,
+        count: Option<u64>,
+    },
+    Zscan {
+        key: String,
+        cursor: u64,
+        pattern: Option<String>,
+        count: Option<u64>,
     },
     Type {
         key: String,
@@ -441,10 +467,12 @@ pub async fn read_command(
                 return Ok(Some(err_wrong_args("set")));
             };
 
-            // 解析可选参数：EX seconds | PX milliseconds | NX | XX | KEEPTTL | GET
+            // 解析可选参数：
+            // EX seconds | PX milliseconds | EXAT unix-time | PXAT ms-unix-time | NX | XX | KEEPTTL | GET
             let mut expire_millis: Option<i64> = None;
-            let mut has_ex = false;
-            let mut has_px = false;
+            let mut expire_at_millis: Option<i64> = None;
+            // 任意一种过期方式（EX/PX/EXAT/PXAT）只能出现一次
+            let mut has_expire = false;
             let mut nx = false;
             let mut xx = false;
             let mut keep_ttl = false;
@@ -457,7 +485,7 @@ pub async fn read_command(
                 };
                 match opt_upper.as_str() {
                     "EX" => {
-                        if has_ex || has_px {
+                        if has_expire {
                             return Ok(Some(err_syntax()));
                         }
                         let Some(sec_bytes) = iter.next() else {
@@ -471,10 +499,10 @@ pub async fn read_command(
                             return Ok(Some(err_not_integer()));
                         }
                         expire_millis = Some(sec.saturating_mul(1000));
-                        has_ex = true;
+                        has_expire = true;
                     }
                     "PX" => {
-                        if has_ex || has_px {
+                        if has_expire {
                             return Ok(Some(err_syntax()));
                         }
                         let Some(ms_bytes) = iter.next() else {
@@ -488,7 +516,42 @@ pub async fn read_command(
                             return Ok(Some(err_not_integer()));
                         }
                         expire_millis = Some(ms);
-                        has_px = true;
+                        has_expire = true;
+                    }
+                    "EXAT" => {
+                        if has_expire {
+                            return Ok(Some(err_syntax()));
+                        }
+                        let Some(sec_bytes) = iter.next() else {
+                            return Ok(Some(err_syntax()));
+                        };
+                        let sec = match parse_i64_from_bulk(sec_bytes) {
+                            Ok(v) => v,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        if sec < 0 {
+                            return Ok(Some(err_not_integer()));
+                        }
+                        // 转为毫秒级绝对时间戳
+                        expire_at_millis = Some(sec.saturating_mul(1000));
+                        has_expire = true;
+                    }
+                    "PXAT" => {
+                        if has_expire {
+                            return Ok(Some(err_syntax()));
+                        }
+                        let Some(ms_bytes) = iter.next() else {
+                            return Ok(Some(err_syntax()));
+                        };
+                        let ms = match parse_i64_from_bulk(ms_bytes) {
+                            Ok(v) => v,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        if ms < 0 {
+                            return Ok(Some(err_not_integer()));
+                        }
+                        expire_at_millis = Some(ms);
+                        has_expire = true;
                     }
                     "NX" => {
                         if xx {
@@ -518,6 +581,7 @@ pub async fn read_command(
                 key,
                 value,
                 expire_millis,
+                expire_at_millis,
                 nx,
                 xx,
                 keep_ttl,
@@ -853,6 +917,274 @@ pub async fn read_command(
                 return Ok(Some(err_wrong_args("dbsize")));
             }
             Command::Dbsize
+        }
+        "SCAN" => {
+            let Some(cursor_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("scan")));
+            };
+            let cursor_i64 = match parse_i64_from_bulk(cursor_bytes) {
+                Ok(v) => v,
+                Err(e) => return Ok(Some(e)),
+            };
+            if cursor_i64 < 0 {
+                return Ok(Some(err_not_integer()));
+            }
+            let mut pattern: Option<String> = None;
+            let mut count: Option<u64> = None;
+
+            while let Some(opt) = iter.next() {
+                let opt_upper = match std::str::from_utf8(&opt) {
+                    Ok(s) => s.to_ascii_uppercase(),
+                    Err(_) => return Ok(Some(err_syntax())),
+                };
+                match opt_upper.as_str() {
+                    "MATCH" => {
+                        if pattern.is_some() {
+                            return Ok(Some(err_syntax()));
+                        }
+                        let Some(pat_bytes) = iter.next() else {
+                            return Ok(Some(err_syntax()));
+                        };
+                        let pat = match parse_bulk_string(pat_bytes) {
+                            Ok(p) => p,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        pattern = Some(pat);
+                    }
+                    "COUNT" => {
+                        if count.is_some() {
+                            return Ok(Some(err_syntax()));
+                        }
+                        let Some(count_bytes) = iter.next() else {
+                            return Ok(Some(err_syntax()));
+                        };
+                        let c_i64 = match parse_i64_from_bulk(count_bytes) {
+                            Ok(v) => v,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        if c_i64 < 0 {
+                            return Ok(Some(err_not_integer()));
+                        }
+                        count = Some(c_i64 as u64);
+                    }
+                    _ => {
+                        return Ok(Some(err_syntax()));
+                    }
+                }
+            }
+
+            Command::Scan {
+                cursor: cursor_i64 as u64,
+                pattern,
+                count,
+            }
+        }
+        "SSCAN" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("sscan")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(cursor_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("sscan")));
+            };
+            let cursor_i64 = match parse_i64_from_bulk(cursor_bytes) {
+                Ok(v) => v,
+                Err(e) => return Ok(Some(e)),
+            };
+            if cursor_i64 < 0 {
+                return Ok(Some(err_not_integer()));
+            }
+            let mut pattern: Option<String> = None;
+            let mut count: Option<u64> = None;
+
+            while let Some(opt) = iter.next() {
+                let opt_upper = match std::str::from_utf8(&opt) {
+                    Ok(s) => s.to_ascii_uppercase(),
+                    Err(_) => return Ok(Some(err_syntax())),
+                };
+                match opt_upper.as_str() {
+                    "MATCH" => {
+                        if pattern.is_some() {
+                            return Ok(Some(err_syntax()));
+                        }
+                        let Some(pat_bytes) = iter.next() else {
+                            return Ok(Some(err_syntax()));
+                        };
+                        let pat = match parse_bulk_string(pat_bytes) {
+                            Ok(p) => p,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        pattern = Some(pat);
+                    }
+                    "COUNT" => {
+                        if count.is_some() {
+                            return Ok(Some(err_syntax()));
+                        }
+                        let Some(count_bytes) = iter.next() else {
+                            return Ok(Some(err_syntax()));
+                        };
+                        let c_i64 = match parse_i64_from_bulk(count_bytes) {
+                            Ok(v) => v,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        if c_i64 < 0 {
+                            return Ok(Some(err_not_integer()));
+                        }
+                        count = Some(c_i64 as u64);
+                    }
+                    _ => {
+                        return Ok(Some(err_syntax()));
+                    }
+                }
+            }
+
+            Command::Sscan {
+                key,
+                cursor: cursor_i64 as u64,
+                pattern,
+                count,
+            }
+        }
+        "HSCAN" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("hscan")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(cursor_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("hscan")));
+            };
+            let cursor_i64 = match parse_i64_from_bulk(cursor_bytes) {
+                Ok(v) => v,
+                Err(e) => return Ok(Some(e)),
+            };
+            if cursor_i64 < 0 {
+                return Ok(Some(err_not_integer()));
+            }
+            let mut pattern: Option<String> = None;
+            let mut count: Option<u64> = None;
+
+            while let Some(opt) = iter.next() {
+                let opt_upper = match std::str::from_utf8(&opt) {
+                    Ok(s) => s.to_ascii_uppercase(),
+                    Err(_) => return Ok(Some(err_syntax())),
+                };
+                match opt_upper.as_str() {
+                    "MATCH" => {
+                        if pattern.is_some() {
+                            return Ok(Some(err_syntax()));
+                        }
+                        let Some(pat_bytes) = iter.next() else {
+                            return Ok(Some(err_syntax()));
+                        };
+                        let pat = match parse_bulk_string(pat_bytes) {
+                            Ok(p) => p,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        pattern = Some(pat);
+                    }
+                    "COUNT" => {
+                        if count.is_some() {
+                            return Ok(Some(err_syntax()));
+                        }
+                        let Some(count_bytes) = iter.next() else {
+                            return Ok(Some(err_syntax()));
+                        };
+                        let c_i64 = match parse_i64_from_bulk(count_bytes) {
+                            Ok(v) => v,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        if c_i64 < 0 {
+                            return Ok(Some(err_not_integer()));
+                        }
+                        count = Some(c_i64 as u64);
+                    }
+                    _ => {
+                        return Ok(Some(err_syntax()));
+                    }
+                }
+            }
+
+            Command::Hscan {
+                key,
+                cursor: cursor_i64 as u64,
+                pattern,
+                count,
+            }
+        }
+        "ZSCAN" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zscan")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(cursor_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zscan")));
+            };
+            let cursor_i64 = match parse_i64_from_bulk(cursor_bytes) {
+                Ok(v) => v,
+                Err(e) => return Ok(Some(e)),
+            };
+            if cursor_i64 < 0 {
+                return Ok(Some(err_not_integer()));
+            }
+            let mut pattern: Option<String> = None;
+            let mut count: Option<u64> = None;
+
+            while let Some(opt) = iter.next() {
+                let opt_upper = match std::str::from_utf8(&opt) {
+                    Ok(s) => s.to_ascii_uppercase(),
+                    Err(_) => return Ok(Some(err_syntax())),
+                };
+                match opt_upper.as_str() {
+                    "MATCH" => {
+                        if pattern.is_some() {
+                            return Ok(Some(err_syntax()));
+                        }
+                        let Some(pat_bytes) = iter.next() else {
+                            return Ok(Some(err_syntax()));
+                        };
+                        let pat = match parse_bulk_string(pat_bytes) {
+                            Ok(p) => p,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        pattern = Some(pat);
+                    }
+                    "COUNT" => {
+                        if count.is_some() {
+                            return Ok(Some(err_syntax()));
+                        }
+                        let Some(count_bytes) = iter.next() else {
+                            return Ok(Some(err_syntax()));
+                        };
+                        let c_i64 = match parse_i64_from_bulk(count_bytes) {
+                            Ok(v) => v,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        if c_i64 < 0 {
+                            return Ok(Some(err_not_integer()));
+                        }
+                        count = Some(c_i64 as u64);
+                    }
+                    _ => {
+                        return Ok(Some(err_syntax()));
+                    }
+                }
+            }
+
+            Command::Zscan {
+                key,
+                cursor: cursor_i64 as u64,
+                pattern,
+                count,
+            }
         }
         "KEYS" => {
             let Some(pattern_bytes) = iter.next() else {

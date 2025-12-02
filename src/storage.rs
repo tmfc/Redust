@@ -1029,26 +1029,18 @@ impl Storage {
         )
     }
 
-    pub fn keys(&self, pattern: &str) -> Vec<String> {
-        // Very simple implementation: only support "*" (all keys) and exact match.
-        if pattern == "*" {
-            let now = Instant::now();
-            let mut all: Vec<String> = self
-                .data
-                .iter()
-                .map(|entry| entry.key().clone())
-                .filter(|k| !self.remove_if_expired(k, now))
-                .collect();
-            all.sort();
-            all
-        } else {
-            let mut result = Vec::new();
-            let now = Instant::now();
-            if !self.remove_if_expired(pattern, now) && self.data.contains_key(pattern) {
-                result.push(pattern.to_string());
-            }
-            result
-        }
+    pub fn keys(&self, _pattern: &str) -> Vec<String> {
+        // 当前实现：忽略 pattern，仅负责返回所有未过期的物理 key，排序后交给上层做模式匹配。
+        // 这样可以复用同一 API 支撑 KEYS/SCAN/INFO 等调用场景。
+        let now = Instant::now();
+        let mut all: Vec<String> = self
+            .data
+            .iter()
+            .map(|entry| entry.key().clone())
+            .filter(|k| !self.remove_if_expired(k, now))
+            .collect();
+        all.sort();
+        all
     }
 
     pub fn lpush(&self, key: &str, values: &[String]) -> Result<usize, ()> {

@@ -42,6 +42,58 @@ async fn mset_and_mget_roundtrip() {
 }
 
 #[tokio::test]
+async fn set_with_exat_and_pxat_options() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    let mut client = TestClient::connect(addr).await;
+
+    // 基本 EXAT 行为：设置绝对过期时间，TTL 应接近给定秒数
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let target_secs = now_secs + 2;
+
+    client
+        .send_array(&["SET", "exat", "v", "EXAT", &target_secs.to_string()])
+        .await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "+OK\r\n");
+
+    client.send_array(&["TTL", "exat"]).await;
+    let ttl_line = client.read_simple_line().await;
+    assert!(ttl_line.starts_with(":"));
+    let ttl: i64 = ttl_line[1..ttl_line.len() - 2].parse().unwrap();
+    // 允许一定抖动：应在 [0, 2] 区间内且不为负值（负值表示 key 已过期）
+    assert!(ttl >= 0 && ttl <= 2);
+
+    // 基本 PXAT 行为：设置绝对毫秒时间，PTTL 应较小但为正
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let target_ms = now_ms + 1500; // ~1.5s
+
+    client
+        .send_array(&["SET", "pxat", "v", "PXAT", &target_ms.to_string()])
+        .await;
+    let line2 = client.read_simple_line().await;
+    assert_eq!(line2, "+OK\r\n");
+
+    client.send_array(&["PTTL", "pxat"]).await;
+    let pttl_line = client.read_simple_line().await;
+    assert!(pttl_line.starts_with(":"));
+    let pttl: i64 = pttl_line[1..pttl_line.len() - 2].parse().unwrap();
+    // 预期在 (0, 1500]ms 之间
+    assert!(pttl > 0 && pttl <= 1500);
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn setrange_does_not_truncate_tail() {
     let (addr, shutdown, handle) = spawn_server().await;
 
@@ -415,6 +467,38 @@ async fn command_argument_and_integer_errors_match_redis() {
 
     // EXPIRE with non-integer seconds -> ERR value is not an integer or out of range
     client.send_array(&["EXPIRE", "foo", "notint"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR value is not an integer or out of range\r\n");
+
+    // SET EX 与 PX/EXAT/PXAT 组合冲突 -> 语法错误
+    client
+        .send_array(&["SET", "foo", "bar", "EX", "10", "PX", "1000"])
+        .await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR syntax error\r\n");
+
+    client
+        .send_array(&["SET", "foo", "bar", "EX", "10", "EXAT", "100"])
+        .await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR syntax error\r\n");
+
+    client
+        .send_array(&["SET", "foo", "bar", "PXAT", "1000", "EXAT", "100"])
+        .await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR syntax error\r\n");
+
+    // EXAT/PXAT 参数为非整数（或负数）时，返回整数错误
+    client
+        .send_array(&["SET", "foo", "bar", "EXAT", "-1"])
+        .await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "-ERR value is not an integer or out of range\r\n");
+
+    client
+        .send_array(&["SET", "foo", "bar", "PXAT", "notint"])
+        .await;
     let line = client.read_simple_line().await;
     assert_eq!(line, "-ERR value is not an integer or out of range\r\n");
 

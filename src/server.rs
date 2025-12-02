@@ -556,6 +556,7 @@ async fn handle_string_command(
             key,
             value,
             expire_millis,
+            expire_at_millis,
             nx,
             xx,
             keep_ttl,
@@ -603,13 +604,26 @@ async fn handle_string_command(
                 // 写入新值
                 storage.set(physical.clone(), value);
 
+                // 先根据 EX/PX/EXAT/PXAT 计算“显式指定”的 TTL；存在显式 TTL 时优先级高于 KEEPTTL。
+                let explicit_ttl_ms: Option<i64> = if let Some(at_ms) = expire_at_millis {
+                    use std::time::{SystemTime, UNIX_EPOCH};
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64;
+                    Some(at_ms.saturating_sub(now_ms))
+                } else {
+                    expire_millis
+                };
+
                 // TTL 处理优先级：
-                // 1. KEEPTTL：恢复旧 TTL（如果存在）
-                // 2. EX/PX：设置新的 TTL
+                // 1. 显式 TTL（EX/PX/EXAT/PXAT）：覆盖旧 TTL
+                // 2. KEEPTTL：在无显式 TTL 时，恢复旧 TTL（如果存在）
                 // 3. 否则：清除已有 TTL
-                if let Some(ms) = keep_ttl_ms {
+                if let Some(ms) = explicit_ttl_ms {
+                    // Redis 语义：到期时间在“现在及以前”视为立即过期
                     storage.expire_millis(&physical, ms);
-                } else if let Some(ms) = expire_millis {
+                } else if let Some(ms) = keep_ttl_ms {
                     storage.expire_millis(&physical, ms);
                 } else {
                     let _ = storage.persist(&physical);
@@ -1203,6 +1217,48 @@ async fn handle_list_command(
                 }
             }
         }
+        Command::Hscan {
+            key,
+            cursor: _,
+            pattern,
+            count: _,
+        } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.hgetall(&physical) {
+                Ok(entries) => {
+                    // entries: Vec<(String, String)>
+                    let pat = pattern.unwrap_or_else(|| "*".to_string());
+                    let mut flat: Vec<(String, String)> = Vec::new();
+                    for (field, value) in &entries {
+                        if pattern_match(&pat, field) {
+                            flat.push((field.to_string(), value.clone()));
+                        }
+                    }
+
+                    let next_cursor = 0u64;
+                    let cursor_str = next_cursor.to_string();
+
+                    let mut response = format!(
+                        "*2\r\n${}\r\n{}\r\n*{}\r\n",
+                        cursor_str.len(),
+                        cursor_str,
+                        flat.len() * 2
+                    );
+                    for (f, v) in flat {
+                        response.push_str(&format!("${}\r\n{}\r\n", f.len(), f));
+                        response.push_str(&format!("${}\r\n{}\r\n", v.len(), v));
+                    }
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
         _ => {}
     }
 
@@ -1357,6 +1413,52 @@ async fn handle_set_command(
                 Ok(members) => {
                     let mut response = format!("*{}\r\n", members.len());
                     for m in members {
+                        response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
+                    }
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Sscan {
+            key,
+            cursor,
+            pattern,
+            count,
+        } => {
+            let physical = prefix_key(current_db, &key);
+            // 复用 smembers 提供的有序成员视图
+            match storage.smembers(&physical) {
+                Ok(members) => {
+                    let total = members.len() as u64;
+                    let start = if cursor > total { total } else { cursor } as usize;
+                    let batch_size = count.unwrap_or(10) as usize;
+                    let end = std::cmp::min(start + batch_size, members.len());
+
+                    let pat = pattern.unwrap_or_else(|| "*".to_string());
+                    let mut matched: Vec<String> = Vec::new();
+                    for m in &members[start..end] {
+                        if pattern_match(&pat, m) {
+                            matched.push(m.to_string());
+                        }
+                    }
+
+                    let next_cursor = if end >= members.len() { 0 } else { end as u64 };
+
+                    let cursor_str = next_cursor.to_string();
+                    let mut response = format!(
+                        "*2\r\n${}\r\n{}\r\n*{}\r\n",
+                        cursor_str.len(),
+                        cursor_str,
+                        matched.len()
+                    );
+                    for m in matched {
                         response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
                     }
                     writer.write_all(response.as_bytes()).await?;
@@ -1725,6 +1827,53 @@ async fn handle_hash_command(
                 }
             }
         }
+        Command::Hscan {
+            key,
+            cursor,
+            pattern,
+            count,
+        } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.hgetall(&physical) {
+                Ok(entries) => {
+                    let total = entries.len() as u64;
+                    let start = if cursor > total { total } else { cursor } as usize;
+                    let batch_size = count.unwrap_or(10) as usize;
+                    let end = std::cmp::min(start + batch_size, entries.len());
+
+                    let pat = pattern.unwrap_or_else(|| "*".to_string());
+                    let mut flat: Vec<(String, String)> = Vec::new();
+                    for (field, value) in &entries[start..end] {
+                        if pattern_match(&pat, field) {
+                            flat.push((field.clone(), value.clone()));
+                        }
+                    }
+
+                    let next_cursor = if end >= entries.len() { 0 } else { end as u64 };
+
+                    let cursor_str = next_cursor.to_string();
+
+                    let mut response = format!(
+                        "*2\r\n${}\r\n{}\r\n*{}\r\n",
+                        cursor_str.len(),
+                        cursor_str,
+                        flat.len() * 2
+                    );
+                    for (f, v) in flat {
+                        response.push_str(&format!("${}\r\n{}\r\n", f.len(), f));
+                        response.push_str(&format!("${}\r\n{}\r\n", v.len(), v));
+                    }
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
         _ => {}
     }
 
@@ -1772,24 +1921,19 @@ async fn handle_key_meta_command(
             respond_simple_string(writer, &t).await?;
         }
         Command::Keys { pattern } => {
-            let mut result: Vec<String> = Vec::new();
-
-            if pattern == "*" {
-                let all = storage.keys("*");
-                let prefix = format!("{}:", current_db);
-                for k in all {
-                    if let Some(rest) = k.strip_prefix(&prefix) {
-                        result.push(rest.to_string());
-                    }
+            let all = storage.keys("*");
+            let prefix = format!("{}:", current_db);
+            let mut logical_keys: Vec<String> = Vec::new();
+            for k in all {
+                if let Some(rest) = k.strip_prefix(&prefix) {
+                    logical_keys.push(rest.to_string());
                 }
-            } else {
-                let physical_pattern = prefix_key(current_db, &pattern);
-                let physical_keys = storage.keys(&physical_pattern);
-                let prefix = format!("{}:", current_db);
-                for k in physical_keys {
-                    if let Some(rest) = k.strip_prefix(&prefix) {
-                        result.push(rest.to_string());
-                    }
+            }
+
+            let mut result: Vec<String> = Vec::new();
+            for k in logical_keys {
+                if pattern_match(&pattern, &k) {
+                    result.push(k);
                 }
             }
 
@@ -1797,6 +1941,50 @@ async fn handle_key_meta_command(
             for k in result {
                 response.push_str(&format!("${}\r\n{}\r\n", k.len(), k));
             }
+            writer.write_all(response.as_bytes()).await?;
+        }
+        Command::Scan {
+            cursor,
+            pattern,
+            count,
+        } => {
+            // 简化实现：基于当前 DB 的逻辑 key 列表做一次切片扫描。
+            let all = storage.keys("*");
+            let prefix = format!("{}:", current_db);
+            let mut logical: Vec<String> = Vec::new();
+            for k in all {
+                if let Some(rest) = k.strip_prefix(&prefix) {
+                    logical.push(rest.to_string());
+                }
+            }
+
+            let total = logical.len() as u64;
+            let start = if cursor > total { total } else { cursor } as usize;
+            let batch_size = count.unwrap_or(10) as usize;
+            let end = std::cmp::min(start + batch_size, logical.len());
+
+            let pat = pattern.unwrap_or_else(|| "*".to_string());
+            let mut matched: Vec<String> = Vec::new();
+            for k in &logical[start..end] {
+                if pattern_match(&pat, k) {
+                    matched.push(k.clone());
+                }
+            }
+
+            let next_cursor = if end >= logical.len() { 0 } else { end as u64 };
+
+            // RESP: *2 \r\n :<cursor> \r\n *N ...
+            let cursor_str = next_cursor.to_string();
+            let mut response =
+                format!("*2\r\n${}\r\n{}\r\n*{}\r\n", cursor_str.len(), cursor_str, matched.len());
+            for k in matched {
+                response.push_str(&format!("${}\r\n{}\r\n", k.len(), k));
+            }
+            writer.write_all(response.as_bytes()).await?;
+        }
+        Command::Zscan { .. } => {
+            // 占位实现：目前尚未支持 ZSet，返回空扫描结果。
+            let response = "*2\r\n$1\r\n0\r\n*0\r\n";
             writer.write_all(response.as_bytes()).await?;
         }
         Command::Dbsize => {
@@ -2168,7 +2356,8 @@ async fn handle_connection(
             | Command::Sdiff { .. }
             | Command::Sunionstore { .. }
             | Command::Sinterstore { .. }
-            | Command::Sdiffstore { .. } => {
+            | Command::Sdiffstore { .. }
+            | Command::Sscan { .. } => {
                 handle_set_command(cmd, &storage, &mut write_half, current_db).await?;
             }
 
@@ -2183,7 +2372,8 @@ async fn handle_connection(
             | Command::Hmget { .. }
             | Command::Hincrby { .. }
             | Command::Hincrbyfloat { .. }
-            | Command::Hlen { .. } => {
+            | Command::Hlen { .. }
+            | Command::Hscan { .. } => {
                 handle_hash_command(cmd, &storage, &mut write_half, current_db).await?;
             }
 
@@ -2195,6 +2385,8 @@ async fn handle_connection(
             | Command::Persist { .. }
             | Command::Type { .. }
             | Command::Keys { .. }
+            | Command::Scan { .. }
+            | Command::Zscan { .. }
             | Command::Dbsize
             | Command::Rename { .. }
             | Command::Renamenx { .. }

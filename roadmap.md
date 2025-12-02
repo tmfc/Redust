@@ -1,116 +1,47 @@
-## 走向生产可用的路线图（9 大类能力 / 工作包总览）
+## 生产可用路线图（社区版：单机/轻量复制，兼容 Redis 客户端）
 
-> 这一节从“要让 Redust 成为**单机、生产可用的 Redis 替代**”的角度，梳理能力大类与工作包。可直接映射为中长期里程碑，具体实现节奏可按阶段 2/3/4 细化。
+> 目标：在不包含 Sentinel/Cluster 等多服务器高可用特性的前提下，提供可替代 Redis 的生产可用单实例（可选轻量复制），兼容现有 Redis 客户端与协议习惯。
 
-### 一、功能维度：命令 & 数据结构
-
-- **1. 核心功能补齐（高优先级）**
-  - Key 过期与淘汰：
-    - 实现 `EXPIRE` / `PEXPIRE` / `TTL` / `PTTL` / `PERSIST` 等最小语义。
-    - 设计过期机制（惰性删除 + 定期采样删除），避免全表扫描。
-    - 预留内存上限与淘汰策略（如 `maxmemory` + 一种 LRU 策略）。
-    - 当前已完成：基础过期语义 MVP（支持 EXPIRE/PEXPIRE/TTL/PTTL/PERSIST，采用懒删除 + 定期采样删除）。
-  - 字符串增强：
-    - 补齐常用多 key/原子操作：`MGET` / `MSET` / `SETNX` / `SETEX` / `PSETEX` / `INCRBY` / `DECRBY` 等。
-    - 评估并明确二进制安全策略（当前以 `String` 为主）。
-- **2. 数据结构扩展**
-  - 哈希（Hash）：
-    - 设计存储结构并实现 `HSET` / `HGET` / `HDEL` / `HEXISTS` / `HGETALL` / `HINCRBY` 等子集。
-    - 为常见业务场景（配置、用户画像）提供足够功能覆盖。
-  - 有序集合（Sorted Set）：
-    - 设计最小实现（如跳表/平衡树），支持 `ZADD` / `ZREM` / `ZRANGE` / `ZREVRANGE` / `ZCARD` / `ZINCRBY` 等。
-    - 主要覆盖排行榜、计分场景。
-  - 列表 & 集合补完：
-    - 列表：在现有 `LPUSH` / `RPUSH` / `LPOP` / `RPOP` / `LRANGE` 基础上补齐 `LLEN` / `LINDEX` / `LREM` / `LTRIM` 等。
-    - 集合：围绕 `SADD` / `SREM` / `SMEMBERS` / `SCARD` / `SISMEMBER` / `SUNION` / `SINTER` / `SDIFF`，视需求增加 `SPOP` / `SRANDMEMBER` / `SMOVE` / `*STORE` 命令。
-
-- **1bis. Pub/Sub 基础能力（中优先级）**
-  - MVP 范围：
-    - 命令子集：`SUBSCRIBE` / `UNSUBSCRIBE` / `PUBLISH`，仅支持按 channel 订阅与广播，不实现模式订阅 `PSUBSCRIBE` / `PUNSUBSCRIBE`。
-    - 语义对齐：同一连接进入订阅模式后，仅允许 Redis 原生支持的少数命令（如 PING/QUIT/SUBSCRIBE/UNSUBSCRIBE），其他命令按 Redis 行为返回错误或忽略。
-    - 消息格式：遵循 Redis Pub/Sub 协议，推送 `message` 事件，RESP 表示形如：`["message", <channel>, <payload>]`。
-  - 实现要点：
-    - 为每个连接维护订阅状态与 channel 列表，接入全局 `PubSubHub`（channel -> subscribers）。
-    - 在连接处理循环中同时监听「客户端命令」与「来自 hub 的推送消息」，确保消息按订阅顺序可靠送达。
-  - 后续演进：
-    - 视需求补充 `PSUBSCRIBE` / `PUNSUBSCRIBE` 与 `PUBSUB` 系列查询命令。
-    - 为 Pub/Sub 增加简单的 QoS 保护（如单连接缓冲区长度、慢消费者处理策略），避免推送将单个连接或整个实例拖垮。
+### 一、协议与命令覆盖
+- 核心数据结构：Strings/Lists/Sets/Hashes 已基本齐全；补齐 Sorted Sets（ZADD/ZRANGE/ZREVRANGE/ZREM/ZCARD/ZINCRBY 等）、Streams、Geo、HyperLogLog、Bitmaps。
+- 事务与脚本：实现 MULTI/EXEC/DISCARD/WATCH 及 EVAL/EVALSHA（简化 Lua 环境即可），保证与客户端库兼容。
+- Pub/Sub：已支持 channel/pattern/shard 子集与 PUBSUB 查询；持续对齐行为细节（缓冲、订阅模式命令限制等）。
+- 扩展命令：SCAN/SSCAN/HSCAN 等游标扫描，键备份/恢复（DUMP/RESTORE），慢日志/CLIENT INFO 等兼容性命令。
 
 ### 二、持久化与数据安全
+- 持久化格式：提供 Redis 兼容的 AOF（everysec 语义）与 RDB 导出/导入；支持启动加载、触发/自动持久化。
+- 崩溃恢复：启动时校验并恢复数据，损坏文件友好降级（保留空库启动能力）。
+- 复制（社区版上限）：提供基础主从复制（全量 + 增量命令流）与只读从库以支撑读写分离；Sentinel/多副本自动故障转移/Cluster 路由留给企业版。
 
-- **3. 持久化雏形与演进（高优先级）**
-  - 选型：优先实现 AOF 或简化版 RDB（二选一起步），定义内部数据结构序列化格式。
-  - 功能：
-    - 支持启动加载历史数据，保证基本崩溃恢复能力。
-    - 支持定期或触发式持久化（后台执行，避免阻塞主处理循环）。
-  - 语义：
-    - 在文档中清晰说明持久性级别（接近 Redis `appendfsync everysec` 的语义，或其它约定）。
+### 三、内存管理与淘汰
+- 对齐 Redis 的 `maxmemory` 策略：allkeys-lru、volatile-lru、allkeys-random、volatile-ttl 等；支持 `maxmemory-policy` 配置。
+- 大 key/大集合保护：写入与读取的尺寸限制、渐进式释放策略，避免单 key 拖垮实例。
+- 精准过期与采样：优化采样策略与时间轮/分层定时结构，减少过期抖动。
 
-### 三、可靠性 & 高可用
+### 四、安全与租户隔离
+- 认证与 ACL：在现有 AUTH 基础上增加 ACL 子集（用户/规则/频道限制），保持与客户端交互一致。
+- 多 DB 与隔离：完善 DB 配置与隔离策略，为未来租户/ACL 铺路。
+- 传输安全：预研 TLS 接入模式（stunnel/内建 TLS）。
 
-- **4. 单机稳定性（高优先级）**
-  - 健壮错误处理：
-    - 命令参数严格校验，统一返回 Redis 风格错误信息。
-    - RESP 解析的边界情况、防御性编程与 DoS 防护（长度限制等）。
-  - 压力行为：
-    - 支持 pipeline、大 key/大集合 场景的基准测试与回归。
-    - 避免在 Tokio runtime 上进行长时间阻塞操作（如持久化、全量扫描）。
-- **5. 复制与只读从库（中–高优先级）**
-  - 主从复制的最小实现：
-    - 全量同步：主节点生成快照并传输给从节点。
-    - 命令流复制：写命令在主节点应用的同时发送到从节点。
-  - 从库：
-    - 支持只读从库，允许业务做读写分离（先不实现自动选主/故障转移）。
+### 五、可观测性与运维
+- 指标与日志：INFO 扩展（内存、过期、复制、Pub/Sub 计数等）、Prometheus 指标完善（含 pubsub 缓冲/投递/丢弃、存储指标）、统一结构化日志。
+- 管理命令：CONFIG GET/SET 子集、SLOWLOG 基础支持、CLIENT LIST/PAUSE/UNBLOCK 子集，便于运维脚本直接复用。
+- 工具链：提供 docker 镜像与 systemd 示例配置，便于部署。
 
-### 四、安全 & 多租户
+### 六、性能与兼容性验证
+- 基准测试：redis-benchmark/自研 bench 的对齐，覆盖 pipeline、多连接、混合读写与大 key 场景，输出对比报告。
+- 兼容性回归：用 redis-cli、go-redis、jedis/lettuce、node-redis 等主流客户端跑回归用例，覆盖事务、订阅、pipeline、超时等行为。
+- 资源回归：在内存/CPU 限制下的稳定性与降级策略验证。
 
-- **6. 安全性（中优先级，视部署环境）**
-  - 基础认证：
-    - 实现简单版 `AUTH` + 密码校验，支持通过配置文件/环境变量设置密码。
-    - 拒绝未认证连接执行绝大多数命令。
-  - ACL 预留：
-    - 暂不实现完整 Redis ACL 体系，仅规划后续可能的命令/键空间级控制。
-  - 多 DB / 多逻辑数据库：
-    - 对齐 Redis DB 概念（如 `SELECT <db>`），提供多个逻辑 key 空间以便按环境/业务做隔离。
-    - 规划默认 DB、最大 DB 数量及配置方式（环境变量/配置文件）。
-    - 预留与后续 ACL/多租户故事的对接能力（按 DB 维度做权限与隔离策略）。
-  - 可选：
-    - 视生产环境需要，预研 TLS 支持与部署方式。
+### 七、企业版保留项（不在社区版范围）
+- Sentinel/Cluster 自动故障转移、多节点一致性、跨机房复制/备份。
+- 高级安全（细粒度 ACL、审计日志）、多租户隔离强化。
+- 商业支持与运维套件。
 
-### 五、可观测性 & 运维
-
-- **7. 监控与可观测（高优先级）**
-  - INFO 子集：
-    - 暴露基本运行指标：内存占用、连接数、key 总数、命令调用次数、过期 key 数量等。
-    - 当前已完成：INFO v1（redust_version、tcp_port、uptime_in_seconds、connected_clients、total_commands_processed、db0:keys 等基础指标）。
-  - 指标导出：
-    - 选用一个简单方案（如 HTTP 端口暴露 Prometheus 文本格式）进行实验性实现。
-  - 日志：
-    - 用统一日志框架替代零散的 `println!`，支持日志等级和模块划分。
-
-### 六、性能 & 资源管理
-
-- **8. 性能优化与资源控制（高优先级，贯穿所有阶段）**
-  - 基准测试：
-    - 使用 `redis-benchmark` 和内置 bench，对比不同命令族的 QPS 与 P99 延迟。
-  - 并发模型：
-    - 评估并优化 `Storage` 的锁粒度（如采用分片锁或并发 Map 实现）。
-    - 当前阶段结论：采用单个 `DashMap<String, StorageValue>`，利用其内部分片锁作为主要并发策略，后续如遇瓶颈再演进。
-  - 内存管理：
-    - 规范化大 key/大集合的行为与限制，避免单 key 把进程拖垮。
-
-### 七、协议兼容性
-
-- **9. 协议与客户端兼容（中优先级）**
-  - RESP 细节：
-    - 对齐 Redis 在错误类型、nil、数组/多 bulk 等方面的边界行为。
-  - 客户端兼容性测试：
-    - 用常见语言的 Redis 客户端（如 redis-cli、redis-rs、go-redis、Jedis 等）做端到端测试。
-
-> 建议：将上述 9 大类拆分为若干 Phase，例如：
-> - **Phase A：单机、内网服务可用** —— 重点完成核心命令扩展（1/2）、持久化雏形（3）、基本稳定性（4）和监控 INFO 子集（7）。
-> - **Phase B：对外生产环境部署** —— 加固安全（6）、完善监控与日志（7）、持续性能优化（8）、补充更多协议/客户端兼容性（9）。
-> - **Phase C：读写分离与高可用探索** —— 逐步实现主从复制和只读从库（5），并在真实业务流量下做灰度验证。
+> 阶段建议：
+> - **Phase A（功能齐备 + 持久化 + 兼容回归）**：补齐命令族（含 Sorted Set/Streams/脚本/事务）、AOF/RDB 兼容与基础复制、maxmemory 策略对齐、INFO/指标扩展。
+> - **Phase B（性能与安全强化）**: 优化并发与内存、完善 ACL/TLS、补充运维命令与工具链，完成多客户端兼容回归。
+> - **Phase C（企业版探索）**: Sentinel/Cluster/多副本 HA、审计/更丰富 ACL、跨机房复制等收费特性。
 
 ---
 

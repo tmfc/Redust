@@ -1,10 +1,15 @@
-# Redust 命令实现进度
+# Redust 命令实现进度（按阶段拆分）
 
-> 使用 todo list 记录命令实现状态；勾选表示当前版本已具备“基本可用”的行为。
+> 目标：社区版对齐 Redis 行为，分三期推进。
+> - **Phase A（功能齐备 + 持久化 + 兼容回归）**：补齐核心命令族、持久化兼容、基础复制，成为可替代 Redis 的单机/轻量复制版本。
+> - **Phase B（性能与安全强化）**：优化并发与内存、完善 ACL/TLS、运维命令与工具链，多客户端兼容回归。
+> - **Phase C（企业版探索）**：Sentinel/Cluster/跨机房复制等高级特性（收费版）。
 
 ---
 
-## 连接与调试类
+## Phase A：功能齐备与兼容基础（当前重点）
+
+### 连接与调试类
 
 - [x] **PING**
   - 当前：`PING` → `+PONG`，参数过多时报错。
@@ -14,7 +19,7 @@
 - [x] **QUIT**
   - 当前：`QUIT` → `+OK` 并关闭连接。
   
-## 信息与监控
+### 信息与监控
 
 - [x] **INFO**
   - 当前：返回 `# Server`、`# Clients`、`# Stats`、`# Keyspace` 等基础信息。
@@ -22,18 +27,19 @@
 
 ---
 
-## 字符串 String
+### 字符串 String
 
 - [x] **SET key value**
   - 当前：基础 `SET key value` 行为 + 覆盖已有值，单元/集成测试完善。
 - [x] **SET key value EX seconds / PX milliseconds**
   - 当前：
-    - 解析 `EX`/`PX` 选项，非负整数校验。
-    - 通过 `expire_millis` 写入过期时间（相对时间）。
+    - 支持 `EX`/`PX` 相对过期（秒/毫秒），`EXAT`/`PXAT` 绝对过期时间（Unix 秒/毫秒）。
+    - 支持 `NX` / `XX` / `KEEPTTL` / `GET` 等高级选项组合：
+      - `NX` 仅在 key 不存在/已过期时写入；`XX` 仅在 key 存在时写入；二者互斥。
+      - `GET` 返回旧值（或 `$-1`），无论本次是否写入成功（与 Redis 一致）。
+      - `KEEPTTL` 在未显式指定 EX/PX/EXAT/PXAT 时保留旧 TTL，否则由显式 TTL 覆盖。
+    - 过期时间为非整数或为负数时，返回 `-ERR value is not an integer or out of range`；语法冲突（如同时出现 EX 与 PX/EXAT/PXAT）返回 `-ERR syntax error`。
     - 懒删除 + 定期删除策略生效。
-  - TODO：
-    - 支持 `NX` / `XX` / `KEEPTTL` / `GET` 等高级选项组合。
-    - 支持 `EXAT` / `PXAT` 绝对时间语义。
 - [x] **GET key**
   - 当前：
     - 未过期：返回 bulk string。
@@ -82,12 +88,11 @@
 - [x] **EXISTS key [key ...]**
 - [x] **TYPE key**
 - [x] **KEYS pattern**
-  - 当前：支持 `*` 和精确匹配；不支持通配表达式（如 `user:*`）。
-  - TODO：实现简单模式匹配（glob 风格）。
+  - 当前：在当前 DB 的逻辑 key 上支持 glob 风格匹配（`*`、`user:*`、`foo?` 等），匹配语义与 Pub/Sub 中的模式订阅一致，已通过端到端测试覆盖。
 
 ---
 
-## 列表 List
+### 列表 List
 
 - [x] **LPUSH key value [value ...]**
 - [x] **RPUSH key value [value ...]**
@@ -97,11 +102,11 @@
 
 状态说明：
 - 已有较完整的行为覆盖测试（边界下标、空列表、多个客户端可见性等）。
-- TODO：尚未实现 `LLEN`、`LREM`、`LINDEX` 等其他列表命令。
+- 已实现 `LLEN`、`LREM`、`LINDEX` 等常用列表命令，并在端到端测试中覆盖参数错误、整数解析错误和 WRONGTYPE 等行为。
 
 ---
 
-## 集合 Set
+### 集合 Set
 
 - [x] **SADD key member [member ...]**
 - [x] **SREM key member [member ...]**
@@ -118,7 +123,7 @@
 
 ---
 
-## 哈希 Hash
+### 哈希 Hash
 
 - [x] **HSET key field value**
   - 当前：
@@ -147,7 +152,7 @@
 
 ---
 
-## 过期与 TTL
+### 过期与 TTL
 
 - [x] **EXPIRE key seconds**
   - 当前：
@@ -181,12 +186,13 @@
 
 ---
 
-## 命令错误风格与参数校验约定（Redis 对齐）
+### 命令错误风格与参数校验约定（Redis 对齐）
 
 当前已实现的命令子集中，以下命令的**参数个数错误**与**整数解析错误**已经对齐 Redis 的错误风格，并通过端到端测试覆盖：
 
 - 字符串与多 key：
   - `SET` / `GET` / `DEL` / `EXISTS` / `TYPE` / `KEYS`
+  - `SCAN`
   - `INCR` / `DECR` / `INCRBY` / `DECRBY`
   - `MGET` / `MSET` / `SETNX` / `SETEX` / `PSETEX`
 - 列表 List：
@@ -215,36 +221,32 @@
 
 ---
 
-## 计划中的命令（尚未实现）
+## Phase A 未完成的核心命令（优先补齐）
 
-- [ ] **高级 SET 选项**
-  - `SET key value NX|XX [EX seconds|PX milliseconds|EXAT unix-time|PXAT ms-unix-time] [KEEPTTL] [GET]`
-- [ ] **键空间扫描**
-  - `SCAN` 及其与模式匹配的组合。
-- [ ] **键/过期查询增强**
-  - `EXISTS`、`KEYS` 的模式匹配兼容更多 Redis 语义。
-- [ ] **信息与监控相关命令**
-  - `INFO` 子集（连接数、key 数、命令计数、内存估算等）。
-- [ ] **持久化相关命令（待结合持久化 PoC 再定）**
-  - 如：`SAVE` / `BGSAVE` / `LASTSAVE` / 简化版 AOF 控制命令等。
+- [x] 高级 SET 选项：`EXAT` / `PXAT`、完整 NX/XX/KEEPTTL/GET 组合与冲突校验（已实现并通过端到端测试；复杂组合和边界行为的进一步打磨见 future.md）。
+- [ ] 键扫描与模式：`SCAN`/`SSCAN`/`HSCAN`/`ZSCAN`，`KEYS` 模式兼容更丰富 glob（已实现基础 `SCAN` + `MATCH`/`COUNT` 以及 `KEYS` glob 匹配；集合/哈希/有序集合的 *SCAN 后续补齐）。
+- [ ] 有序集合：`ZADD`/`ZREM`/`ZRANGE`/`ZREVRANGE`/`ZCARD`/`ZINCRBY` 等基础子集。
+- [ ] 流（Streams）：`XADD`/`XRANGE`/`XREAD`/`XDEL` 等基础读写。
+- [ ] 事务与脚本：`MULTI`/`EXEC`/`DISCARD`/`WATCH`，`EVAL`/`EVALSHA`。
+- [ ] 持久化控制命令：`SAVE`/`BGSAVE`/`LASTSAVE`，AOF 开关/重写子集。
+- [ ] 复制命令子集（社区版）：`REPLCONF`/`PSYNC`/`SLAVEOF`/`REPLICAOF`（主从握手与增量复制）。
+- [ ] 客户端/运维：`CONFIG GET/SET` 子集、`SLOWLOG`、`CLIENT LIST`/`PAUSE`/`UNBLOCK`。
 
 ---
 
-## 部分完成 / 仍需补充的工作概览
+## Phase B 展望（性能、安全、运维强化）
 
-- **SET 带 EX/PX**：
-  - 已有：基础相对过期语义 + lazy/active 删除 + TTL/PTTL/PERSIST 配套。
-  - 待补：NX/XX/EXAT/PXAT/KEEPTTL/GET 组合语义与冲突规则。
-- **KEYS**：
-  - 已有：`*` + 精确匹配。
-  - 待补：简单 glob 模式实现与测试。
-- **过期策略**：
-  - 已有：固定间隔 + 固定样本数的定期清理；语义上接近 Redis，参数尚未调优。
-  - 待补：
-    - 抽样规则更细化（例如优先抽有过期时间的 key）。
-    - 简单的指标观测（如每轮扫描删除数、过期 key 总数）。
+- SET/过期策略调优：采样过期、指标观测、maxmemory 策略对齐。
+- 安全：ACL 子集、TLS。
+- 运维：更丰富的 CONFIG/CLIENT/ADMIN 命令，slowlog/监控细节。
+- 性能：并发与内存优化、benchmark 与 profile 跟进。
 
 ---
+
+## Phase C（企业版）超出当前范围
+
+- Sentinel/Cluster、高可用、跨机房复制。
+- 高级 ACL、审计日志、多租户隔离。
 
 ## Redis 全量命令总览（按模块）
 
@@ -343,11 +345,11 @@
 - [x] LPOP
 - [x] RPOP
 - [x] LRANGE
-- [ ] LLEN
-- [ ] LINDEX
+- [x] LLEN
+- [x] LINDEX
 - [ ] LSET
 - [ ] LINSERT
-- [ ] LREM
+- [x] LREM
 - [ ] BLPOP
 - [ ] BRPOP
 - [ ] BRPOPLPUSH
