@@ -2030,7 +2030,9 @@ async fn handle_connection(
             }
             Command::Unsubscribe { channels } => {
                 let targets: Vec<String> = if channels.is_empty() {
-                    channel_subscriptions.keys().cloned().collect()
+                    let mut v: Vec<String> = channel_subscriptions.keys().cloned().collect();
+                    v.sort();
+                    v
                 } else {
                     channels
                 };
@@ -2070,7 +2072,9 @@ async fn handle_connection(
             }
             Command::Punsubscribe { patterns } => {
                 let targets: Vec<String> = if patterns.is_empty() {
-                    pattern_subscriptions.keys().cloned().collect()
+                    let mut v: Vec<String> = pattern_subscriptions.keys().cloned().collect();
+                    v.sort();
+                    v
                 } else {
                     patterns
                 };

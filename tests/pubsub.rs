@@ -283,3 +283,61 @@ async fn channels_cleanup_after_disconnect() {
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn patterns_cleanup_after_disconnect() {
+    let (addr, shutdown, handle) = spawn_server().await;
+
+    {
+        let mut sub = RespClient::connect(addr).await;
+        sub.send_array(&[b"PSUBSCRIBE", b"p*"]).await;
+        let _ = sub.read_array().await;
+    }
+
+    sleep(Duration::from_millis(50)).await;
+
+    let mut client = RespClient::connect(addr).await;
+    client.send_array(&[b"PUBSUB", b"NUMPAT"]).await;
+    let numpat = client.read_integer().await;
+    assert_eq!(numpat, 0);
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn unsubscribe_without_args_sends_one_event_per_channel() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client = RespClient::connect(addr).await;
+
+    client.send_array(&[b"SUBSCRIBE", b"a", b"b"]).await;
+    let _ = client.read_array().await;
+    let _ = client.read_array().await;
+
+    client.send_array(&[b"PSUBSCRIBE", b"p*"]).await;
+    let _ = client.read_array().await;
+
+    client.send_array(&[b"UNSUBSCRIBE"]).await;
+    let first = client.read_array().await;
+    let second = client.read_array().await;
+
+    // Order is stable due to sorting
+    assert_eq!(
+        first,
+        vec![b"unsubscribe".to_vec(), b"a".to_vec(), b"2".to_vec()]
+    );
+    assert_eq!(
+        second,
+        vec![b"unsubscribe".to_vec(), b"b".to_vec(), b"1".to_vec()]
+    );
+
+    client.send_array(&[b"PUNSUBSCRIBE"]).await;
+    let final_evt = client.read_array().await;
+    assert_eq!(
+        final_evt,
+        vec![b"punsubscribe".to_vec(), b"p*".to_vec(), b"0".to_vec()]
+    );
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}

@@ -25,6 +25,6 @@
     - [x] 模式订阅：`PSUBSCRIBE` / `PUNSUBSCRIBE`，推送 `pmessage` 事件。
     - [x] 查询命令：`PUBSUB CHANNELS|NUMSUB|NUMPAT`，含 pattern 统计。
     - [ ] 订阅生命周期：连接关闭/超时自动退订，空 channel 回收。
-    - [ ] 兼容性细节：`UNSUBSCRIBE` 无参数时的返回形态、多 channel 退订的计数一致性测试。
+    - [x] 兼容性细节：`UNSUBSCRIBE` 无参数时的返回形态、多 channel 退订的计数一致性测试。
     - [ ] backpressure：broadcast 缓冲策略与订阅/消息速率指标，防止订阅者过慢导致发送失败。
     - [x] AUTH 交互：未认证禁止发布/订阅，认证后保持订阅。
