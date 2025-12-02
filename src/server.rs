@@ -41,6 +41,8 @@ struct PubSubHub {
     shard_channels: Arc<DashMap<String, broadcast::Sender<PubMessage>>>,
 }
 
+const PUBSUB_BUFFER: usize = 128;
+
 impl PubSubHub {
     fn new() -> Self {
         PubSubHub {
@@ -54,7 +56,7 @@ impl PubSubHub {
         let tx = self
             .channels
             .entry(channel.to_string())
-            .or_insert_with(|| broadcast::channel(1024).0)
+            .or_insert_with(|| broadcast::channel(PUBSUB_BUFFER).0)
             .clone();
         tx.subscribe()
     }
@@ -63,7 +65,7 @@ impl PubSubHub {
         let tx = self
             .patterns
             .entry(pattern.to_string())
-            .or_insert_with(|| broadcast::channel(1024).0)
+            .or_insert_with(|| broadcast::channel(PUBSUB_BUFFER).0)
             .clone();
         tx.subscribe()
     }
@@ -72,7 +74,7 @@ impl PubSubHub {
         let tx = self
             .shard_channels
             .entry(channel.to_string())
-            .or_insert_with(|| broadcast::channel(1024).0)
+            .or_insert_with(|| broadcast::channel(PUBSUB_BUFFER).0)
             .clone();
         tx.subscribe()
     }
@@ -426,6 +428,13 @@ enum PubMessage {
         channel: String,
         payload: Arc<Vec<u8>>,
     },
+    Lagged,
+}
+
+#[derive(Clone, Copy)]
+enum PubSubOverflowStrategy {
+    Drop,
+    Disconnect,
 }
 
 async fn write_subscribe_event(
@@ -509,6 +518,7 @@ async fn write_pub_message_event(
             channel,
             payload,
         } => write_pmessage_event(writer, pattern, channel, payload).await,
+        PubMessage::Lagged => Ok(()),
     }
 }
 
@@ -1970,6 +1980,7 @@ async fn handle_connection(
     storage: Storage,
     metrics: Arc<Metrics>,
     pubsub: PubSubHub,
+    overflow_strategy: PubSubOverflowStrategy,
 ) -> io::Result<()> {
     let peer_addr = stream.peer_addr().ok();
     info!("[conn] new connection from {:?}", peer_addr);
@@ -1995,6 +2006,9 @@ async fn handle_connection(
             tokio::select! {
                 maybe_msg = msg_rx.recv() => {
                     if let Some(msg) = maybe_msg {
+                        if let PubMessage::Lagged = msg {
+                            break;
+                        }
                         write_pub_message_event(&mut write_half, &msg).await?;
                         continue;
                     }
@@ -2245,9 +2259,24 @@ async fn handle_connection(
                                         metrics_clone
                                             .pubsub_messages_dropped
                                             .fetch_add(n as u64, Ordering::Relaxed);
+                                        if matches!(
+                                            overflow_strategy,
+                                            PubSubOverflowStrategy::Disconnect
+                                        ) {
+                                            let _ = tx.send(PubMessage::Lagged);
+                                            break;
+                                        }
                                         continue;
                                     }
-                                    Err(broadcast::error::RecvError::Closed) => break,
+                                    Err(broadcast::error::RecvError::Closed) => {
+                                        if matches!(
+                                            overflow_strategy,
+                                            PubSubOverflowStrategy::Disconnect
+                                        ) {
+                                            let _ = tx.send(PubMessage::Lagged);
+                                        }
+                                        break;
+                                    }
                                 }
                             }
                         });
@@ -2312,9 +2341,24 @@ async fn handle_connection(
                                         metrics_clone
                                             .pubsub_messages_dropped
                                             .fetch_add(n as u64, Ordering::Relaxed);
+                                        if matches!(
+                                            overflow_strategy,
+                                            PubSubOverflowStrategy::Disconnect
+                                        ) {
+                                            let _ = tx.send(PubMessage::Lagged);
+                                            break;
+                                        }
                                         continue;
                                     }
-                                    Err(broadcast::error::RecvError::Closed) => break,
+                                    Err(broadcast::error::RecvError::Closed) => {
+                                        if matches!(
+                                            overflow_strategy,
+                                            PubSubOverflowStrategy::Disconnect
+                                        ) {
+                                            let _ = tx.send(PubMessage::Lagged);
+                                        }
+                                        break;
+                                    }
                                 }
                             }
                         });
@@ -2380,9 +2424,24 @@ async fn handle_connection(
                                         metrics_clone
                                             .pubsub_messages_dropped
                                             .fetch_add(n as u64, Ordering::Relaxed);
+                                        if matches!(
+                                            overflow_strategy,
+                                            PubSubOverflowStrategy::Disconnect
+                                        ) {
+                                            let _ = tx.send(PubMessage::Lagged);
+                                            break;
+                                        }
                                         continue;
                                     }
-                                    Err(broadcast::error::RecvError::Closed) => break,
+                                    Err(broadcast::error::RecvError::Closed) => {
+                                        if matches!(
+                                            overflow_strategy,
+                                            PubSubOverflowStrategy::Disconnect
+                                        ) {
+                                            let _ = tx.send(PubMessage::Lagged);
+                                        }
+                                        break;
+                                    }
                                 }
                             }
                         });
@@ -2618,9 +2677,16 @@ pub async fn serve(
                 let storage = storage.clone();
                 let metrics = metrics.clone();
                 let pubsub = pubsub.clone();
+                let overflow_strategy = match env::var("REDUST_PUBSUB_OVERFLOW") {
+                    Ok(v) => match v.to_ascii_lowercase().as_str() {
+                        "disconnect" => PubSubOverflowStrategy::Disconnect,
+                        _ => PubSubOverflowStrategy::Drop,
+                    },
+                    Err(_) => PubSubOverflowStrategy::Drop,
+                };
                 info!("Accepted connection from {}", addr);
                 tokio::spawn(async move {
-                    if let Err(err) = handle_connection(stream, storage, metrics, pubsub).await {
+                    if let Err(err) = handle_connection(stream, storage, metrics, pubsub, overflow_strategy).await {
                         error!("Connection error: {}", err);
                     }
                 });
