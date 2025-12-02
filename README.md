@@ -9,8 +9,9 @@ Redust 是一个使用 Rust 编写的、兼容 Redis 协议的轻量级服务。
     - 通用：`PING`、`ECHO`、`QUIT`、`TYPE`、`KEYS`、`DBSIZE`、`INFO`、`EXPIRE`/`PEXPIRE`、`TTL`/`PTTL`、`PERSIST` 等。
     - Strings：`SET`（含 NX/XX/KEEPTTL/GET 等扩展选项）、`GET`、`DEL`、`EXISTS`、`INCR`/`DECR`、`INCRBY`/`DECRBY`、`INCRBYFLOAT`、`APPEND`、`STRLEN`、`GETSET`、`GETRANGE`/`SETRANGE`、`MGET`、`MSET`、`MSETNX`、`SETNX`、`SETEX`/`PSETEX`、`GETDEL`、`GETEX` 等。
     - Lists：`LPUSH`、`RPUSH`、`LPOP`、`RPOP`、`LRANGE` 等。
-    - Sets：`SADD`、`SREM`、`SMEMBERS`、`SCARD`、`SISMEMBER`、`SUNION`、`SINTER`、`SDIFF` 及部分存储型变体。
+    - Sets：`SADD`、`SREM`、`SMEMBERS`、`SCARD`、`SISMEMBER`、`SUNION`、`SINTER`、`SDIFF`，支持 `SPOP` / `SRANDMEMBER` 以及 `SUNIONSTORE` / `SINTERSTORE` / `SDIFFSTORE`。
     - Hashes：`HSET`、`HGET`、`HGETALL`、`HDEL`、`HEXISTS`、`HINCRBY` 等常用命令。
+    - Pub/Sub：`PUBLISH`、`SUBSCRIBE`/`PSUBSCRIBE`、`UNSUBSCRIBE`/`PUNSUBSCRIBE`，以及 `PUBSUB CHANNELS|NUMSUB|NUMPAT`。
   - 更完整、实时的命令支持情况请参考仓库根目录的 `command.md`。
   - 协议层基于 RESP2，实现了数组解析与 Bulk String 编解码。
 - **异步高并发**：基于 Tokio 运行时，每个 TCP 连接在独立任务中处理，支持多客户端并发访问同一存储。

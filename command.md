@@ -114,7 +114,7 @@
 
 状态说明：
 - 多 key 运算在集合缺失/类型错误时的行为已经与 Redis 接近，并有针对性测试。
-- TODO：暂未实现 `SUNIONSTORE` / `SINTERSTORE` / `SDIFFSTORE` 等写入型命令。
+- 已补充 `SUNIONSTORE` / `SINTERSTORE` / `SDIFFSTORE` 等写入型命令，结果写回会覆盖目标 key 并清除旧 TTL。
 
 ---
 
@@ -169,6 +169,16 @@
 过期实现概要：
 - 懒删除：所有读/改 key 的路径在操作前会检查并删除已过期键。
 - 定期删除：后台任务定期抽样少量 key，执行过期检查与删除。
+
+---
+
+## Pub/Sub
+
+- [x] **PUBLISH / SUBSCRIBE / PSUBSCRIBE / UNSUBSCRIBE / PUNSUBSCRIBE**
+  - 当前：支持频道订阅与模式订阅，订阅模式下仅允许 (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT，推送 `message` / `pmessage` 事件。
+- [x] **PUBSUB CHANNELS / NUMSUB / NUMPAT**
+  - 当前：`CHANNELS` 列出仍有订阅者的频道（可选简单 glob 过滤），`NUMSUB` 返回各频道的订阅数，`NUMPAT` 返回模式订阅总数。
+- TODO：订阅连接关闭/超时自动退订、空频道回收、与 Redis 对齐的更多兼容性细节。
 
 ---
 
@@ -354,9 +364,9 @@
 - [x] SUNION
 - [x] SINTER
 - [x] SDIFF
-- [ ] SUNIONSTORE
-- [ ] SINTERSTORE
-- [ ] SDIFFSTORE
+- [x] SUNIONSTORE
+- [x] SINTERSTORE
+- [x] SDIFFSTORE
 - [ ] SSCAN
 
 ### Sorted Sets (ZSets)
@@ -395,12 +405,12 @@
 
 ### Pub/Sub
 
-- [ ] PUBLISH
-- [ ] SUBSCRIBE
-- [ ] PSUBSCRIBE
-- [ ] UNSUBSCRIBE
-- [ ] PUNSUBSCRIBE
-- [ ] PUBSUB *（CHANNELS/NUMSUB/NUMPAT）*
+- [x] PUBLISH
+- [x] SUBSCRIBE
+- [x] PSUBSCRIBE
+- [x] UNSUBSCRIBE
+- [x] PUNSUBSCRIBE
+- [x] PUBSUB *（CHANNELS/NUMSUB/NUMPAT）*
 
 ### Transactions
 

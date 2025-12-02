@@ -1,25 +1,24 @@
-use std::future::Future;
 use std::collections::HashMap;
-use std::sync::{Arc, atomic::{AtomicU64, AtomicUsize, Ordering}};
-use std::time::Instant;
 use std::env;
+use std::future::Future;
+use std::sync::{
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+    Arc,
+};
+use std::time::Instant;
 
+use dashmap::DashMap;
 use tokio::io::{self, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::sleep;
 use tokio::sync::{broadcast, mpsc};
-use dashmap::DashMap;
+use tokio::time::sleep;
 
-use log::{info, error};
+use log::{error, info};
 
 use crate::command::{read_command, Command, CommandError}; // Import CommandError
 use crate::resp::{
-    respond_bulk_string,
-    respond_bulk_bytes,
+    respond_bulk_bytes, respond_bulk_string, respond_error, respond_integer, respond_null_bulk,
     respond_simple_string,
-    respond_error,
-    respond_integer,
-    respond_null_bulk,
 };
 use crate::storage::Storage;
 
@@ -32,17 +31,19 @@ struct Metrics {
 
 #[derive(Clone)]
 struct PubSubHub {
-    channels: Arc<DashMap<String, broadcast::Sender<Vec<u8>>>>,
+    channels: Arc<DashMap<String, broadcast::Sender<PubMessage>>>,
+    patterns: Arc<DashMap<String, broadcast::Sender<PubMessage>>>,
 }
 
 impl PubSubHub {
     fn new() -> Self {
         PubSubHub {
             channels: Arc::new(DashMap::new()),
+            patterns: Arc::new(DashMap::new()),
         }
     }
 
-    fn subscribe(&self, channel: &str) -> broadcast::Receiver<Vec<u8>> {
+    fn subscribe_channel(&self, channel: &str) -> broadcast::Receiver<PubMessage> {
         let tx = self
             .channels
             .entry(channel.to_string())
@@ -51,15 +52,103 @@ impl PubSubHub {
         tx.subscribe()
     }
 
-    fn publish(&self, channel: &str, payload: &[u8]) -> usize {
-        if let Some(sender) = self.channels.get(channel) {
-            match sender.send(payload.to_vec()) {
-                Ok(n) => n,
-                Err(_) => 0,
+    fn subscribe_pattern(&self, pattern: &str) -> broadcast::Receiver<PubMessage> {
+        let tx = self
+            .patterns
+            .entry(pattern.to_string())
+            .or_insert_with(|| broadcast::channel(1024).0)
+            .clone();
+        tx.subscribe()
+    }
+
+    fn cleanup_stale(&self) {
+        let mut drop_channels = Vec::new();
+        for entry in self.channels.iter() {
+            if entry.value().receiver_count() == 0 {
+                drop_channels.push(entry.key().clone());
             }
-        } else {
-            0
         }
+        for ch in drop_channels {
+            self.channels.remove(&ch);
+        }
+
+        let mut drop_patterns = Vec::new();
+        for entry in self.patterns.iter() {
+            if entry.value().receiver_count() == 0 {
+                drop_patterns.push(entry.key().clone());
+            }
+        }
+        for pat in drop_patterns {
+            self.patterns.remove(&pat);
+        }
+    }
+
+    fn publish(&self, channel: &str, payload: &[u8]) -> usize {
+        self.cleanup_stale();
+
+        let payload = Arc::new(payload.to_vec());
+        let mut delivered = 0usize;
+        let channel_name = channel.to_string();
+
+        if let Some(sender) = self.channels.get(channel) {
+            let message = PubMessage::Channel {
+                channel: channel_name.clone(),
+                payload: payload.clone(),
+            };
+            delivered += sender.send(message).unwrap_or(0);
+        }
+
+        for entry in self.patterns.iter() {
+            if pattern_match(entry.key(), channel) {
+                let message = PubMessage::Pattern {
+                    pattern: entry.key().clone(),
+                    channel: channel_name.clone(),
+                    payload: payload.clone(),
+                };
+                delivered += entry.value().send(message).unwrap_or(0);
+            }
+        }
+
+        delivered
+    }
+
+    fn active_channels(&self, pattern: Option<&str>) -> Vec<String> {
+        self.cleanup_stale();
+
+        let mut channels: Vec<String> = self
+            .channels
+            .iter()
+            .filter(|entry| entry.value().receiver_count() > 0)
+            .filter_map(|entry| {
+                let name = entry.key();
+                if let Some(pat) = pattern {
+                    if !pattern_match(pat, name) {
+                        return None;
+                    }
+                }
+                Some(name.clone())
+            })
+            .collect();
+        channels.sort();
+        channels
+    }
+
+    fn channel_subscribers(&self, channel: &str) -> usize {
+        self.cleanup_stale();
+
+        self.channels
+            .get(channel)
+            .map(|sender| sender.receiver_count())
+            .unwrap_or(0)
+    }
+
+    fn pattern_subscription_count(&self) -> usize {
+        self.cleanup_stale();
+
+        self.patterns
+            .iter()
+            .map(|entry| entry.value().receiver_count())
+            .sum()
     }
 }
 
@@ -109,8 +198,28 @@ fn format_bytes(bytes: u64) -> String {
     format!("{}B", bytes)
 }
 
+fn pattern_match(pattern: &str, value: &str) -> bool {
+    fn helper(pattern: &[u8], value: &[u8]) -> bool {
+        if pattern.is_empty() {
+            return value.is_empty();
+        }
+        match pattern[0] {
+            b'*' => {
+                helper(&pattern[1..], value) || (!value.is_empty() && helper(pattern, &value[1..]))
+            }
+            b'?' => !value.is_empty() && helper(&pattern[1..], &value[1..]),
+            c => !value.is_empty() && c == value[0] && helper(&pattern[1..], &value[1..]),
+        }
+    }
+
+    helper(pattern.as_bytes(), value.as_bytes())
+}
+
 fn current_max_value_bytes() -> Option<u64> {
-    env::var("REDUST_MAXVALUE_BYTES").ok().and_then(|s| parse_maxmemory_bytes(&s)).filter(|v| *v > 0)
+    env::var("REDUST_MAXVALUE_BYTES")
+        .ok()
+        .and_then(|s| parse_maxmemory_bytes(&s))
+        .filter(|v| *v > 0)
 }
 
 fn build_prometheus_metrics(storage: &Storage, metrics: &Metrics) -> String {
@@ -140,9 +249,17 @@ fn prefix_key(db: u8, key: &str) -> String {
     format!("{}:{}", db, key)
 }
 
-struct PubMessage {
-    channel: String,
-    payload: Vec<u8>,
+#[derive(Clone)]
+enum PubMessage {
+    Channel {
+        channel: String,
+        payload: Arc<Vec<u8>>,
+    },
+    Pattern {
+        pattern: String,
+        channel: String,
+        payload: Arc<Vec<u8>>,
+    },
 }
 
 async fn write_subscribe_event(
@@ -172,13 +289,61 @@ async fn write_message_event(
     payload: &[u8],
 ) -> io::Result<()> {
     writer
-        .write_all(format!("*3\r\n$7\r\nmessage\r\n${}\r\n{}\r\n", channel.len(), channel).as_bytes())
+        .write_all(
+            format!(
+                "*3\r\n$7\r\nmessage\r\n${}\r\n{}\r\n",
+                channel.len(),
+                channel
+            )
+            .as_bytes(),
+        )
         .await?;
     writer
         .write_all(format!("${}\r\n", payload.len()).as_bytes())
         .await?;
     writer.write_all(payload).await?;
     writer.write_all(b"\r\n").await
+}
+
+async fn write_pmessage_event(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    pattern: &str,
+    channel: &str,
+    payload: &[u8],
+) -> io::Result<()> {
+    writer
+        .write_all(
+            format!(
+                "*4\r\n$8\r\npmessage\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                pattern.len(),
+                pattern,
+                channel.len(),
+                channel
+            )
+            .as_bytes(),
+        )
+        .await?;
+    writer
+        .write_all(format!("${}\r\n", payload.len()).as_bytes())
+        .await?;
+    writer.write_all(payload).await?;
+    writer.write_all(b"\r\n").await
+}
+
+async fn write_pub_message_event(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    message: &PubMessage,
+) -> io::Result<()> {
+    match message {
+        PubMessage::Channel { channel, payload } => {
+            write_message_event(writer, channel, payload).await
+        }
+        PubMessage::Pattern {
+            pattern,
+            channel,
+            payload,
+        } => write_pmessage_event(writer, pattern, channel, payload).await,
+    }
 }
 
 async fn write_pong_event(
@@ -208,7 +373,15 @@ async fn handle_string_command(
         Command::Quit => {
             respond_simple_string(writer, "OK").await?;
         }
-        Command::Set { key, value, expire_millis, nx, xx, keep_ttl, get } => {
+        Command::Set {
+            key,
+            value,
+            expire_millis,
+            nx,
+            xx,
+            keep_ttl,
+            get,
+        } => {
             let physical = prefix_key(current_db, &key);
 
             // 长度限制
@@ -225,7 +398,11 @@ async fn handle_string_command(
             // 若指定 KEEPTTL，则在覆盖前先读取剩余 TTL
             let keep_ttl_ms = if keep_ttl {
                 let ttl = storage.pttl_millis(&physical);
-                if ttl > 0 { Some(ttl) } else { None }
+                if ttl > 0 {
+                    Some(ttl)
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -314,11 +491,19 @@ async fn handle_string_command(
                     respond_null_bulk(writer).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
-        Command::Getex { key, expire_millis, persist } => {
+        Command::Getex {
+            key,
+            expire_millis,
+            persist,
+        } => {
             let physical = prefix_key(current_db, &key);
 
             let value_opt = storage.get(&physical);
@@ -348,7 +533,11 @@ async fn handle_string_command(
                     respond_bulk_bytes(writer, &s).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -366,7 +555,11 @@ async fn handle_string_command(
                     respond_integer(writer, len as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -384,7 +577,11 @@ async fn handle_string_command(
                     respond_integer(writer, new_len as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -395,7 +592,11 @@ async fn handle_string_command(
                     respond_integer(writer, len as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -416,7 +617,11 @@ async fn handle_string_command(
                     respond_null_bulk(writer).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -465,17 +670,26 @@ async fn handle_string_command(
             }
         }
         Command::Del { keys } => {
-            let physical: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
+            let physical: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
             let removed = storage.del(&physical);
             respond_integer(writer, removed as i64).await?;
         }
         Command::Exists { keys } => {
-            let physical: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
+            let physical: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
             let count = storage.exists(&physical);
             respond_integer(writer, count as i64).await?;
         }
         Command::Mget { keys } => {
-            let physical: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
+            let physical: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
             let values = storage.mget(&physical);
             writer
                 .write_all(format!("*{}\r\n", values.len()).as_bytes())
@@ -543,7 +757,11 @@ async fn handle_string_command(
             let v = if inserted { 1 } else { 0 };
             respond_integer(writer, v).await?;
         }
-        Command::Setex { key, seconds, value } => {
+        Command::Setex {
+            key,
+            seconds,
+            value,
+        } => {
             let physical = prefix_key(current_db, &key);
             if let Some(limit) = current_max_value_bytes() {
                 if (value.len() as u64) > limit {
@@ -593,7 +811,11 @@ async fn handle_list_command(
                     respond_integer(writer, len as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -608,7 +830,11 @@ async fn handle_list_command(
                     writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -623,7 +849,11 @@ async fn handle_list_command(
                     writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -645,7 +875,11 @@ async fn handle_list_command(
                     writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -664,7 +898,11 @@ async fn handle_list_command(
                     respond_integer(writer, len as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -679,7 +917,11 @@ async fn handle_list_command(
                     writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -693,7 +935,11 @@ async fn handle_list_command(
                     respond_null_bulk(writer).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -707,7 +953,11 @@ async fn handle_list_command(
                     respond_null_bulk(writer).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -718,7 +968,11 @@ async fn handle_list_command(
                     respond_integer(writer, len as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -732,7 +986,11 @@ async fn handle_list_command(
                     respond_null_bulk(writer).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -743,7 +1001,11 @@ async fn handle_list_command(
                     respond_integer(writer, removed as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -754,7 +1016,11 @@ async fn handle_list_command(
                     respond_simple_string(writer, "OK").await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -786,7 +1052,11 @@ async fn handle_set_command(
                     respond_integer(writer, added as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -797,7 +1067,11 @@ async fn handle_set_command(
                     respond_integer(writer, removed as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -812,7 +1086,11 @@ async fn handle_set_command(
                     writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -823,7 +1101,11 @@ async fn handle_set_command(
                     respond_integer(writer, card as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -835,12 +1117,19 @@ async fn handle_set_command(
                     respond_integer(writer, v).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
         Command::Sunion { keys } => {
-            let physical: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
+            let physical: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
             match storage.sunion(&physical) {
                 Ok(members) => {
                     let mut response = format!("*{}\r\n", members.len());
@@ -850,12 +1139,19 @@ async fn handle_set_command(
                     writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
         Command::Sinter { keys } => {
-            let physical: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
+            let physical: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
             match storage.sinter(&physical) {
                 Ok(members) => {
                     let mut response = format!("*{}\r\n", members.len());
@@ -865,12 +1161,19 @@ async fn handle_set_command(
                     writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
         Command::Sdiff { keys } => {
-            let physical: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
+            let physical: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
             match storage.sdiff(&physical) {
                 Ok(members) => {
                     let mut response = format!("*{}\r\n", members.len());
@@ -880,43 +1183,68 @@ async fn handle_set_command(
                     writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
         Command::Sunionstore { dest, keys } => {
-            let physical_keys: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
+            let physical_keys: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
             let physical_dest = prefix_key(current_db, &dest);
             match storage.sunionstore(&physical_dest, &physical_keys) {
                 Ok(len) => {
                     respond_integer(writer, len as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
         Command::Sinterstore { dest, keys } => {
-            let physical_keys: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
+            let physical_keys: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
             let physical_dest = prefix_key(current_db, &dest);
             match storage.sinterstore(&physical_dest, &physical_keys) {
                 Ok(len) => {
                     respond_integer(writer, len as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
         Command::Sdiffstore { dest, keys } => {
-            let physical_keys: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
+            let physical_keys: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
             let physical_dest = prefix_key(current_db, &dest);
             match storage.sdiffstore(&physical_dest, &physical_keys) {
                 Ok(len) => {
                     respond_integer(writer, len as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -943,33 +1271,39 @@ async fn handle_set_command(
                     }
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
         Command::Srandmember { key, count } => {
             let physical = prefix_key(current_db, &key);
             match storage.srandmember(&physical, count) {
-                Ok(members) => {
-                    match count {
-                        None => {
-                            if let Some(m) = members.into_iter().next() {
-                                respond_bulk_string(writer, &m).await?;
-                            } else {
-                                respond_null_bulk(writer).await?;
-                            }
-                        }
-                        Some(_) => {
-                            let mut response = format!("*{}\r\n", members.len());
-                            for m in members {
-                                response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
-                            }
-                            writer.write_all(response.as_bytes()).await?;
+                Ok(members) => match count {
+                    None => {
+                        if let Some(m) = members.into_iter().next() {
+                            respond_bulk_string(writer, &m).await?;
+                        } else {
+                            respond_null_bulk(writer).await?;
                         }
                     }
-                }
+                    Some(_) => {
+                        let mut response = format!("*{}\r\n", members.len());
+                        for m in members {
+                            response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
+                        }
+                        writer.write_all(response.as_bytes()).await?;
+                    }
+                },
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -999,7 +1333,11 @@ async fn handle_hash_command(
                     respond_integer(writer, added as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -1013,7 +1351,11 @@ async fn handle_hash_command(
                     respond_null_bulk(writer).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -1024,7 +1366,11 @@ async fn handle_hash_command(
                     respond_integer(writer, removed as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -1036,7 +1382,11 @@ async fn handle_hash_command(
                     respond_integer(writer, v).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -1052,7 +1402,11 @@ async fn handle_hash_command(
                     writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -1067,7 +1421,11 @@ async fn handle_hash_command(
                     writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -1082,7 +1440,11 @@ async fn handle_hash_command(
                     writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -1105,7 +1467,11 @@ async fn handle_hash_command(
                     writer.write_all(response.as_bytes()).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -1117,7 +1483,11 @@ async fn handle_hash_command(
                     respond_integer(writer, value).await?;
                 }
                 Err(crate::storage::HincrError::WrongType) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
                 Err(crate::storage::HincrError::NotInteger) => {
                     respond_error(writer, "ERR hash value is not an integer").await?;
@@ -1147,7 +1517,11 @@ async fn handle_hash_command(
                     respond_bulk_string(writer, &s).await?;
                 }
                 Err(crate::storage::HincrFloatError::WrongType) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
                 Err(crate::storage::HincrFloatError::NotFloat) => {
                     respond_error(writer, "ERR hash value is not a valid float").await?;
@@ -1164,7 +1538,11 @@ async fn handle_hash_command(
                     respond_integer(writer, len as i64).await?;
                 }
                 Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -1377,7 +1755,11 @@ async fn handle_metrics_connection(
     Ok(())
 }
 
-async fn run_metrics_exporter(bind_addr: &str, storage: Storage, metrics: Arc<Metrics>) -> io::Result<()> {
+async fn run_metrics_exporter(
+    bind_addr: &str,
+    storage: Storage,
+    metrics: Arc<Metrics>,
+) -> io::Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
     info!("[metrics] exporter listening on {}", listener.local_addr()?);
 
@@ -1394,7 +1776,12 @@ async fn run_metrics_exporter(bind_addr: &str, storage: Storage, metrics: Arc<Me
     }
 }
 
-async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Metrics>, pubsub: PubSubHub) -> io::Result<()> {
+async fn handle_connection(
+    stream: TcpStream,
+    storage: Storage,
+    metrics: Arc<Metrics>,
+    pubsub: PubSubHub,
+) -> io::Result<()> {
     let peer_addr = stream.peer_addr().ok();
     info!("[conn] new connection from {:?}", peer_addr);
 
@@ -1404,10 +1791,13 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
     let mut reader = BufReader::new(read_half);
     let mut current_db: u8 = 0;
 
-    let auth_password = env::var("REDUST_AUTH_PASSWORD").ok().filter(|s| !s.is_empty());
+    let auth_password = env::var("REDUST_AUTH_PASSWORD")
+        .ok()
+        .filter(|s| !s.is_empty());
     let mut authenticated = auth_password.is_none();
     let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<PubMessage>();
-    let mut subscriptions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut channel_subscriptions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut pattern_subscriptions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut subscribed_mode = false;
 
     loop {
@@ -1415,7 +1805,7 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
             tokio::select! {
                 maybe_msg = msg_rx.recv() => {
                     if let Some(msg) = maybe_msg {
-                        write_message_event(&mut write_half, &msg.channel, &msg.payload).await?;
+                        write_pub_message_event(&mut write_half, &msg).await?;
                         continue;
                     }
                     read_command(&mut reader).await
@@ -1460,7 +1850,11 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
                         authenticated = true;
                         respond_simple_string(&mut write_half, "OK").await?;
                     } else {
-                        respond_error(&mut write_half, "WRONGPASS invalid username-password pair or user is disabled").await?;
+                        respond_error(
+                            &mut write_half,
+                            "WRONGPASS invalid username-password pair or user is disabled",
+                        )
+                        .await?;
                     }
                     continue;
                 }
@@ -1482,7 +1876,12 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
 
         if subscribed_mode {
             match cmd {
-                Command::Subscribe { .. } | Command::Unsubscribe { .. } | Command::Ping | Command::Quit => {}
+                Command::Subscribe { .. }
+                | Command::Unsubscribe { .. }
+                | Command::Psubscribe { .. }
+                | Command::Punsubscribe { .. }
+                | Command::Ping
+                | Command::Quit => {}
                 _ => {
                     respond_error(&mut write_half, "ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context").await?;
                     continue;
@@ -1603,7 +2002,8 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
             Command::Publish { channel, message } => {
                 if let Some(limit) = current_max_value_bytes() {
                     if (message.len() as u64) > limit {
-                        respond_error(&mut write_half, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                        respond_error(&mut write_half, "ERR value exceeds REDUST_MAXVALUE_BYTES")
+                            .await?;
                         continue;
                     }
                 }
@@ -1613,44 +2013,103 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
             // Pub/Sub 订阅
             Command::Subscribe { channels } => {
                 for channel in channels {
-                    if !subscriptions.contains_key(&channel) {
-                        let mut rx = pubsub.subscribe(&channel);
+                    if !channel_subscriptions.contains_key(&channel) {
+                        let mut rx = pubsub.subscribe_channel(&channel);
                         let tx = msg_tx.clone();
-                        let ch = channel.clone();
                         let handle = tokio::spawn(async move {
-                            while let Ok(payload) = rx.recv().await {
-                                let _ = tx.send(PubMessage {
-                                    channel: ch.clone(),
-                                    payload,
-                                });
+                            while let Ok(message) = rx.recv().await {
+                                let _ = tx.send(message);
                             }
                         });
-                        subscriptions.insert(channel.clone(), handle);
+                        channel_subscriptions.insert(channel.clone(), handle);
                     }
-                    let count = subscriptions.len();
+                    let count = channel_subscriptions.len() + pattern_subscriptions.len();
                     write_subscribe_event(&mut write_half, "subscribe", &channel, count).await?;
                 }
-                subscribed_mode = !subscriptions.is_empty();
+                subscribed_mode = (channel_subscriptions.len() + pattern_subscriptions.len()) > 0;
             }
             Command::Unsubscribe { channels } => {
                 let targets: Vec<String> = if channels.is_empty() {
-                    subscriptions.keys().cloned().collect()
+                    channel_subscriptions.keys().cloned().collect()
                 } else {
                     channels
                 };
 
                 if targets.is_empty() {
-                    write_subscribe_event(&mut write_half, "unsubscribe", "", subscriptions.len()).await?;
+                    let count = channel_subscriptions.len() + pattern_subscriptions.len();
+                    write_subscribe_event(&mut write_half, "unsubscribe", "", count).await?;
                 } else {
                     for ch in targets {
-                        if let Some(handle) = subscriptions.remove(&ch) {
+                        if let Some(handle) = channel_subscriptions.remove(&ch) {
                             handle.abort();
                         }
-                        let count = subscriptions.len();
+                        let count = channel_subscriptions.len() + pattern_subscriptions.len();
                         write_subscribe_event(&mut write_half, "unsubscribe", &ch, count).await?;
                     }
                 }
-                subscribed_mode = !subscriptions.is_empty();
+                subscribed_mode = (channel_subscriptions.len() + pattern_subscriptions.len()) > 0;
+                pubsub.cleanup_stale();
+            }
+            // 模式订阅
+            Command::Psubscribe { patterns } => {
+                for pattern in patterns {
+                    if !pattern_subscriptions.contains_key(&pattern) {
+                        let mut rx = pubsub.subscribe_pattern(&pattern);
+                        let tx = msg_tx.clone();
+                        let handle = tokio::spawn(async move {
+                            while let Ok(message) = rx.recv().await {
+                                let _ = tx.send(message);
+                            }
+                        });
+                        pattern_subscriptions.insert(pattern.clone(), handle);
+                    }
+                    let count = channel_subscriptions.len() + pattern_subscriptions.len();
+                    write_subscribe_event(&mut write_half, "psubscribe", &pattern, count).await?;
+                }
+                subscribed_mode = (channel_subscriptions.len() + pattern_subscriptions.len()) > 0;
+            }
+            Command::Punsubscribe { patterns } => {
+                let targets: Vec<String> = if patterns.is_empty() {
+                    pattern_subscriptions.keys().cloned().collect()
+                } else {
+                    patterns
+                };
+
+                if targets.is_empty() {
+                    let count = channel_subscriptions.len() + pattern_subscriptions.len();
+                    write_subscribe_event(&mut write_half, "punsubscribe", "", count).await?;
+                } else {
+                    for pat in targets {
+                        if let Some(handle) = pattern_subscriptions.remove(&pat) {
+                            handle.abort();
+                        }
+                        let count = channel_subscriptions.len() + pattern_subscriptions.len();
+                        write_subscribe_event(&mut write_half, "punsubscribe", &pat, count).await?;
+                    }
+                }
+                subscribed_mode = (channel_subscriptions.len() + pattern_subscriptions.len()) > 0;
+                pubsub.cleanup_stale();
+            }
+            Command::PubsubChannels { pattern } => {
+                let channels = pubsub.active_channels(pattern.as_deref());
+                let header = format!("*{}\r\n", channels.len());
+                write_half.write_all(header.as_bytes()).await?;
+                for ch in channels {
+                    respond_bulk_string(&mut write_half, &ch).await?;
+                }
+            }
+            Command::PubsubNumsub { channels } => {
+                let header = format!("*{}\r\n", channels.len() * 2);
+                write_half.write_all(header.as_bytes()).await?;
+                for ch in channels {
+                    respond_bulk_string(&mut write_half, &ch).await?;
+                    let subscribers = pubsub.channel_subscribers(&ch);
+                    respond_integer(&mut write_half, subscribers as i64).await?;
+                }
+            }
+            Command::PubsubNumpat => {
+                let total = pubsub.pattern_subscription_count();
+                respond_integer(&mut write_half, total as i64).await?;
             }
 
             Command::Auth { .. } => {
@@ -1675,9 +2134,14 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
         }
     }
 
-    for (_, handle) in subscriptions {
+    for (_, handle) in channel_subscriptions {
         handle.abort();
     }
+    for (_, handle) in pattern_subscriptions {
+        handle.abort();
+    }
+
+    pubsub.cleanup_stale();
 
     metrics.connected_clients.fetch_sub(1, Ordering::Relaxed);
 
@@ -1756,7 +2220,9 @@ pub async fn serve(
             let storage_clone = storage.clone();
             let metrics_clone = metrics.clone();
             tokio::spawn(async move {
-                if let Err(e) = run_metrics_exporter(&metrics_addr, storage_clone, metrics_clone).await {
+                if let Err(e) =
+                    run_metrics_exporter(&metrics_addr, storage_clone, metrics_clone).await
+                {
                     error!("[metrics] exporter failed: {}", e);
                 }
             });

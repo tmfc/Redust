@@ -1,5 +1,5 @@
-use tokio::io::{self, BufReader};
 use std::fmt;
+use tokio::io::{self, BufReader};
 
 use crate::resp::read_resp_array;
 
@@ -45,82 +45,275 @@ pub enum Command {
         keep_ttl: bool,
         get: bool,
     },
-    Get { key: String },
-    Getdel { key: String },
+    Get {
+        key: String,
+    },
+    Getdel {
+        key: String,
+    },
     Getex {
         key: String,
         expire_millis: Option<i64>,
         persist: bool,
     },
-    Getrange { key: String, start: isize, end: isize },
-    Setrange { key: String, offset: usize, value: Binary },
-    Append { key: String, value: Binary },
-    Strlen { key: String },
-    Getset { key: String, value: Binary },
-    Del { keys: Vec<String> },
-    Exists { keys: Vec<String> },
-    Incr { key: String },
-    Decr { key: String },
-    Incrby { key: String, delta: i64 },
-    Decrby { key: String, delta: i64 },
-    Incrbyfloat { key: String, delta: f64 },
-    Type { key: String },
-    Keys { pattern: String },
+    Getrange {
+        key: String,
+        start: isize,
+        end: isize,
+    },
+    Setrange {
+        key: String,
+        offset: usize,
+        value: Binary,
+    },
+    Append {
+        key: String,
+        value: Binary,
+    },
+    Strlen {
+        key: String,
+    },
+    Getset {
+        key: String,
+        value: Binary,
+    },
+    Del {
+        keys: Vec<String>,
+    },
+    Exists {
+        keys: Vec<String>,
+    },
+    Incr {
+        key: String,
+    },
+    Decr {
+        key: String,
+    },
+    Incrby {
+        key: String,
+        delta: i64,
+    },
+    Decrby {
+        key: String,
+        delta: i64,
+    },
+    Incrbyfloat {
+        key: String,
+        delta: f64,
+    },
+    Type {
+        key: String,
+    },
+    Keys {
+        pattern: String,
+    },
     Dbsize,
-    Lpush { key: String, values: Vec<String> },
-    Rpush { key: String, values: Vec<String> },
-    Lrange { key: String, start: isize, stop: isize },
-    Lpop { key: String },
-    Rpop { key: String },
-    Llen { key: String },
-    Lindex { key: String, index: isize },
-    Lrem { key: String, count: isize, value: String },
-    Ltrim { key: String, start: isize, stop: isize },
-    Sadd { key: String, members: Vec<String> },
-    Srem { key: String, members: Vec<String> },
-    Smembers { key: String },
-    Scard { key: String },
-    Sismember { key: String, member: String },
-    Spop { key: String, count: Option<i64> },
-    Srandmember { key: String, count: Option<i64> },
-    Sunion { keys: Vec<String> },
-    Sinter { keys: Vec<String> },
-    Sdiff { keys: Vec<String> },
-    Sunionstore { dest: String, keys: Vec<String> },
-    Sinterstore { dest: String, keys: Vec<String> },
-    Sdiffstore { dest: String, keys: Vec<String> },
-    Hset { key: String, field: String, value: String },
-    Hget { key: String, field: String },
-    Hdel { key: String, fields: Vec<String> },
-    Hexists { key: String, field: String },
-    Hgetall { key: String },
-    Hkeys { key: String },
-    Hvals { key: String },
-    Hmget { key: String, fields: Vec<String> },
-    Hincrby { key: String, field: String, delta: i64 },
-    Hincrbyfloat { key: String, field: String, delta: f64 },
-    Hlen { key: String },
-    Expire { key: String, seconds: i64 },
-    Pexpire { key: String, millis: i64 },
-    Ttl { key: String },
-    Pttl { key: String },
-    Persist { key: String },
+    Lpush {
+        key: String,
+        values: Vec<String>,
+    },
+    Rpush {
+        key: String,
+        values: Vec<String>,
+    },
+    Lrange {
+        key: String,
+        start: isize,
+        stop: isize,
+    },
+    Lpop {
+        key: String,
+    },
+    Rpop {
+        key: String,
+    },
+    Llen {
+        key: String,
+    },
+    Lindex {
+        key: String,
+        index: isize,
+    },
+    Lrem {
+        key: String,
+        count: isize,
+        value: String,
+    },
+    Ltrim {
+        key: String,
+        start: isize,
+        stop: isize,
+    },
+    Sadd {
+        key: String,
+        members: Vec<String>,
+    },
+    Srem {
+        key: String,
+        members: Vec<String>,
+    },
+    Smembers {
+        key: String,
+    },
+    Scard {
+        key: String,
+    },
+    Sismember {
+        key: String,
+        member: String,
+    },
+    Spop {
+        key: String,
+        count: Option<i64>,
+    },
+    Srandmember {
+        key: String,
+        count: Option<i64>,
+    },
+    Sunion {
+        keys: Vec<String>,
+    },
+    Sinter {
+        keys: Vec<String>,
+    },
+    Sdiff {
+        keys: Vec<String>,
+    },
+    Sunionstore {
+        dest: String,
+        keys: Vec<String>,
+    },
+    Sinterstore {
+        dest: String,
+        keys: Vec<String>,
+    },
+    Sdiffstore {
+        dest: String,
+        keys: Vec<String>,
+    },
+    Hset {
+        key: String,
+        field: String,
+        value: String,
+    },
+    Hget {
+        key: String,
+        field: String,
+    },
+    Hdel {
+        key: String,
+        fields: Vec<String>,
+    },
+    Hexists {
+        key: String,
+        field: String,
+    },
+    Hgetall {
+        key: String,
+    },
+    Hkeys {
+        key: String,
+    },
+    Hvals {
+        key: String,
+    },
+    Hmget {
+        key: String,
+        fields: Vec<String>,
+    },
+    Hincrby {
+        key: String,
+        field: String,
+        delta: i64,
+    },
+    Hincrbyfloat {
+        key: String,
+        field: String,
+        delta: f64,
+    },
+    Hlen {
+        key: String,
+    },
+    Expire {
+        key: String,
+        seconds: i64,
+    },
+    Pexpire {
+        key: String,
+        millis: i64,
+    },
+    Ttl {
+        key: String,
+    },
+    Pttl {
+        key: String,
+    },
+    Persist {
+        key: String,
+    },
     Info,
-    Auth { password: String },
-    Select { db: u8 },
-    Mget { keys: Vec<String> },
-    Mset { pairs: Vec<(String, Binary)> },
-    Msetnx { pairs: Vec<(String, Binary)> },
-    Rename { key: String, newkey: String },
-    Renamenx { key: String, newkey: String },
+    Auth {
+        password: String,
+    },
+    Select {
+        db: u8,
+    },
+    Mget {
+        keys: Vec<String>,
+    },
+    Mset {
+        pairs: Vec<(String, Binary)>,
+    },
+    Msetnx {
+        pairs: Vec<(String, Binary)>,
+    },
+    Rename {
+        key: String,
+        newkey: String,
+    },
+    Renamenx {
+        key: String,
+        newkey: String,
+    },
     Flushdb,
     Flushall,
-    Setnx { key: String, value: Binary },
-    Setex { key: String, seconds: i64, value: Binary },
-    Psetex { key: String, millis: i64, value: Binary },
-    Subscribe { channels: Vec<String> },
-    Unsubscribe { channels: Vec<String> },
-    Publish { channel: String, message: Binary },
+    Setnx {
+        key: String,
+        value: Binary,
+    },
+    Setex {
+        key: String,
+        seconds: i64,
+        value: Binary,
+    },
+    Psetex {
+        key: String,
+        millis: i64,
+        value: Binary,
+    },
+    Subscribe {
+        channels: Vec<String>,
+    },
+    Unsubscribe {
+        channels: Vec<String>,
+    },
+    Psubscribe {
+        patterns: Vec<String>,
+    },
+    Punsubscribe {
+        patterns: Vec<String>,
+    },
+    Publish {
+        channel: String,
+        message: Binary,
+    },
+    PubsubChannels {
+        pattern: Option<String>,
+    },
+    PubsubNumsub {
+        channels: Vec<String>,
+    },
+    PubsubNumpat,
     Unknown(Vec<Binary>),
     /// Represents an error that should be sent back to the client.
     Error(String),
@@ -128,7 +321,10 @@ pub enum Command {
 
 fn err_wrong_args(cmd: &str) -> Command {
     // Redis 错误消息中命令名通常是小写形式
-    Command::Error(format!("ERR wrong number of arguments for '{}' command", cmd.to_lowercase()))
+    Command::Error(format!(
+        "ERR wrong number of arguments for '{}' command",
+        cmd.to_lowercase()
+    ))
 }
 
 fn err_not_integer() -> Command {
@@ -145,6 +341,13 @@ fn err_syntax() -> Command {
 
 fn err_invalid_bulk() -> Command {
     Command::Error("ERR invalid bulk string encoding".to_string())
+}
+
+fn err_pubsub_args() -> Command {
+    Command::Error(
+        "ERR Unknown subcommand or wrong number of arguments for 'pubsub'. Try PUBSUB HELP."
+            .to_string(),
+    )
 }
 
 fn parse_bulk_string(bytes: Vec<u8>) -> Result<String, Command> {
@@ -289,7 +492,15 @@ pub async fn read_command(
                 }
             }
 
-            Command::Set { key, value, expire_millis, nx, xx, keep_ttl, get }
+            Command::Set {
+                key,
+                value,
+                expire_millis,
+                nx,
+                xx,
+                keep_ttl,
+                get,
+            }
         }
         "GET" => {
             let Some(key_bytes) = iter.next() else {
@@ -383,7 +594,11 @@ pub async fn read_command(
                 }
             }
 
-            Command::Getex { key, expire_millis, persist }
+            Command::Getex {
+                key,
+                expire_millis,
+                persist,
+            }
         }
         "GETRANGE" => {
             let Some(key_bytes) = iter.next() else {
@@ -434,7 +649,9 @@ pub async fn read_command(
                 Err(e) => return Ok(Some(e)),
             };
             if offset_i64 < 0 {
-                return Ok(Some(Command::Error("ERR offset is out of range".to_string())));
+                return Ok(Some(Command::Error(
+                    "ERR offset is out of range".to_string(),
+                )));
             }
             let offset = offset_i64 as usize;
             Command::Setrange { key, offset, value }
@@ -1365,7 +1582,9 @@ pub async fn read_command(
             };
 
             if db_idx < 0 || db_idx >= 16 {
-                return Ok(Some(Command::Error("ERR DB index is out of range".to_string())));
+                return Ok(Some(Command::Error(
+                    "ERR DB index is out of range".to_string(),
+                )));
             }
 
             Command::Select { db: db_idx as u8 }
@@ -1410,40 +1629,36 @@ pub async fn read_command(
             }
             Command::Renamenx { key, newkey }
         }
-        "FLUSHDB" => {
-            match (iter.next(), iter.next()) {
-                (None, None) => Command::Flushdb,
-                (Some(arg_bytes), None) => {
-                    let u = match parse_bulk_string(arg_bytes) {
-                        Ok(s) => s.to_ascii_uppercase(),
-                        Err(e) => return Ok(Some(e)),
-                    };
-                    if u == "ASYNC" || u == "SYNC" {
-                        Command::Flushdb
-                    } else {
-                        return Ok(Some(err_wrong_args("flushdb")));
-                    }
+        "FLUSHDB" => match (iter.next(), iter.next()) {
+            (None, None) => Command::Flushdb,
+            (Some(arg_bytes), None) => {
+                let u = match parse_bulk_string(arg_bytes) {
+                    Ok(s) => s.to_ascii_uppercase(),
+                    Err(e) => return Ok(Some(e)),
+                };
+                if u == "ASYNC" || u == "SYNC" {
+                    Command::Flushdb
+                } else {
+                    return Ok(Some(err_wrong_args("flushdb")));
                 }
-                _ => return Ok(Some(err_wrong_args("flushdb"))),
             }
-        }
-        "FLUSHALL" => {
-            match (iter.next(), iter.next()) {
-                (None, None) => Command::Flushall,
-                (Some(arg_bytes), None) => {
-                    let u = match parse_bulk_string(arg_bytes) {
-                        Ok(s) => s.to_ascii_uppercase(),
-                        Err(e) => return Ok(Some(e)),
-                    };
-                    if u == "ASYNC" || u == "SYNC" {
-                        Command::Flushall
-                    } else {
-                        return Ok(Some(err_wrong_args("flushall")));
-                    }
+            _ => return Ok(Some(err_wrong_args("flushdb"))),
+        },
+        "FLUSHALL" => match (iter.next(), iter.next()) {
+            (None, None) => Command::Flushall,
+            (Some(arg_bytes), None) => {
+                let u = match parse_bulk_string(arg_bytes) {
+                    Ok(s) => s.to_ascii_uppercase(),
+                    Err(e) => return Ok(Some(e)),
+                };
+                if u == "ASYNC" || u == "SYNC" {
+                    Command::Flushall
+                } else {
+                    return Ok(Some(err_wrong_args("flushall")));
                 }
-                _ => return Ok(Some(err_wrong_args("flushall"))),
             }
-        }
+            _ => return Ok(Some(err_wrong_args("flushall"))),
+        },
         "SUBSCRIBE" => {
             let mut channels = Vec::new();
             for b in iter {
@@ -1467,6 +1682,29 @@ pub async fn read_command(
             }
             Command::Unsubscribe { channels }
         }
+        "PSUBSCRIBE" => {
+            let mut patterns = Vec::new();
+            for b in iter {
+                match parse_bulk_string(b) {
+                    Ok(p) => patterns.push(p),
+                    Err(e) => return Ok(Some(e)),
+                }
+            }
+            if patterns.is_empty() {
+                return Ok(Some(err_wrong_args("psubscribe")));
+            }
+            Command::Psubscribe { patterns }
+        }
+        "PUNSUBSCRIBE" => {
+            let mut patterns = Vec::new();
+            for b in iter {
+                match parse_bulk_string(b) {
+                    Ok(p) => patterns.push(p),
+                    Err(e) => return Ok(Some(e)),
+                }
+            }
+            Command::Punsubscribe { patterns }
+        }
         "PUBLISH" => {
             let Some(channel_bytes) = iter.next() else {
                 return Ok(Some(err_wrong_args("publish")));
@@ -1482,6 +1720,50 @@ pub async fn read_command(
                 Err(e) => return Ok(Some(e)),
             };
             Command::Publish { channel, message }
+        }
+        "PUBSUB" => {
+            let Some(subcmd_bytes) = iter.next() else {
+                return Ok(Some(err_pubsub_args()));
+            };
+            let subcmd_upper = match parse_bulk_string(subcmd_bytes) {
+                Ok(s) => s.to_ascii_uppercase(),
+                Err(e) => return Ok(Some(e)),
+            };
+
+            match subcmd_upper.as_str() {
+                "CHANNELS" => {
+                    let pattern = if let Some(pat_bytes) = iter.next() {
+                        let pat = match parse_bulk_string(pat_bytes) {
+                            Ok(p) => p,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        if iter.next().is_some() {
+                            return Ok(Some(err_pubsub_args()));
+                        }
+                        Some(pat)
+                    } else {
+                        None
+                    };
+                    Command::PubsubChannels { pattern }
+                }
+                "NUMSUB" => {
+                    let mut channels = Vec::new();
+                    for b in iter {
+                        match parse_bulk_string(b) {
+                            Ok(c) => channels.push(c),
+                            Err(e) => return Ok(Some(e)),
+                        }
+                    }
+                    Command::PubsubNumsub { channels }
+                }
+                "NUMPAT" => {
+                    if iter.next().is_some() {
+                        return Ok(Some(err_pubsub_args()));
+                    }
+                    Command::PubsubNumpat
+                }
+                _ => return Ok(Some(err_pubsub_args())),
+            }
         }
         "MGET" => {
             let mut keys = Vec::new();
@@ -1578,7 +1860,11 @@ pub async fn read_command(
             if seconds < 0 {
                 return Ok(Some(err_not_integer()));
             }
-            Command::Setex { key, seconds, value }
+            Command::Setex {
+                key,
+                seconds,
+                value,
+            }
         }
         "PSETEX" => {
             let Some(key_bytes) = iter.next() else {
@@ -1625,18 +1911,12 @@ mod tests {
 
         let client = tokio::spawn(async move {
             let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-            stream
-                .write_all(b"*1\r\n$4\r\nPING\r\n")
-                .await
-                .unwrap();
+            stream.write_all(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
             stream
                 .write_all(b"*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n")
                 .await
                 .unwrap();
-            stream
-                .write_all(b"*1\r\n$4\r\nQUIT\r\n")
-                .await
-                .unwrap();
+            stream.write_all(b"*1\r\n$4\r\nQUIT\r\n").await.unwrap();
             stream
                 .write_all(b"*2\r\n$7\r\nCOMMAND\r\n$4\r\nDOCS\r\n")
                 .await
@@ -1647,10 +1927,7 @@ mod tests {
                 .await
                 .unwrap();
             // Test too few arguments for ECHO
-            stream
-                .write_all(b"*1\r\n$4\r\nECHO\r\n")
-                .await
-                .unwrap();
+            stream.write_all(b"*1\r\n$4\r\nECHO\r\n").await.unwrap();
             // Test too many arguments for ECHO
             stream
                 .write_all(b"*3\r\n$4\r\nECHO\r\n$5\r\nhello\r\n$5\r\nworld\r\n")
@@ -1731,7 +2008,6 @@ mod tests {
             panic!("expected ECHO error command");
         }
 
-
         client.await.unwrap();
     }
 
@@ -1763,10 +2039,7 @@ mod tests {
                 .await
                 .unwrap();
             // LPOP (Error)
-            stream
-                .write_all(b"*1\r\n$4\r\nLPOP\r\n")
-                .await
-                .unwrap();
+            stream.write_all(b"*1\r\n$4\r\nLPOP\r\n").await.unwrap();
             // LPOP mylist X (Error)
             stream
                 .write_all(b"*3\r\n$4\r\nLPOP\r\n$6\r\nmylist\r\n$1\r\nX\r\n")
@@ -1882,10 +2155,7 @@ mod tests {
                 .await
                 .unwrap();
             // SMEMBERS (Error)
-            stream
-                .write_all(b"*1\r\n$8\r\nSMEMBERS\r\n")
-                .await
-                .unwrap();
+            stream.write_all(b"*1\r\n$8\r\nSMEMBERS\r\n").await.unwrap();
             // SMEMBERS myset X (Error)
             stream
                 .write_all(b"*3\r\n$8\r\nSMEMBERS\r\n$5\r\nmyset\r\n$1\r\nX\r\n")

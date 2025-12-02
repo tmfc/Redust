@@ -6,18 +6,18 @@ use tokio::sync::oneshot;
 
 use redust::server::serve;
 
-async fn spawn_server(
-) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<tokio::io::Result<()>>) {
+async fn spawn_server() -> (
+    SocketAddr,
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<tokio::io::Result<()>>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
     let addr = listener.local_addr().expect("local addr");
     let (tx, rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
-        serve(
-            listener,
-            async move {
-                let _ = rx.await;
-            },
-        )
+        serve(listener, async move {
+            let _ = rx.await;
+        })
         .await
     });
     (addr, tx, handle)
@@ -29,9 +29,7 @@ async fn mset_and_mget_roundtrip() {
 
     let mut client = TestClient::connect(addr).await;
 
-    client
-        .mset(&[("k1", "v1"), ("k2", "v2")])
-        .await;
+    client.mset(&[("k1", "v1"), ("k2", "v2")]).await;
 
     let values = client.mget(&["k1", "k2", "missing"]).await;
     assert_eq!(values.len(), 3);
@@ -70,9 +68,7 @@ async fn msetnx_atomicity_and_existing_keys() {
     let mut client = TestClient::connect(addr).await;
 
     // 所有 key 都不存在时，应一次性写入并返回 :1
-    client
-        .send_array(&["MSETNX", "k1", "v1", "k2", "v2"])
-        .await;
+    client.send_array(&["MSETNX", "k1", "v1", "k2", "v2"]).await;
     let line1 = client.read_simple_line().await;
     assert_eq!(line1, ":1\r\n");
 
@@ -95,9 +91,7 @@ async fn msetnx_atomicity_and_existing_keys() {
     assert_eq!(v4, None);
 
     // 对比：MSET 在参数合法时始终写入
-    client
-        .mset(&[("k5", "a"), ("k6", "b")])
-        .await;
+    client.mset(&[("k5", "a"), ("k6", "b")]).await;
     let v5 = client.get("k5").await;
     let v6 = client.get("k6").await;
     assert_eq!(v5.as_deref(), Some("a"));
@@ -114,16 +108,12 @@ async fn incrbyfloat_roundtrip_and_error_cases() {
     let mut client = TestClient::connect(addr).await;
 
     // 不存在的 key 视为 0，自增浮点
-    client
-        .send_array(&["INCRBYFLOAT", "f1", "1.5"])
-        .await;
+    client.send_array(&["INCRBYFLOAT", "f1", "1.5"]).await;
     let v1 = client.read_bulk().await;
     assert_eq!(v1.as_deref(), Some("1.5"));
 
     // 再加 2.25 -> 3.75
-    client
-        .send_array(&["INCRBYFLOAT", "f1", "2.25"])
-        .await;
+    client.send_array(&["INCRBYFLOAT", "f1", "2.25"]).await;
     let v2 = client.read_bulk().await;
     assert_eq!(v2.as_deref(), Some("3.75"));
 
@@ -133,17 +123,13 @@ async fn incrbyfloat_roundtrip_and_error_cases() {
     assert!(int_err.starts_with("-ERR value is not an integer or out of range"));
 
     // 继续用 INCRBYFLOAT 自增：3.75 + 0.75 = 4.5
-    client
-        .send_array(&["INCRBYFLOAT", "f1", "0.75"])
-        .await;
+    client.send_array(&["INCRBYFLOAT", "f1", "0.75"]).await;
     let v4 = client.read_bulk().await;
     assert_eq!(v4.as_deref(), Some("4.5"));
 
     // 非数字值应返回浮点错误
     client.set("notfloat", "abc").await;
-    client
-        .send_array(&["INCRBYFLOAT", "notfloat", "1.0"])
-        .await;
+    client.send_array(&["INCRBYFLOAT", "notfloat", "1.0"]).await;
     let err = client.read_simple_line().await;
     assert!(err.starts_with("-ERR"));
 
@@ -238,23 +224,17 @@ async fn set_with_nx_xx_semantics() {
     let mut client = TestClient::connect(addr).await;
 
     // 初次 SET foo bar NX -> 应写入
-    client
-        .send_array(&["SET", "foo", "bar", "NX"])
-        .await;
+    client.send_array(&["SET", "foo", "bar", "NX"]).await;
     let line = client.read_simple_line().await;
     assert_eq!(line, "+OK\r\n");
 
     // 再次 SET foo baz NX -> 条件失败，返回 null bulk
-    client
-        .send_array(&["SET", "foo", "baz", "NX"])
-        .await;
+    client.send_array(&["SET", "foo", "baz", "NX"]).await;
     let line = client.read_simple_line().await;
     assert_eq!(line, "$-1\r\n");
 
     // SET foo qux XX -> 应覆盖
-    client
-        .send_array(&["SET", "foo", "qux", "XX"])
-        .await;
+    client.send_array(&["SET", "foo", "qux", "XX"]).await;
     let line = client.read_simple_line().await;
     assert_eq!(line, "+OK\r\n");
 
@@ -275,9 +255,7 @@ async fn set_with_get_option() {
     client.set("foo", "bar").await;
 
     // SET foo baz GET -> 返回旧值 bar，key 变为 baz
-    client
-        .send_array(&["SET", "foo", "baz", "GET"])
-        .await;
+    client.send_array(&["SET", "foo", "baz", "GET"]).await;
     let old = client.read_bulk().await;
     assert_eq!(old.as_deref(), Some("bar"));
 
@@ -285,9 +263,7 @@ async fn set_with_get_option() {
     assert_eq!(v.as_deref(), Some("baz"));
 
     // SET foo qux NX GET，在 key 已存在时条件失败，返回当前值 baz 且不覆盖
-    client
-        .send_array(&["SET", "foo", "qux", "NX", "GET"])
-        .await;
+    client.send_array(&["SET", "foo", "qux", "NX", "GET"]).await;
     let old2 = client.read_bulk().await;
     assert_eq!(old2.as_deref(), Some("baz"));
 
@@ -305,9 +281,7 @@ async fn set_with_keepttl_option() {
     let mut client = TestClient::connect(addr).await;
 
     // 使用 EX 设置带 TTL 的 key
-    client
-        .send_array(&["SET", "foo", "bar", "EX", "2"])
-        .await;
+    client.send_array(&["SET", "foo", "bar", "EX", "2"]).await;
     let line = client.read_simple_line().await;
     assert_eq!(line, "+OK\r\n");
 
@@ -317,9 +291,7 @@ async fn set_with_keepttl_option() {
     assert!(ttl_before.starts_with(":"));
 
     // 使用 KEEPTTL 覆盖 value，TTL 应保留
-    client
-        .send_array(&["SET", "foo", "baz", "KEEPTTL"])
-        .await;
+    client.send_array(&["SET", "foo", "baz", "KEEPTTL"]).await;
     let line = client.read_simple_line().await;
     assert_eq!(line, "+OK\r\n");
 
@@ -382,9 +354,7 @@ async fn getex_updates_ttl_and_persist_clears_it() {
     assert_eq!(line, "+OK\r\n");
 
     // GETEX foo EX 3 -> 返回当前值，并将 TTL 延长到 ~3s
-    client
-        .send_array(&["GETEX", "foo", "EX", "3"])
-        .await;
+    client.send_array(&["GETEX", "foo", "EX", "3"]).await;
     let v = client.read_bulk().await;
     assert_eq!(v.as_deref(), Some("bar"));
 
@@ -393,9 +363,7 @@ async fn getex_updates_ttl_and_persist_clears_it() {
     assert!(ttl_line.starts_with(":"));
 
     // 使用 GETEX foo PX 500 缩短 TTL 到 500ms 内
-    client
-        .send_array(&["GETEX", "foo", "PX", "500"])
-        .await;
+    client.send_array(&["GETEX", "foo", "PX", "500"]).await;
     let v2 = client.read_bulk().await;
     assert_eq!(v2.as_deref(), Some("bar"));
 
@@ -404,9 +372,7 @@ async fn getex_updates_ttl_and_persist_clears_it() {
     assert!(pttl_line.starts_with(":"));
 
     // 使用 GETEX foo PERSIST 清除 TTL
-    client
-        .send_array(&["GETEX", "foo", "PERSIST"])
-        .await;
+    client.send_array(&["GETEX", "foo", "PERSIST"]).await;
     let v3 = client.read_bulk().await;
     assert_eq!(v3.as_deref(), Some("bar"));
 
@@ -442,7 +408,10 @@ async fn command_argument_and_integer_errors_match_redis() {
     // EXPIRE with missing seconds -> ERR wrong number of arguments for 'expire' command
     client.send_array(&["EXPIRE", "foo"]).await;
     let line = client.read_simple_line().await;
-    assert_eq!(line, "-ERR wrong number of arguments for 'expire' command\r\n");
+    assert_eq!(
+        line,
+        "-ERR wrong number of arguments for 'expire' command\r\n"
+    );
 
     // EXPIRE with non-integer seconds -> ERR value is not an integer or out of range
     client.send_array(&["EXPIRE", "foo", "notint"]).await;
@@ -472,12 +441,18 @@ async fn command_argument_and_integer_errors_match_redis() {
     // LLEN with missing key -> ERR wrong number of arguments for 'llen' command
     client.send_array(&["LLEN"]).await;
     let line = client.read_simple_line().await;
-    assert_eq!(line, "-ERR wrong number of arguments for 'llen' command\r\n");
+    assert_eq!(
+        line,
+        "-ERR wrong number of arguments for 'llen' command\r\n"
+    );
 
     // LLEN with extra argument -> same wrong-args error
     client.send_array(&["LLEN", "foo", "extra"]).await;
     let line = client.read_simple_line().await;
-    assert_eq!(line, "-ERR wrong number of arguments for 'llen' command\r\n");
+    assert_eq!(
+        line,
+        "-ERR wrong number of arguments for 'llen' command\r\n"
+    );
 
     // LINDEX with non-integer index -> integer error
     client.send_array(&["LINDEX", "foo", "notint"]).await;
@@ -487,46 +462,78 @@ async fn command_argument_and_integer_errors_match_redis() {
     // HGETALL with wrong arg count -> wrong-args error
     client.send_array(&["HGETALL"]).await;
     let line = client.read_simple_line().await;
-    assert_eq!(line, "-ERR wrong number of arguments for 'hgetall' command\r\n");
+    assert_eq!(
+        line,
+        "-ERR wrong number of arguments for 'hgetall' command\r\n"
+    );
 
     client.send_array(&["HGETALL", "foo", "extra"]).await;
     let line = client.read_simple_line().await;
-    assert_eq!(line, "-ERR wrong number of arguments for 'hgetall' command\r\n");
+    assert_eq!(
+        line,
+        "-ERR wrong number of arguments for 'hgetall' command\r\n"
+    );
 
     // SCARD with wrong arg count -> wrong-args error
     client.send_array(&["SCARD"]).await;
     let line = client.read_simple_line().await;
-    assert_eq!(line, "-ERR wrong number of arguments for 'scard' command\r\n");
+    assert_eq!(
+        line,
+        "-ERR wrong number of arguments for 'scard' command\r\n"
+    );
 
     client.send_array(&["SCARD", "foo", "extra"]).await;
     let line = client.read_simple_line().await;
-    assert_eq!(line, "-ERR wrong number of arguments for 'scard' command\r\n");
+    assert_eq!(
+        line,
+        "-ERR wrong number of arguments for 'scard' command\r\n"
+    );
 
     // SISMEMBER with wrong arg count -> wrong-args error
     client.send_array(&["SISMEMBER"]).await;
     let line = client.read_simple_line().await;
-    assert_eq!(line, "-ERR wrong number of arguments for 'sismember' command\r\n");
+    assert_eq!(
+        line,
+        "-ERR wrong number of arguments for 'sismember' command\r\n"
+    );
 
     client.send_array(&["SISMEMBER", "foo"]).await;
     let line = client.read_simple_line().await;
-    assert_eq!(line, "-ERR wrong number of arguments for 'sismember' command\r\n");
+    assert_eq!(
+        line,
+        "-ERR wrong number of arguments for 'sismember' command\r\n"
+    );
 
-    client.send_array(&["SISMEMBER", "foo", "bar", "extra"]).await;
+    client
+        .send_array(&["SISMEMBER", "foo", "bar", "extra"])
+        .await;
     let line = client.read_simple_line().await;
-    assert_eq!(line, "-ERR wrong number of arguments for 'sismember' command\r\n");
+    assert_eq!(
+        line,
+        "-ERR wrong number of arguments for 'sismember' command\r\n"
+    );
 
     // SUNION/SINTER/SDIFF without any key -> wrong-args error
     client.send_array(&["SUNION"]).await;
     let line = client.read_simple_line().await;
-    assert_eq!(line, "-ERR wrong number of arguments for 'sunion' command\r\n");
+    assert_eq!(
+        line,
+        "-ERR wrong number of arguments for 'sunion' command\r\n"
+    );
 
     client.send_array(&["SINTER"]).await;
     let line = client.read_simple_line().await;
-    assert_eq!(line, "-ERR wrong number of arguments for 'sinter' command\r\n");
+    assert_eq!(
+        line,
+        "-ERR wrong number of arguments for 'sinter' command\r\n"
+    );
 
     client.send_array(&["SDIFF"]).await;
     let line = client.read_simple_line().await;
-    assert_eq!(line, "-ERR wrong number of arguments for 'sdiff' command\r\n");
+    assert_eq!(
+        line,
+        "-ERR wrong number of arguments for 'sdiff' command\r\n"
+    );
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
@@ -662,9 +669,7 @@ async fn getset_preserves_ttl() {
     let mut client = TestClient::connect(addr).await;
 
     // 先用 SET EX 设置 TTL
-    client
-        .send_array(&["SET", "foo", "bar", "EX", "1"])
-        .await;
+    client.send_array(&["SET", "foo", "bar", "EX", "1"]).await;
     let line = client.read_simple_line().await;
     assert_eq!(line, "+OK\r\n");
 
@@ -699,7 +704,10 @@ impl TestClient {
         let stream = TcpStream::connect(addr).await.unwrap();
         let (read_half, write_half) = stream.into_split();
         let reader = BufReader::new(read_half);
-        TestClient { reader, writer: write_half }
+        TestClient {
+            reader,
+            writer: write_half,
+        }
     }
 
     async fn send_array(&mut self, parts: &[&str]) {
@@ -764,7 +772,8 @@ impl TestClient {
     }
 
     async fn set_bytes(&mut self, key: &str, value: &[u8]) {
-        self.send_array_bytes(&[b"SET", key.as_bytes(), value]).await;
+        self.send_array_bytes(&[b"SET", key.as_bytes(), value])
+            .await;
         let line = self.read_simple_line().await;
         assert_eq!(line, "+OK\r\n");
     }
@@ -910,7 +919,8 @@ impl TestClient {
 
     async fn setrange_bytes(&mut self, key: &str, offset: usize, value: &[u8]) -> i64 {
         let off_s = offset.to_string();
-        self.send_array_bytes(&[b"SETRANGE", key.as_bytes(), off_s.as_bytes(), value]).await;
+        self.send_array_bytes(&[b"SETRANGE", key.as_bytes(), off_s.as_bytes(), value])
+            .await;
         let line = self.read_simple_line().await;
         assert!(line.starts_with(":"));
         line[1..line.len() - 2].parse().unwrap()
@@ -993,8 +1003,7 @@ async fn persist_clears_expiration() {
     let mut client = TestClient::connect(addr).await;
 
     // SET foo bar EX 10
-    client
-        .send_array(&["SET", "foo", "bar", "EX", "10"]).await;
+    client.send_array(&["SET", "foo", "bar", "EX", "10"]).await;
     let line = client.read_simple_line().await;
     assert_eq!(line, "+OK\r\n");
 

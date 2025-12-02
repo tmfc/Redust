@@ -15,7 +15,10 @@ impl RespClient {
             .unwrap_or_else(|e| panic!("failed to connect to {}: {}", addr, e));
         let (read_half, write_half) = stream.into_split();
         let reader = BufReader::new(read_half);
-        RespClient { reader, writer: write_half }
+        RespClient {
+            reader,
+            writer: write_half,
+        }
     }
 
     async fn send_array(&mut self, parts: &[&str]) {
@@ -382,7 +385,9 @@ async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
             // 功能校验：MSET/MGET
             let pairs = [("bench_m1", "v1"), ("bench_m2", "v2")];
             client.mset(&pairs).await;
-            let values = client.mget(&["bench_m1", "bench_m2", "bench_missing"]).await;
+            let values = client
+                .mget(&["bench_m1", "bench_m2", "bench_missing"])
+                .await;
             if values.len() != 3
                 || values[0].as_deref() != Some("v1")
                 || values[1].as_deref() != Some("v2")
@@ -392,9 +397,7 @@ async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
             }
 
             // 性能测试：固定大小批量 MSET/MGET
-            let keys: Vec<String> = (0..10)
-                .map(|i| format!("bench_mk:{}", i))
-                .collect();
+            let keys: Vec<String> = (0..10).map(|i| format!("bench_mk:{}", i)).collect();
             let key_refs: Vec<&str> = keys.iter().map(|k| k.as_str()).collect();
 
             let start = std::time::Instant::now();
@@ -430,27 +433,19 @@ async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
             // 功能校验：HSET/HGET/HGETALL/HDEL
             let key = "bench_hash";
             client.del(&[key]).await;
-            client
-                .send_array(&["HSET", key, "field", "value"])
-                .await;
+            client.send_array(&["HSET", key, "field", "value"]).await;
             let _ = client.read_simple_line().await; // :1
 
-            client
-                .send_array(&["HSET", key, "field", "value2"])
-                .await;
+            client.send_array(&["HSET", key, "field", "value2"]).await;
             let _ = client.read_simple_line().await; // :0
 
-            client
-                .send_array(&["HGET", key, "field"])
-                .await;
+            client.send_array(&["HGET", key, "field"]).await;
             let v = client.read_bulk().await;
             if v.as_deref() != Some("value2") {
                 panic!("unexpected HGET value: {:?}", v);
             }
 
-            client
-                .send_array(&["HGETALL", key])
-                .await;
+            client.send_array(&["HGETALL", key]).await;
             let mut header = String::new();
             client.reader.read_line(&mut header).await.unwrap();
             if header.trim_end() != "*2" {
@@ -462,9 +457,7 @@ async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
                 panic!("unexpected HGETALL pair: {:?} {:?}", f, v2);
             }
 
-            client
-                .send_array(&["HDEL", key, "field"])
-                .await;
+            client.send_array(&["HDEL", key, "field"]).await;
             let del_line = client.read_simple_line().await;
             if del_line.trim_end() != ":1" {
                 panic!("unexpected HDEL response: {:?}", del_line);
@@ -478,14 +471,10 @@ async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
             for i in 0..iterations {
                 let field = format!("f{}", i % 16);
                 let value = format!("v{}", i);
-                client
-                    .send_array(&["HSET", key, &field, &value])
-                    .await;
+                client.send_array(&["HSET", key, &field, &value]).await;
                 let _ = client.read_simple_line().await;
 
-                client
-                    .send_array(&["HGET", key, &field])
-                    .await;
+                client.send_array(&["HGET", key, &field]).await;
                 let got = client.read_bulk().await;
                 if got.as_deref() != Some(value.as_str()) {
                     panic!(
@@ -685,19 +674,17 @@ async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
         "set_union" => {
             // 功能校验：SUNION 行为
             client.del(&["bench_su_1", "bench_su_2"]).await;
-            let added1 = client
-                .send_array(&["SADD", "bench_su_1", "a", "b"])
-                .await;
+            let added1 = client.send_array(&["SADD", "bench_su_1", "a", "b"]).await;
             let _ = added1; // 我们不检查返回值，这里只依赖服务器自身行为
-            // 读取 :2
+                            // 读取 :2
             let _ = client.read_simple_line().await;
 
-            client
-                .send_array(&["SADD", "bench_su_2", "b", "c"])
-                .await;
+            client.send_array(&["SADD", "bench_su_2", "b", "c"]).await;
             let _ = client.read_simple_line().await; // :2
 
-            let mut items = client.sunion(&["bench_su_1", "bench_su_2", "missing"]).await;
+            let mut items = client
+                .sunion(&["bench_su_1", "bench_su_2", "missing"])
+                .await;
             items.sort();
             if items != vec!["a".to_string(), "b".to_string(), "c".to_string()] {
                 panic!("unexpected SUNION items: {:?}", items);
@@ -707,26 +694,18 @@ async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
             let base1 = "bench_su_loop_1";
             let base2 = "bench_su_loop_2";
             client.del(&[base1, base2]).await;
-            client
-                .send_array(&["SADD", base1, "a"])
-                .await;
+            client.send_array(&["SADD", base1, "a"]).await;
             let _ = client.read_simple_line().await;
-            client
-                .send_array(&["SADD", base2, "b"])
-                .await;
+            client.send_array(&["SADD", base2, "b"]).await;
             let _ = client.read_simple_line().await;
 
             let start = std::time::Instant::now();
             for i in 0..iterations {
                 let v1 = format!("x{}", i);
                 let v2 = format!("y{}", i);
-                client
-                    .send_array(&["SADD", base1, &v1])
-                    .await;
+                client.send_array(&["SADD", base1, &v1]).await;
                 let _ = client.read_simple_line().await;
-                client
-                    .send_array(&["SADD", base2, &v2])
-                    .await;
+                client.send_array(&["SADD", base2, &v2]).await;
                 let _ = client.read_simple_line().await;
                 let _ = client.sunion(&[base1, base2]).await;
             }
@@ -742,24 +721,22 @@ async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
         }
         "set_intersection" => {
             // 功能校验：SINTER 行为
-            client.del(&["bench_si_1", "bench_si_2", "bench_si_3"]).await;
-
             client
-                .send_array(&["SADD", "bench_si_1", "a", "b"])
+                .del(&["bench_si_1", "bench_si_2", "bench_si_3"])
                 .await;
+
+            client.send_array(&["SADD", "bench_si_1", "a", "b"]).await;
             let _ = client.read_simple_line().await; // :2
 
-            client
-                .send_array(&["SADD", "bench_si_2", "b", "c"])
-                .await;
+            client.send_array(&["SADD", "bench_si_2", "b", "c"]).await;
             let _ = client.read_simple_line().await; // :2
 
-            client
-                .send_array(&["SADD", "bench_si_3", "b", "d"])
-                .await;
+            client.send_array(&["SADD", "bench_si_3", "b", "d"]).await;
             let _ = client.read_simple_line().await; // :2
 
-            let mut items = client.sinter(&["bench_si_1", "bench_si_2", "bench_si_3"]).await;
+            let mut items = client
+                .sinter(&["bench_si_1", "bench_si_2", "bench_si_3"])
+                .await;
             items.sort();
             if items != vec!["b".to_string()] {
                 panic!("unexpected SINTER items: {:?}", items);
@@ -771,17 +748,11 @@ async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
             let base3 = "bench_si_loop_3";
             client.del(&[base1, base2, base3]).await;
 
-            client
-                .send_array(&["SADD", base1, "x"])
-                .await;
+            client.send_array(&["SADD", base1, "x"]).await;
             let _ = client.read_simple_line().await;
-            client
-                .send_array(&["SADD", base2, "x"])
-                .await;
+            client.send_array(&["SADD", base2, "x"]).await;
             let _ = client.read_simple_line().await;
-            client
-                .send_array(&["SADD", base3, "x"])
-                .await;
+            client.send_array(&["SADD", base3, "x"]).await;
             let _ = client.read_simple_line().await;
 
             let start = std::time::Instant::now();
@@ -790,17 +761,11 @@ async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
                 let v2 = format!("j{}", i);
                 let v3 = format!("k{}", i);
 
-                client
-                    .send_array(&["SADD", base1, &v1])
-                    .await;
+                client.send_array(&["SADD", base1, &v1]).await;
                 let _ = client.read_simple_line().await;
-                client
-                    .send_array(&["SADD", base2, &v2])
-                    .await;
+                client.send_array(&["SADD", base2, &v2]).await;
                 let _ = client.read_simple_line().await;
-                client
-                    .send_array(&["SADD", base3, &v3])
-                    .await;
+                client.send_array(&["SADD", base3, &v3]).await;
                 let _ = client.read_simple_line().await;
 
                 let _ = client.sinter(&[base1, base2, base3]).await;
@@ -824,9 +789,7 @@ async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
                 .await;
             let _ = client.read_simple_line().await; // :3
 
-            client
-                .send_array(&["SADD", "bench_sd_2", "b", "d"])
-                .await;
+            client.send_array(&["SADD", "bench_sd_2", "b", "d"]).await;
             let _ = client.read_simple_line().await; // :2
 
             let mut items = client.sdiff(&["bench_sd_1", "bench_sd_2"]).await;
@@ -840,22 +803,16 @@ async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
             let base2 = "bench_sd_loop_2";
             client.del(&[base1, base2]).await;
 
-            client
-                .send_array(&["SADD", base1, "x", "y", "z"])
-                .await;
+            client.send_array(&["SADD", base1, "x", "y", "z"]).await;
             let _ = client.read_simple_line().await;
-            client
-                .send_array(&["SADD", base2, "y"])
-                .await;
+            client.send_array(&["SADD", base2, "y"]).await;
             let _ = client.read_simple_line().await;
 
             let start = std::time::Instant::now();
             for i in 0..iterations {
                 let v = format!("v{}", i);
 
-                client
-                    .send_array(&["SADD", base1, &v])
-                    .await;
+                client.send_array(&["SADD", base1, &v]).await;
                 let _ = client.read_simple_line().await;
 
                 let _ = client.sdiff(&[base1, base2]).await;

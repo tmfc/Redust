@@ -23,9 +23,7 @@ async fn rdb_basic_roundtrip_via_storage() {
     storage
         .sadd("myset", &vec!["x".to_string(), "y".to_string()])
         .unwrap();
-    storage
-        .hset("myhash", "field", "val".to_string())
-        .unwrap();
+    storage.hset("myhash", "field", "val".to_string()).unwrap();
 
     storage.set("ttl_key".to_string(), b"tv".to_vec());
     let _ = storage.expire_seconds("ttl_key", 10);

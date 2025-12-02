@@ -7,18 +7,18 @@ use redust::server::serve;
 mod env_guard;
 use env_guard::{set_env, ENV_LOCK};
 
-async fn spawn_server(
-) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<tokio::io::Result<()>>) {
+async fn spawn_server() -> (
+    SocketAddr,
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<tokio::io::Result<()>>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
     let addr = listener.local_addr().expect("local addr");
     let (tx, rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
-        serve(
-            listener,
-            async move {
-                let _ = rx.await;
-            },
-        )
+        serve(listener, async move {
+            let _ = rx.await;
+        })
         .await
     });
     (addr, tx, handle)
@@ -34,7 +34,10 @@ impl TestClient {
         let stream = TcpStream::connect(addr).await.unwrap();
         let (read_half, write_half) = stream.into_split();
         let reader = BufReader::new(read_half);
-        TestClient { reader, writer: write_half }
+        TestClient {
+            reader,
+            writer: write_half,
+        }
     }
 
     async fn send_array(&mut self, parts: &[&str]) {

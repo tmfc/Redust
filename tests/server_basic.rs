@@ -1,5 +1,5 @@
-use std::net::SocketAddr;
 use std::env;
+use std::net::SocketAddr;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -8,18 +8,18 @@ use tokio::time::{Duration, Instant};
 
 use redust::server::serve;
 
-async fn spawn_server(
-) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<tokio::io::Result<()>>) {
+async fn spawn_server() -> (
+    SocketAddr,
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<tokio::io::Result<()>>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
     let addr = listener.local_addr().expect("local addr");
     let (tx, rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
-        serve(
-            listener,
-            async move {
-                let _ = rx.await;
-            },
-        )
+        serve(listener, async move {
+            let _ = rx.await;
+        })
         .await
     });
     (addr, tx, handle)
@@ -542,10 +542,7 @@ async fn prometheus_metrics_exporter_basic() {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    write_half
-        .write_all(b"*1\r\n$4\r\nPING\r\n")
-        .await
-        .unwrap();
+    write_half.write_all(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
     let mut line = String::new();
     reader.read_line(&mut line).await.unwrap();
     assert_eq!(line, "+PONG\r\n");
@@ -578,7 +575,10 @@ async fn prometheus_metrics_exporter_basic() {
     {
         use tokio::io::AsyncReadExt;
         let mut reader = BufReader::new(metrics_stream); // reuse BufReader for HTTP response
-        reader.read_to_string(&mut buf).await.expect("failed to read /metrics response");
+        reader
+            .read_to_string(&mut buf)
+            .await
+            .expect("failed to read /metrics response");
     }
 
     assert!(buf.contains("redust_uptime_seconds"));
@@ -633,7 +633,9 @@ async fn lists_extended_commands() {
 
     // RPUSH mylist a b a c -> 4
     write_half
-        .write_all(b"*6\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\na\r\n$1\r\nc\r\n")
+        .write_all(
+            b"*6\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\na\r\n$1\r\nc\r\n",
+        )
         .await
         .unwrap();
     let mut line = String::new();
@@ -907,10 +909,7 @@ async fn info_basic_fields() {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    write_half
-        .write_all(b"*1\r\n$4\r\nINFO\r\n")
-        .await
-        .unwrap();
+    write_half.write_all(b"*1\r\n$4\r\nINFO\r\n").await.unwrap();
 
     let mut buf = String::new();
     // 读取若干行，直到 EOF 或已经包含我们关心的 Keyspace 行
@@ -1278,7 +1277,10 @@ async fn sets_union_behaviour() {
     }
 
     members.sort();
-    assert_eq!(members, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    assert_eq!(
+        members,
+        vec!["a".to_string(), "b".to_string(), "c".to_string()]
+    );
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
@@ -1326,7 +1328,12 @@ async fn sets_store_and_random_commands() {
     members.sort();
     assert_eq!(
         members,
-        vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()]
+        vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string()
+        ]
     );
     eprintln!("stage: union members read");
 
@@ -1787,10 +1794,7 @@ async fn continues_after_unknown_command() {
     reader.read_line(&mut error_line).await.unwrap();
     assert_eq!(error_line, "-ERR unknown command 'COMMAND DOCS'\r\n");
 
-    write_half
-        .write_all(b"*1\r\n$4\r\nPING\r\n")
-        .await
-        .unwrap();
+    write_half.write_all(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
     let mut pong = String::new();
     reader.read_line(&mut pong).await.unwrap();
     assert_eq!(pong, "+PONG\r\n");
@@ -1806,10 +1810,7 @@ async fn handles_quit_and_connection_close() {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    write_half
-        .write_all(b"*1\r\n$4\r\nQUIT\r\n")
-        .await
-        .unwrap();
+    write_half.write_all(b"*1\r\n$4\r\nQUIT\r\n").await.unwrap();
     let mut ok = String::new();
     reader.read_line(&mut ok).await.unwrap();
     assert_eq!(ok, "+OK\r\n");
@@ -1828,17 +1829,18 @@ async fn performance_ping_round_trips() {
     let iterations = 200;
     let start = Instant::now();
     for _ in 0..iterations {
-        write_half
-            .write_all(b"*1\r\n$4\r\nPING\r\n")
-            .await
-            .unwrap();
+        write_half.write_all(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
         assert_eq!(line, "+PONG\r\n");
         line.clear();
     }
     let elapsed = start.elapsed();
-    assert!(elapsed < Duration::from_secs(2), "Ping loop took too long: {:?}", elapsed);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "Ping loop took too long: {:?}",
+        elapsed
+    );
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();

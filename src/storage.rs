@@ -1,15 +1,15 @@
+use dashmap::DashMap;
+use rand::prelude::SliceRandom;
+use rand::{seq::IteratorRandom, thread_rng};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::{
-    Arc,
     atomic::{AtomicU64, Ordering},
+    Arc,
 };
 use std::time::{Duration, Instant};
-use dashmap::DashMap;
-use rand::{seq::IteratorRandom, thread_rng};
-use rand::prelude::SliceRandom;
 
 type ByteString = Vec<u8>;
 
@@ -233,7 +233,13 @@ impl Storage {
         Ok(result)
     }
 
-    pub fn hincr_by(&self, key: &str, field: &str, delta: i64, max_value_bytes: Option<u64>) -> Result<i64, HincrError> {
+    pub fn hincr_by(
+        &self,
+        key: &str,
+        field: &str,
+        delta: i64,
+        max_value_bytes: Option<u64>,
+    ) -> Result<i64, HincrError> {
         let now = Instant::now();
         if self.remove_if_expired(key, now) {
             // treat as non-existent hash
@@ -255,7 +261,9 @@ impl Storage {
 
         // Default missing field to 0, then add delta
         let current_s = map.get(field).cloned().unwrap_or_else(|| "0".to_string());
-        let current = current_s.parse::<i64>().map_err(|_| HincrError::NotInteger)?;
+        let current = current_s
+            .parse::<i64>()
+            .map_err(|_| HincrError::NotInteger)?;
         let new_val = current.checked_add(delta).ok_or(HincrError::Overflow)?;
 
         let new_str = new_val.to_string();
@@ -273,7 +281,13 @@ impl Storage {
         Ok(new_val)
     }
 
-    pub fn hincr_by_float(&self, key: &str, field: &str, delta: f64, max_value_bytes: Option<u64>) -> Result<f64, HincrFloatError> {
+    pub fn hincr_by_float(
+        &self,
+        key: &str,
+        field: &str,
+        delta: f64,
+        max_value_bytes: Option<u64>,
+    ) -> Result<f64, HincrFloatError> {
         let now = Instant::now();
         if self.remove_if_expired(key, now) {
             // treat as non-existent hash
@@ -293,7 +307,9 @@ impl Storage {
         };
 
         let current_s = map.get(field).cloned().unwrap_or_else(|| "0".to_string());
-        let current = current_s.parse::<f64>().map_err(|_| HincrFloatError::NotFloat)?;
+        let current = current_s
+            .parse::<f64>()
+            .map_err(|_| HincrFloatError::NotFloat)?;
         let new_val = current + delta;
         if !new_val.is_finite() {
             return Err(HincrFloatError::NotFloat);
@@ -798,7 +814,10 @@ impl Storage {
             })
             .or_insert_with(|| {
                 inserted = true;
-                StorageValue::String { value, expires_at: None }
+                StorageValue::String {
+                    value,
+                    expires_at: None,
+                }
             });
         if inserted {
             self.touch_key(key);
@@ -831,9 +850,7 @@ impl Storage {
     pub fn exists(&self, keys: &[String]) -> usize {
         let now = Instant::now();
         keys.iter()
-            .filter(|k| {
-                !self.remove_if_expired(k, now) && self.data.contains_key(*k)
-            })
+            .filter(|k| !self.remove_if_expired(k, now) && self.data.contains_key(*k))
             .count()
     }
 
@@ -873,7 +890,11 @@ impl Storage {
             if self.remove_if_expired(from, now) {
                 return Err(());
             }
-            return if self.data.contains_key(from) { Ok(false) } else { Err(()) };
+            return if self.data.contains_key(from) {
+                Ok(false)
+            } else {
+                Err(())
+            };
         }
 
         if self.remove_if_expired(from, now) {
@@ -1454,11 +1475,7 @@ impl Storage {
 
     pub fn dbsize(&self) -> usize {
         let now = Instant::now();
-        let keys: Vec<String> = self
-            .data
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
+        let keys: Vec<String> = self.data.iter().map(|entry| entry.key().clone()).collect();
 
         keys.into_iter()
             .filter(|k| !self.remove_if_expired(k, now))
@@ -1815,7 +1832,10 @@ impl Storage {
                     if file.read_exact(&mut v).is_err() {
                         break;
                     }
-                    StorageValue::String { value: v, expires_at }
+                    StorageValue::String {
+                        value: v,
+                        expires_at,
+                    }
                 }
                 1 => {
                     let mut len_buf = [0u8; 4];
@@ -1842,7 +1862,10 @@ impl Storage {
                         };
                         list.push_back(s);
                     }
-                    StorageValue::List { value: list, expires_at }
+                    StorageValue::List {
+                        value: list,
+                        expires_at,
+                    }
                 }
                 2 => {
                     let mut len_buf = [0u8; 4];
@@ -1869,7 +1892,10 @@ impl Storage {
                         };
                         set.insert(s);
                     }
-                    StorageValue::Set { value: set, expires_at }
+                    StorageValue::Set {
+                        value: set,
+                        expires_at,
+                    }
                 }
                 3 => {
                     let mut len_buf = [0u8; 4];
@@ -1913,7 +1939,10 @@ impl Storage {
 
                         map.insert(field_str, val_str);
                     }
-                    StorageValue::Hash { value: map, expires_at }
+                    StorageValue::Hash {
+                        value: map,
+                        expires_at,
+                    }
                 }
                 _ => {
                     return Ok(());
@@ -2130,7 +2159,11 @@ impl Storage {
         let Some(entry) = self.data.get(smallest_key) else {
             return Ok(Vec::new());
         };
-        let StorageValue::Set { value: smallest_set, .. } = entry.value() else {
+        let StorageValue::Set {
+            value: smallest_set,
+            ..
+        } = entry.value()
+        else {
             return Err(());
         };
 
@@ -2150,7 +2183,10 @@ impl Storage {
                 let Some(other_entry) = self.data.get(key) else {
                     return Ok(Vec::new());
                 };
-                let StorageValue::Set { value: other_set, .. } = other_entry.value() else {
+                let StorageValue::Set {
+                    value: other_set, ..
+                } = other_entry.value()
+                else {
                     return Err(());
                 };
 
@@ -2311,11 +2347,7 @@ impl Storage {
         let mut oldest_ts: u64 = u64::MAX;
 
         for k in candidates.into_iter() {
-            let ts = self
-                .last_access
-                .get(&k)
-                .map(|v| *v.value())
-                .unwrap_or(0);
+            let ts = self.last_access.get(&k).map(|v| *v.value()).unwrap_or(0);
 
             if ts < oldest_ts {
                 oldest_ts = ts;
@@ -2359,12 +2391,8 @@ impl Storage {
 
             let value_size: u64 = match value {
                 StorageValue::String { value, .. } => value.len() as u64,
-                StorageValue::List { value: list, .. } => {
-                    list.iter().map(|v| v.len() as u64).sum()
-                }
-                StorageValue::Set { value: set, .. } => {
-                    set.iter().map(|v| v.len() as u64).sum()
-                }
+                StorageValue::List { value: list, .. } => list.iter().map(|v| v.len() as u64).sum(),
+                StorageValue::Set { value: set, .. } => set.iter().map(|v| v.len() as u64).sum(),
                 StorageValue::Hash { value: map, .. } => {
                     map.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum()
                 }
