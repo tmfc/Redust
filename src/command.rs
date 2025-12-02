@@ -118,6 +118,9 @@ pub enum Command {
     Setnx { key: String, value: Binary },
     Setex { key: String, seconds: i64, value: Binary },
     Psetex { key: String, millis: i64, value: Binary },
+    Subscribe { channels: Vec<String> },
+    Unsubscribe { channels: Vec<String> },
+    Publish { channel: String, message: Binary },
     Unknown(Vec<Binary>),
     /// Represents an error that should be sent back to the client.
     Error(String),
@@ -1440,6 +1443,45 @@ pub async fn read_command(
                 }
                 _ => return Ok(Some(err_wrong_args("flushall"))),
             }
+        }
+        "SUBSCRIBE" => {
+            let mut channels = Vec::new();
+            for b in iter {
+                match parse_bulk_string(b) {
+                    Ok(c) => channels.push(c),
+                    Err(e) => return Ok(Some(e)),
+                }
+            }
+            if channels.is_empty() {
+                return Ok(Some(err_wrong_args("subscribe")));
+            }
+            Command::Subscribe { channels }
+        }
+        "UNSUBSCRIBE" => {
+            let mut channels = Vec::new();
+            for b in iter {
+                match parse_bulk_string(b) {
+                    Ok(c) => channels.push(c),
+                    Err(e) => return Ok(Some(e)),
+                }
+            }
+            Command::Unsubscribe { channels }
+        }
+        "PUBLISH" => {
+            let Some(channel_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("publish")));
+            };
+            let Some(message) = iter.next() else {
+                return Ok(Some(err_wrong_args("publish")));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("publish")));
+            }
+            let channel = match parse_bulk_string(channel_bytes) {
+                Ok(c) => c,
+                Err(e) => return Ok(Some(e)),
+            };
+            Command::Publish { channel, message }
         }
         "MGET" => {
             let mut keys = Vec::new();

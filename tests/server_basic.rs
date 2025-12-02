@@ -25,6 +25,14 @@ async fn spawn_server(
     (addr, tx, handle)
 }
 
+async fn send_array(writer: &mut tokio::net::tcp::OwnedWriteHalf, parts: &[&str]) {
+    let mut buf = format!("*{}\r\n", parts.len());
+    for p in parts {
+        buf.push_str(&format!("${}\r\n{}\r\n", p.len(), p));
+    }
+    writer.write_all(buf.as_bytes()).await.unwrap();
+}
+
 #[tokio::test]
 async fn responds_to_basic_commands() {
     let (addr, shutdown, handle) = spawn_server().await;
@@ -521,8 +529,11 @@ async fn select_command_isolates_databases() {
 
 #[tokio::test]
 async fn prometheus_metrics_exporter_basic() {
-    // Enable metrics exporter on a fixed local port for this test.
-    env::set_var("REDUST_METRICS_ADDR", "127.0.0.1:9898");
+    // Enable metrics exporter on an available local port to avoid conflicts across tests.
+    let metrics_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind metrics port");
+    let metrics_addr = metrics_listener.local_addr().unwrap();
+    drop(metrics_listener);
+    env::set_var("REDUST_METRICS_ADDR", metrics_addr.to_string());
 
     let (addr, shutdown, handle) = spawn_server().await;
 
@@ -544,7 +555,7 @@ async fn prometheus_metrics_exporter_basic() {
     let mut last_err = None;
     let mut metrics_stream = None;
     for _ in 0..20 {
-        match TcpStream::connect("127.0.0.1:9898").await {
+        match TcpStream::connect(metrics_addr).await {
             Ok(s) => {
                 metrics_stream = Some(s);
                 break;
@@ -1268,6 +1279,193 @@ async fn sets_union_behaviour() {
 
     members.sort();
     assert_eq!(members, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn sets_store_and_random_commands() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // Prepare source sets
+    send_array(&mut write_half, &["SADD", "set1", "a", "b", "c"]).await;
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":3\r\n");
+
+    send_array(&mut write_half, &["SADD", "set2", "b", "c", "d"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":3\r\n");
+
+    // SUNIONSTORE dest set1 set2 -> 4 members
+    send_array(&mut write_half, &["SUNIONSTORE", "dest", "set1", "set2"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":4\r\n");
+
+    // SMEMBERS dest -> a, b, c, d (order not guaranteed)
+    send_array(&mut write_half, &["SMEMBERS", "dest"]).await;
+    let mut arr_header = String::new();
+    reader.read_line(&mut arr_header).await.unwrap();
+    assert_eq!(arr_header, "*4\r\n");
+    eprintln!("stage: smembers dest header");
+    let mut members = Vec::new();
+    for _ in 0..4 {
+        let mut bulk_header = String::new();
+        let mut value = String::new();
+        reader.read_line(&mut bulk_header).await.unwrap();
+        reader.read_line(&mut value).await.unwrap();
+        assert!(bulk_header.starts_with("$"));
+        members.push(value.trim_end_matches("\r\n").to_string());
+    }
+    members.sort();
+    assert_eq!(
+        members,
+        vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()]
+    );
+    eprintln!("stage: union members read");
+
+    // Set a TTL on dest, then SINTERSTORE should drop the expiry
+    send_array(&mut write_half, &["PEXPIRE", "dest", "100"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":1\r\n");
+
+    send_array(&mut write_half, &["SINTERSTORE", "dest", "set1", "set2"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":2\r\n");
+
+    // PTTL dest should be -1 (no expiry) after store operation
+    send_array(&mut write_half, &["PTTL", "dest"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":-1\r\n");
+
+    // Members now should be intersection: b, c
+    send_array(&mut write_half, &["SMEMBERS", "dest"]).await;
+    arr_header.clear();
+    reader.read_line(&mut arr_header).await.unwrap();
+    assert_eq!(arr_header, "*2\r\n");
+    members.clear();
+    for _ in 0..2 {
+        let mut bulk_header = String::new();
+        let mut value = String::new();
+        reader.read_line(&mut bulk_header).await.unwrap();
+        reader.read_line(&mut value).await.unwrap();
+        members.push(value.trim_end_matches("\r\n").to_string());
+    }
+    members.sort();
+    assert_eq!(members, vec!["b".to_string(), "c".to_string()]);
+
+    // SDIFFSTORE dest set1 set2 -> a
+    send_array(&mut write_half, &["SDIFFSTORE", "dest", "set1", "set2"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":1\r\n");
+
+    send_array(&mut write_half, &["SMEMBERS", "dest"]).await;
+    arr_header.clear();
+    reader.read_line(&mut arr_header).await.unwrap();
+    assert_eq!(arr_header, "*1\r\n");
+    let mut bulk_header = String::new();
+    let mut value = String::new();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(value, "a\r\n");
+
+    // Wrongtype in source should error and keep dest unchanged
+    send_array(&mut write_half, &["SET", "strkey", "x"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "+OK\r\n");
+
+    send_array(&mut write_half, &["SUNIONSTORE", "dest", "set1", "strkey"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(
+        line,
+        "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+    );
+
+    // dest should still hold the previous SDIFFSTORE result (a)
+    write_half
+        .write_all(b"*2\r\n$8\r\nSMEMBERS\r\n$4\r\ndest\r\n")
+        .await
+        .unwrap();
+    arr_header.clear();
+    reader.read_line(&mut arr_header).await.unwrap();
+    assert_eq!(arr_header, "*1\r\n");
+    bulk_header.clear();
+    value.clear();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut value).await.unwrap();
+    assert_eq!(value, "a\r\n");
+
+    // SPOP with count should remove that many distinct members
+    send_array(&mut write_half, &["SADD", "popset", "x", "y", "z"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":3\r\n");
+
+    send_array(&mut write_half, &["SPOP", "popset", "2"]).await;
+    arr_header.clear();
+    reader.read_line(&mut arr_header).await.unwrap();
+    assert_eq!(arr_header, "*2\r\n");
+    // drain two bulk entries
+    for _ in 0..2 {
+        bulk_header.clear();
+        value.clear();
+        reader.read_line(&mut bulk_header).await.unwrap();
+        reader.read_line(&mut value).await.unwrap();
+        assert!(bulk_header.starts_with("$"));
+    }
+
+    send_array(&mut write_half, &["SCARD", "popset"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":1\r\n");
+
+    // Final SPOP should return the last element and empty the set
+    send_array(&mut write_half, &["SPOP", "popset"]).await;
+    bulk_header.clear();
+    value.clear();
+    reader.read_line(&mut bulk_header).await.unwrap();
+    reader.read_line(&mut value).await.unwrap();
+    assert!(bulk_header.starts_with("$"));
+
+    send_array(&mut write_half, &["SCARD", "popset"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":0\r\n");
+
+    // SRANDMEMBER with negative count should return duplicates without mutation
+    send_array(&mut write_half, &["SADD", "randset", "a", "b", "c"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":3\r\n");
+
+    send_array(&mut write_half, &["SRANDMEMBER", "randset", "-5"]).await;
+    arr_header.clear();
+    reader.read_line(&mut arr_header).await.unwrap();
+    assert_eq!(arr_header, "*5\r\n");
+    for _ in 0..5 {
+        bulk_header.clear();
+        value.clear();
+        reader.read_line(&mut bulk_header).await.unwrap();
+        reader.read_line(&mut value).await.unwrap();
+        assert!(bulk_header.starts_with("$"));
+    }
+
+    send_array(&mut write_half, &["SCARD", "randset"]).await;
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, ":3\r\n");
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();

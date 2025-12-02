@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::collections::HashMap;
 use std::sync::{Arc, atomic::{AtomicU64, AtomicUsize, Ordering}};
 use std::time::Instant;
 use std::env;
@@ -6,6 +7,8 @@ use std::env;
 use tokio::io::{self, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
+use tokio::sync::{broadcast, mpsc};
+use dashmap::DashMap;
 
 use log::{info, error};
 
@@ -25,6 +28,39 @@ struct Metrics {
     connected_clients: AtomicUsize,
     total_commands: AtomicU64,
     tcp_port: u16,
+}
+
+#[derive(Clone)]
+struct PubSubHub {
+    channels: Arc<DashMap<String, broadcast::Sender<Vec<u8>>>>,
+}
+
+impl PubSubHub {
+    fn new() -> Self {
+        PubSubHub {
+            channels: Arc::new(DashMap::new()),
+        }
+    }
+
+    fn subscribe(&self, channel: &str) -> broadcast::Receiver<Vec<u8>> {
+        let tx = self
+            .channels
+            .entry(channel.to_string())
+            .or_insert_with(|| broadcast::channel(1024).0)
+            .clone();
+        tx.subscribe()
+    }
+
+    fn publish(&self, channel: &str, payload: &[u8]) -> usize {
+        if let Some(sender) = self.channels.get(channel) {
+            match sender.send(payload.to_vec()) {
+                Ok(n) => n,
+                Err(_) => 0,
+            }
+        } else {
+            0
+        }
+    }
 }
 
 fn parse_maxmemory_bytes(input: &str) -> Option<u64> {
@@ -102,6 +138,58 @@ fn build_prometheus_metrics(storage: &Storage, metrics: &Metrics) -> String {
 
 fn prefix_key(db: u8, key: &str) -> String {
     format!("{}:{}", db, key)
+}
+
+struct PubMessage {
+    channel: String,
+    payload: Vec<u8>,
+}
+
+async fn write_subscribe_event(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    kind: &str,
+    channel: &str,
+    count: usize,
+) -> io::Result<()> {
+    writer
+        .write_all(
+            format!(
+                "*3\r\n${}\r\n{}\r\n${}\r\n{}\r\n:{}\r\n",
+                kind.len(),
+                kind,
+                channel.len(),
+                channel,
+                count
+            )
+            .as_bytes(),
+        )
+        .await
+}
+
+async fn write_message_event(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    channel: &str,
+    payload: &[u8],
+) -> io::Result<()> {
+    writer
+        .write_all(format!("*3\r\n$7\r\nmessage\r\n${}\r\n{}\r\n", channel.len(), channel).as_bytes())
+        .await?;
+    writer
+        .write_all(format!("${}\r\n", payload.len()).as_bytes())
+        .await?;
+    writer.write_all(payload).await?;
+    writer.write_all(b"\r\n").await
+}
+
+async fn write_pong_event(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    payload: &[u8],
+) -> io::Result<()> {
+    writer
+        .write_all(format!("*2\r\n$4\r\npong\r\n${}\r\n", payload.len()).as_bytes())
+        .await?;
+    writer.write_all(payload).await?;
+    writer.write_all(b"\r\n").await
 }
 
 async fn handle_string_command(
@@ -326,99 +414,6 @@ async fn handle_string_command(
                 }
                 Ok(None) => {
                     respond_null_bulk(writer).await?;
-                }
-                Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
-                }
-            }
-        }
-        Command::Sunionstore { dest, keys } => {
-            let physical_keys: Vec<String> = keys
-                .into_iter()
-                .map(|k| prefix_key(current_db, &k))
-                .collect();
-            let physical_dest = prefix_key(current_db, &dest);
-            match storage.sunionstore(&physical_dest, &physical_keys) {
-                Ok(len) => {
-                    respond_integer(writer, len as i64).await?;
-                }
-                Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
-                }
-            }
-        }
-        Command::Sinterstore { dest, keys } => {
-            let physical_keys: Vec<String> = keys
-                .into_iter()
-                .map(|k| prefix_key(current_db, &k))
-                .collect();
-            let physical_dest = prefix_key(current_db, &dest);
-            match storage.sinterstore(&physical_dest, &physical_keys) {
-                Ok(len) => {
-                    respond_integer(writer, len as i64).await?;
-                }
-                Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
-                }
-            }
-        }
-        Command::Sdiffstore { dest, keys } => {
-            let physical_keys: Vec<String> = keys
-                .into_iter()
-                .map(|k| prefix_key(current_db, &k))
-                .collect();
-            let physical_dest = prefix_key(current_db, &dest);
-            match storage.sdiffstore(&physical_dest, &physical_keys) {
-                Ok(len) => {
-                    respond_integer(writer, len as i64).await?;
-                }
-                Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
-                }
-            }
-        }
-        Command::Spop { key, count } => {
-            let physical = prefix_key(current_db, &key);
-            match storage.spop(&physical, count) {
-                Ok(values) => {
-                    if count.is_none() {
-                        if let Some(v) = values.into_iter().next() {
-                            let resp = format!("${}\r\n{}\r\n", v.len(), v);
-                            writer.write_all(resp.as_bytes()).await?;
-                        } else {
-                            writer.write_all(b"$-1\r\n").await?;
-                        }
-                    } else {
-                        let mut resp = format!("*{}\r\n", values.len());
-                        for v in values {
-                            resp.push_str(&format!("${}\r\n{}\r\n", v.len(), v));
-                        }
-                        writer.write_all(resp.as_bytes()).await?;
-                    }
-                }
-                Err(()) => {
-                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
-                }
-            }
-        }
-        Command::Srandmember { key, count } => {
-            let physical = prefix_key(current_db, &key);
-            match storage.srandmember(&physical, count) {
-                Ok(values) => {
-                    if count.is_none() {
-                        if let Some(v) = values.into_iter().next() {
-                            let resp = format!("${}\r\n{}\r\n", v.len(), v);
-                            writer.write_all(resp.as_bytes()).await?;
-                        } else {
-                            writer.write_all(b"$-1\r\n").await?;
-                        }
-                    } else {
-                        let mut resp = format!("*{}\r\n", values.len());
-                        for v in values {
-                            resp.push_str(&format!("${}\r\n{}\r\n", v.len(), v));
-                        }
-                        writer.write_all(resp.as_bytes()).await?;
-                    }
                 }
                 Err(()) => {
                     respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
@@ -883,6 +878,42 @@ async fn handle_set_command(
                         response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
                     }
                     writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Sunionstore { dest, keys } => {
+            let physical_keys: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
+            let physical_dest = prefix_key(current_db, &dest);
+            match storage.sunionstore(&physical_dest, &physical_keys) {
+                Ok(len) => {
+                    respond_integer(writer, len as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Sinterstore { dest, keys } => {
+            let physical_keys: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
+            let physical_dest = prefix_key(current_db, &dest);
+            match storage.sinterstore(&physical_dest, &physical_keys) {
+                Ok(len) => {
+                    respond_integer(writer, len as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Sdiffstore { dest, keys } => {
+            let physical_keys: Vec<String> = keys.into_iter().map(|k| prefix_key(current_db, &k)).collect();
+            let physical_dest = prefix_key(current_db, &dest);
+            match storage.sdiffstore(&physical_dest, &physical_keys) {
+                Ok(len) => {
+                    respond_integer(writer, len as i64).await?;
                 }
                 Err(()) => {
                     respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
@@ -1363,7 +1394,7 @@ async fn run_metrics_exporter(bind_addr: &str, storage: Storage, metrics: Arc<Me
     }
 }
 
-async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Metrics>) -> io::Result<()> {
+async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Metrics>, pubsub: PubSubHub) -> io::Result<()> {
     let peer_addr = stream.peer_addr().ok();
     info!("[conn] new connection from {:?}", peer_addr);
 
@@ -1375,9 +1406,25 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
 
     let auth_password = env::var("REDUST_AUTH_PASSWORD").ok().filter(|s| !s.is_empty());
     let mut authenticated = auth_password.is_none();
+    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<PubMessage>();
+    let mut subscriptions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut subscribed_mode = false;
 
     loop {
-        let cmd_result = read_command(&mut reader).await;
+        let cmd_result = if subscribed_mode {
+            tokio::select! {
+                maybe_msg = msg_rx.recv() => {
+                    if let Some(msg) = maybe_msg {
+                        write_message_event(&mut write_half, &msg.channel, &msg.payload).await?;
+                        continue;
+                    }
+                    read_command(&mut reader).await
+                }
+                cmd = read_command(&mut reader) => cmd,
+            }
+        } else {
+            read_command(&mut reader).await
+        };
         let cmd = match cmd_result {
             Ok(Some(command)) => command,
             Ok(None) => break, // Connection closed or no more data
@@ -1431,6 +1478,20 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
             // 未启用 AUTH，但客户端仍然发送 AUTH
             respond_error(&mut write_half, "ERR AUTH not enabled").await?;
             continue;
+        }
+
+        if subscribed_mode {
+            match cmd {
+                Command::Subscribe { .. } | Command::Unsubscribe { .. } | Command::Ping | Command::Quit => {}
+                _ => {
+                    respond_error(&mut write_half, "ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context").await?;
+                    continue;
+                }
+            }
+            if let Command::Ping = cmd {
+                write_pong_event(&mut write_half, b"").await?;
+                continue;
+            }
         }
 
         match cmd {
@@ -1538,6 +1599,59 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
                 current_db = db;
                 respond_simple_string(&mut write_half, "OK").await?;
             }
+            // Pub/Sub 发布
+            Command::Publish { channel, message } => {
+                if let Some(limit) = current_max_value_bytes() {
+                    if (message.len() as u64) > limit {
+                        respond_error(&mut write_half, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                        continue;
+                    }
+                }
+                let receivers = pubsub.publish(&channel, &message);
+                respond_integer(&mut write_half, receivers as i64).await?;
+            }
+            // Pub/Sub 订阅
+            Command::Subscribe { channels } => {
+                for channel in channels {
+                    if !subscriptions.contains_key(&channel) {
+                        let mut rx = pubsub.subscribe(&channel);
+                        let tx = msg_tx.clone();
+                        let ch = channel.clone();
+                        let handle = tokio::spawn(async move {
+                            while let Ok(payload) = rx.recv().await {
+                                let _ = tx.send(PubMessage {
+                                    channel: ch.clone(),
+                                    payload,
+                                });
+                            }
+                        });
+                        subscriptions.insert(channel.clone(), handle);
+                    }
+                    let count = subscriptions.len();
+                    write_subscribe_event(&mut write_half, "subscribe", &channel, count).await?;
+                }
+                subscribed_mode = !subscriptions.is_empty();
+            }
+            Command::Unsubscribe { channels } => {
+                let targets: Vec<String> = if channels.is_empty() {
+                    subscriptions.keys().cloned().collect()
+                } else {
+                    channels
+                };
+
+                if targets.is_empty() {
+                    write_subscribe_event(&mut write_half, "unsubscribe", "", subscriptions.len()).await?;
+                } else {
+                    for ch in targets {
+                        if let Some(handle) = subscriptions.remove(&ch) {
+                            handle.abort();
+                        }
+                        let count = subscriptions.len();
+                        write_subscribe_event(&mut write_half, "unsubscribe", &ch, count).await?;
+                    }
+                }
+                subscribed_mode = !subscriptions.is_empty();
+            }
 
             Command::Auth { .. } => {
                 unreachable!();
@@ -1559,6 +1673,10 @@ async fn handle_connection(stream: TcpStream, storage: Storage, metrics: Arc<Met
                 respond_error(&mut write_half, &msg).await?;
             }
         }
+    }
+
+    for (_, handle) in subscriptions {
+        handle.abort();
     }
 
     metrics.connected_clients.fetch_sub(1, Ordering::Relaxed);
@@ -1631,6 +1749,7 @@ pub async fn serve(
         total_commands: AtomicU64::new(0),
         tcp_port: port,
     });
+    let pubsub = PubSubHub::new();
 
     if let Ok(metrics_addr) = env::var("REDUST_METRICS_ADDR") {
         if !metrics_addr.is_empty() {
@@ -1650,9 +1769,10 @@ pub async fn serve(
                 let (stream, addr) = res?;
                 let storage = storage.clone();
                 let metrics = metrics.clone();
+                let pubsub = pubsub.clone();
                 info!("Accepted connection from {}", addr);
                 tokio::spawn(async move {
-                    if let Err(err) = handle_connection(stream, storage, metrics).await {
+                    if let Err(err) = handle_connection(stream, storage, metrics, pubsub).await {
                         error!("Connection error: {}", err);
                     }
                 });
