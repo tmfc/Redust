@@ -361,6 +361,14 @@ pub enum Command {
     Save,
     Bgsave,
     Lastsave,
+    // 事务命令
+    Multi,
+    Exec,
+    Discard,
+    Watch {
+        keys: Vec<String>,
+    },
+    Unwatch,
     Zadd {
         key: String,
         entries: Vec<(f64, String)>,
@@ -1411,6 +1419,43 @@ pub async fn read_command(
                 return Ok(Some(err_wrong_args("lastsave")));
             }
             Command::Lastsave
+        }
+        "MULTI" => {
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("multi")));
+            }
+            Command::Multi
+        }
+        "EXEC" => {
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("exec")));
+            }
+            Command::Exec
+        }
+        "DISCARD" => {
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("discard")));
+            }
+            Command::Discard
+        }
+        "WATCH" => {
+            let mut keys: Vec<String> = Vec::new();
+            for b in iter {
+                match parse_bulk_string(b) {
+                    Ok(k) => keys.push(k),
+                    Err(e) => return Ok(Some(e)),
+                }
+            }
+            if keys.is_empty() {
+                return Ok(Some(err_wrong_args("watch")));
+            }
+            Command::Watch { keys }
+        }
+        "UNWATCH" => {
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("unwatch")));
+            }
+            Command::Unwatch
         }
         "KEYS" => {
             let Some(pattern_bytes) = iter.next() else {

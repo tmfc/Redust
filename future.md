@@ -158,6 +158,51 @@
 
 ---
 
+## 键扫描与模式匹配增强（V2）
+
+> 现状：`SCAN`/`KEYS`/`SSCAN`/`HSCAN`/`ZSCAN` 已实现基础功能，`pattern_match` 支持 `*`、`?`、`[abc]`、`[a-z]`、`\` 转义等 glob 语法。
+
+- [ ] **`[^abc]` 取反字符集支持**
+  - Redis 支持 `[^abc]` 表示"不匹配 a/b/c 中任一字符"。
+  - 当前 `pattern_match` 未实现取反逻辑，需在 `match_set` 中增加对 `^` 前缀的处理。
+
+- [ ] **SCAN TYPE 选项**
+  - Redis 6.0+ 支持 `SCAN cursor TYPE string|list|set|hash|zset` 按类型过滤。
+  - 可在 `Command::Scan` 中增加 `type_filter: Option<String>` 字段，并在扫描时调用 `storage.type_of()` 过滤。
+
+- [ ] **SCAN NOVALUES 选项（HSCAN/ZSCAN）**
+  - Redis 7.4+ 支持 `HSCAN key cursor NOVALUES` 仅返回 field 不返回 value，减少网络开销。
+  - 可作为后续优化点。
+
+- [ ] **SCAN 游标稳定性与性能**
+  - 当前 SCAN 实现基于 key 列表索引作为 cursor，在并发写入/删除时可能出现重复或遗漏。
+  - 后续可考虑引入更稳定的游标机制（如基于 key 排序后的二分查找位置）。
+
+---
+
+## 事务与脚本增强（V2）
+
+> 现状：`MULTI`/`EXEC`/`DISCARD`/`WATCH`/`UNWATCH` 已实现基础语义，支持命令队列和乐观锁。
+
+- [ ] **EVAL/EVALSHA Lua 脚本支持**
+  - 引入简化的 Lua 运行时（如 `mlua` crate），支持基础脚本执行。
+  - 实现 `redis.call()` / `redis.pcall()` 回调，允许脚本调用 Redis 命令。
+  - 实现 `SCRIPT LOAD` / `SCRIPT EXISTS` / `SCRIPT FLUSH` 脚本管理命令。
+
+- [ ] **事务中更多命令支持**
+  - 当前事务中部分命令（如 `TYPE`、`KEYS`、`SCAN` 等）返回错误。
+  - 后续可逐步支持这些命令在事务中执行。
+
+- [ ] **事务错误处理增强**
+  - Redis 在 EXEC 时如果队列中有语法错误命令，会中止整个事务。
+  - 当前实现在命令入队时已做语法检查，但可进一步对齐 Redis 行为。
+
+- [ ] **WATCH 版本追踪优化**
+  - 当前仅在 `set`/`del` 操作中更新 key 版本，其他写操作（如 `LPUSH`、`SADD`、`HSET` 等）尚未覆盖。
+  - 后续需系统性地在所有写路径中调用 `bump_key_version`。
+
+---
+
 ## 列表 / 集合命令增强（V2）
 
 - [ ] **列表高级命令与阻塞语义预研**

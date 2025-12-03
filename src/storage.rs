@@ -50,6 +50,10 @@ pub struct Storage {
     maxmemory_bytes: Option<u64>,
     last_access: Arc<DashMap<String, u64>>,
     access_counter: Arc<AtomicU64>,
+    /// 全局版本计数器，每次写操作递增
+    global_version: Arc<AtomicU64>,
+    /// 每个 key 的版本号，用于 WATCH 机制
+    key_versions: Arc<DashMap<String, u64>>,
 }
 
 // HINCRBY 专用错误类型，用于区分 WRONGTYPE / 非整数 / 溢出 / 超过 maxvalue 限制
@@ -84,7 +88,20 @@ impl Storage {
             maxmemory_bytes,
             last_access: Arc::new(DashMap::new()),
             access_counter: Arc::new(AtomicU64::new(0)),
+            global_version: Arc::new(AtomicU64::new(0)),
+            key_versions: Arc::new(DashMap::new()),
         }
+    }
+
+    /// 获取指定 key 的当前版本号
+    pub fn get_key_version(&self, key: &str) -> u64 {
+        self.key_versions.get(key).map(|v| *v).unwrap_or(0)
+    }
+
+    /// 递增指定 key 的版本号（在写操作后调用）
+    pub fn bump_key_version(&self, key: &str) {
+        let new_version = self.global_version.fetch_add(1, Ordering::SeqCst) + 1;
+        self.key_versions.insert(key.to_string(), new_version);
     }
 
     pub fn flushdb(&self, db: u8) {
@@ -96,13 +113,19 @@ impl Storage {
             .filter(|k| k.starts_with(&prefix))
             .collect();
 
-        for k in keys_to_remove {
-            self.data.remove(&k);
-            self.last_access.remove(&k);
+        for k in &keys_to_remove {
+            self.data.remove(k);
+            self.last_access.remove(k);
+            self.bump_key_version(k);
         }
     }
 
     pub fn flushall(&self) {
+        // 先记录所有 key 并更新版本
+        let all_keys: Vec<String> = self.data.iter().map(|e| e.key().clone()).collect();
+        for k in &all_keys {
+            self.bump_key_version(k);
+        }
         self.data.clear();
         self.last_access.clear();
         self.access_counter.store(0, Ordering::Relaxed);
@@ -137,8 +160,10 @@ impl Storage {
             );
         }
 
+        // hset 总是修改 key（即使 field 已存在），需要更新版本
+        self.touch_key(key);
+        self.bump_key_version(key);
         if added > 0 {
-            self.touch_key(key);
             self.maybe_evict_for_write();
         }
 
@@ -292,6 +317,7 @@ impl Storage {
         map.insert(field.to_string(), new_str);
 
         self.touch_key(key);
+        self.bump_key_version(key);
         self.maybe_evict_for_write();
 
         Ok(new_val)
@@ -351,6 +377,7 @@ impl Storage {
         map.insert(field.to_string(), s);
 
         self.touch_key(key);
+        self.bump_key_version(key);
         self.maybe_evict_for_write();
 
         Ok(new_val)
@@ -400,6 +427,7 @@ impl Storage {
 
         if removed > 0 {
             self.touch_key(key);
+            self.bump_key_version(key);
         }
 
         Ok(removed)
@@ -450,6 +478,7 @@ impl Storage {
 
         if !result.is_empty() {
             self.touch_key(key);
+            self.bump_key_version(key);
         }
 
         Ok(result)
@@ -574,6 +603,7 @@ impl Storage {
                 expires_at: None,
             });
         self.touch_key(&key);
+        self.bump_key_version(&key);
         self.maybe_evict_for_write();
     }
 
@@ -620,6 +650,7 @@ impl Storage {
 
         // 删除访问记录
         self.last_access.remove(key);
+        self.bump_key_version(key);
 
         Ok(result)
     }
@@ -695,8 +726,9 @@ impl Storage {
             );
             len
         };
+        self.touch_key(key);
+        self.bump_key_version(key);
         if len > 0 {
-            self.touch_key(key);
             self.maybe_evict_for_write();
         }
 
@@ -746,6 +778,7 @@ impl Storage {
         }
 
         self.touch_key(key);
+        self.bump_key_version(key);
         self.maybe_evict_for_write();
 
         Ok(old)
@@ -786,8 +819,9 @@ impl Storage {
             len
         };
 
+        self.touch_key(key);
+        self.bump_key_version(key);
         if new_len > 0 {
-            self.touch_key(key);
             self.maybe_evict_for_write();
         }
 
@@ -850,6 +884,7 @@ impl Storage {
             });
         if inserted {
             self.touch_key(key);
+            self.bump_key_version(key);
             self.maybe_evict_for_write();
         }
         inserted
@@ -870,6 +905,7 @@ impl Storage {
         for key in keys {
             if self.data.remove(key).is_some() {
                 self.last_access.remove(key);
+                self.bump_key_version(key);
                 removed += 1;
             }
         }
@@ -904,10 +940,12 @@ impl Storage {
 
         // 删除旧的访问记录
         self.last_access.remove(from);
+        self.bump_key_version(from);
 
         // 插入新 key，保留 TTL 信息
         self.data.insert(to.to_string(), value);
         self.touch_key(to);
+        self.bump_key_version(to);
 
         Ok(())
     }
@@ -943,8 +981,10 @@ impl Storage {
         };
 
         self.last_access.remove(from);
+        self.bump_key_version(from);
         self.data.insert(to.to_string(), value);
         self.touch_key(to);
+        self.bump_key_version(to);
 
         Ok(true)
     }
@@ -988,6 +1028,7 @@ impl Storage {
         let new_val = value.checked_add(delta).ok_or(())?;
         *current_val = new_val.to_string().into_bytes();
         self.touch_key(key);
+        self.bump_key_version(key);
         self.maybe_evict_for_write();
         Ok(new_val)
     }
@@ -1037,6 +1078,7 @@ impl Storage {
 
         *current_val = s.into_bytes();
         self.touch_key(key);
+        self.bump_key_version(key);
         self.maybe_evict_for_write();
         Ok(new_val)
     }
@@ -1120,8 +1162,9 @@ impl Storage {
             );
         }
 
+        self.touch_key(key);
+        self.bump_key_version(key);
         if len > 0 {
-            self.touch_key(key);
             self.maybe_evict_for_write();
         }
 
@@ -1199,6 +1242,10 @@ impl Storage {
             _ => return Err(()),
         };
 
+        if result.is_some() {
+            self.bump_key_version(key);
+        }
+
         Ok(result)
     }
 
@@ -1216,6 +1263,10 @@ impl Storage {
             StorageValue::List { value: list, .. } => list.pop_back(),
             _ => return Err(()),
         };
+
+        if result.is_some() {
+            self.bump_key_version(key);
+        }
 
         Ok(result)
     }
@@ -1327,6 +1378,7 @@ impl Storage {
 
         if removed > 0 {
             self.touch_key(key);
+            self.bump_key_version(key);
         }
 
         Ok(removed)
@@ -1374,6 +1426,7 @@ impl Storage {
             // Result is empty list
             list.clear();
             self.touch_key(key);
+            self.bump_key_version(key);
             return Ok(());
         }
 
@@ -1391,6 +1444,7 @@ impl Storage {
         }
 
         self.touch_key(key);
+        self.bump_key_version(key);
         // ltrim 只会收缩列表，不会增加内存，这里不触发淘汰
 
         Ok(())
@@ -1431,6 +1485,7 @@ impl Storage {
 
         if added > 0 {
             self.touch_key(key);
+            self.bump_key_version(key);
             self.maybe_evict_for_write();
         }
 
@@ -1462,6 +1517,7 @@ impl Storage {
 
         if removed > 0 {
             self.touch_key(key);
+            self.bump_key_version(key);
         }
 
         Ok(removed)
@@ -1576,8 +1632,9 @@ impl Storage {
                 expires_at: None,
             },
         );
+        self.touch_key(dest);
+        self.bump_key_version(dest);
         if len > 0 {
-            self.touch_key(dest);
             self.maybe_evict_for_write();
         }
         len
@@ -1735,6 +1792,7 @@ impl Storage {
 
         if !entries.is_empty() {
             self.touch_key(key);
+            self.bump_key_version(key);
             self.maybe_evict_for_write();
         }
 
@@ -1785,6 +1843,7 @@ impl Storage {
 
         if removed > 0 {
             self.touch_key(key);
+            self.bump_key_version(key);
         }
 
         Ok(removed)
@@ -1858,6 +1917,7 @@ impl Storage {
         }
 
         self.touch_key(key);
+        self.bump_key_version(key);
         self.maybe_evict_for_write();
 
         Ok(new_score)
@@ -2272,6 +2332,7 @@ impl Storage {
             let existed = self.data.remove(key).is_some();
             if existed {
                 self.last_access.remove(key);
+                self.bump_key_version(key);
             }
             return existed;
         }
@@ -2294,6 +2355,7 @@ impl Storage {
             | StorageValue::Hash { expires_at, .. }
             | StorageValue::Zset { expires_at, .. } => {
                 *expires_at = Some(deadline);
+                self.bump_key_version(key);
                 true
             }
         }
@@ -2304,6 +2366,7 @@ impl Storage {
             let existed = self.data.remove(key).is_some();
             if existed {
                 self.last_access.remove(key);
+                self.bump_key_version(key);
             }
             return existed;
         }
@@ -2326,6 +2389,7 @@ impl Storage {
             | StorageValue::Hash { expires_at, .. }
             | StorageValue::Zset { expires_at, .. } => {
                 *expires_at = Some(deadline);
+                self.bump_key_version(key);
                 true
             }
         }
@@ -2423,6 +2487,7 @@ impl Storage {
             | StorageValue::Zset { expires_at, .. } => {
                 if expires_at.is_some() {
                     *expires_at = None;
+                    self.bump_key_version(key);
                     true
                 } else {
                     false

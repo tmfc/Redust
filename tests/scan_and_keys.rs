@@ -430,3 +430,195 @@ async fn zscan_missing_key_returns_empty() {
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
 }
+
+/// 测试 `?` 单字符通配符
+#[tokio::test]
+async fn keys_glob_question_mark() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // 写入 key: a1, a2, a10, ab
+    client.send_array(&["SET", "a1", "v"]).await;
+    let _ = client.read_simple_line().await;
+    client.send_array(&["SET", "a2", "v"]).await;
+    let _ = client.read_simple_line().await;
+    client.send_array(&["SET", "a10", "v"]).await;
+    let _ = client.read_simple_line().await;
+    client.send_array(&["SET", "ab", "v"]).await;
+    let _ = client.read_simple_line().await;
+
+    // KEYS a? 应该匹配 a1, a2, ab（两个字符），不匹配 a10
+    client.send_array(&["KEYS", "a?"]).await;
+    let keys = client.read_array_of_bulk().await;
+    let mut keys_sorted = keys.clone();
+    keys_sorted.sort();
+    assert_eq!(keys_sorted, vec!["a1", "a2", "ab"]);
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+/// 测试 `[abc]` 字符集匹配
+#[tokio::test]
+async fn keys_glob_character_set() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // 写入 key: xa, xb, xc, xd, xe
+    for c in ['a', 'b', 'c', 'd', 'e'] {
+        let k = format!("x{}", c);
+        client.send_array(&["SET", &k, "v"]).await;
+        let _ = client.read_simple_line().await;
+    }
+
+    // KEYS x[abc] 应该匹配 xa, xb, xc
+    client.send_array(&["KEYS", "x[abc]"]).await;
+    let keys = client.read_array_of_bulk().await;
+    let mut keys_sorted = keys.clone();
+    keys_sorted.sort();
+    assert_eq!(keys_sorted, vec!["xa", "xb", "xc"]);
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+/// 测试 `[a-z]` 字符范围匹配
+#[tokio::test]
+async fn keys_glob_character_range() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // 写入 key: k0, k5, ka, kz, kA
+    client.send_array(&["SET", "k0", "v"]).await;
+    let _ = client.read_simple_line().await;
+    client.send_array(&["SET", "k5", "v"]).await;
+    let _ = client.read_simple_line().await;
+    client.send_array(&["SET", "ka", "v"]).await;
+    let _ = client.read_simple_line().await;
+    client.send_array(&["SET", "kz", "v"]).await;
+    let _ = client.read_simple_line().await;
+    client.send_array(&["SET", "kA", "v"]).await;
+    let _ = client.read_simple_line().await;
+
+    // KEYS k[a-z] 应该匹配 ka, kz（小写字母）
+    client.send_array(&["KEYS", "k[a-z]"]).await;
+    let keys = client.read_array_of_bulk().await;
+    let mut keys_sorted = keys.clone();
+    keys_sorted.sort();
+    assert_eq!(keys_sorted, vec!["ka", "kz"]);
+
+    // KEYS k[0-9] 应该匹配 k0, k5
+    client.send_array(&["KEYS", "k[0-9]"]).await;
+    let keys = client.read_array_of_bulk().await;
+    let mut keys_sorted = keys.clone();
+    keys_sorted.sort();
+    assert_eq!(keys_sorted, vec!["k0", "k5"]);
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+/// 测试转义字符 `\*` `\?`
+#[tokio::test]
+async fn keys_glob_escape_special_chars() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // 写入 key: foo*, foo?, foobar
+    client.send_array(&["SET", "foo*", "v"]).await;
+    let _ = client.read_simple_line().await;
+    client.send_array(&["SET", "foo?", "v"]).await;
+    let _ = client.read_simple_line().await;
+    client.send_array(&["SET", "foobar", "v"]).await;
+    let _ = client.read_simple_line().await;
+
+    // KEYS foo\* 应该只匹配 foo*（字面星号）
+    client.send_array(&["KEYS", r"foo\*"]).await;
+    let keys = client.read_array_of_bulk().await;
+    assert_eq!(keys, vec!["foo*"]);
+
+    // KEYS foo\? 应该只匹配 foo?（字面问号）
+    client.send_array(&["KEYS", r"foo\?"]).await;
+    let keys = client.read_array_of_bulk().await;
+    assert_eq!(keys, vec!["foo?"]);
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+/// 测试复合模式 `user:*:profile`
+#[tokio::test]
+async fn keys_glob_compound_pattern() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // 写入 key
+    client.send_array(&["SET", "user:1:profile", "v"]).await;
+    let _ = client.read_simple_line().await;
+    client.send_array(&["SET", "user:2:profile", "v"]).await;
+    let _ = client.read_simple_line().await;
+    client.send_array(&["SET", "user:1:settings", "v"]).await;
+    let _ = client.read_simple_line().await;
+    client.send_array(&["SET", "user:abc:profile", "v"]).await;
+    let _ = client.read_simple_line().await;
+
+    // KEYS user:*:profile 应该匹配 user:1:profile, user:2:profile, user:abc:profile
+    client.send_array(&["KEYS", "user:*:profile"]).await;
+    let keys = client.read_array_of_bulk().await;
+    let mut keys_sorted = keys.clone();
+    keys_sorted.sort();
+    assert_eq!(
+        keys_sorted,
+        vec!["user:1:profile", "user:2:profile", "user:abc:profile"]
+    );
+
+    // KEYS user:?:profile 应该只匹配单字符 ID
+    client.send_array(&["KEYS", "user:?:profile"]).await;
+    let keys = client.read_array_of_bulk().await;
+    let mut keys_sorted = keys.clone();
+    keys_sorted.sort();
+    assert_eq!(keys_sorted, vec!["user:1:profile", "user:2:profile"]);
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+/// 测试 SCAN 带 MATCH 使用各种 glob 模式
+#[tokio::test]
+async fn scan_with_various_glob_patterns() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // 写入 key
+    for i in 0..5 {
+        let k = format!("item:{}", i);
+        client.send_array(&["SET", &k, "v"]).await;
+        let _ = client.read_simple_line().await;
+    }
+    client.send_array(&["SET", "item:abc", "v"]).await;
+    let _ = client.read_simple_line().await;
+    client.send_array(&["SET", "other", "v"]).await;
+    let _ = client.read_simple_line().await;
+
+    // SCAN with MATCH item:? (单字符)
+    let mut cursor = 0u64;
+    let mut seen = Vec::new();
+    loop {
+        let (next, keys) = client.scan(cursor, Some("item:?"), Some(100)).await;
+        for k in keys {
+            if !k.is_empty() {
+                seen.push(k);
+            }
+        }
+        if next == 0 {
+            break;
+        }
+        cursor = next;
+    }
+    seen.sort();
+    let expected: Vec<String> = (0..5).map(|i| format!("item:{}", i)).collect();
+    assert_eq!(seen, expected);
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}

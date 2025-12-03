@@ -2445,6 +2445,136 @@ async fn run_metrics_exporter(
     }
 }
 
+/// 在事务中执行单个命令，返回结果写入 writer
+async fn execute_command_in_transaction(
+    cmd: Command,
+    storage: &Storage,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    current_db: u8,
+) -> io::Result<()> {
+    match cmd {
+        // string / generic key-value 命令
+        Command::Ping
+        | Command::PingWithPayload(_)
+        | Command::Echo(_)
+        | Command::Set { .. }
+        | Command::Get { .. }
+        | Command::Getdel { .. }
+        | Command::Getex { .. }
+        | Command::Getrange { .. }
+        | Command::Setrange { .. }
+        | Command::Append { .. }
+        | Command::Strlen { .. }
+        | Command::Getset { .. }
+        | Command::Incr { .. }
+        | Command::Decr { .. }
+        | Command::Incrby { .. }
+        | Command::Decrby { .. }
+        | Command::Incrbyfloat { .. }
+        | Command::Del { .. }
+        | Command::Exists { .. }
+        | Command::Mget { .. }
+        | Command::Mset { .. }
+        | Command::Msetnx { .. }
+        | Command::Setnx { .. }
+        | Command::Setex { .. }
+        | Command::Psetex { .. }
+        | Command::Quit => {
+            handle_string_command(cmd, storage, writer, current_db).await?;
+        }
+
+        // list 命令
+        Command::Lpush { .. }
+        | Command::Rpush { .. }
+        | Command::Lrange { .. }
+        | Command::Lpop { .. }
+        | Command::Rpop { .. }
+        | Command::Llen { .. }
+        | Command::Lindex { .. }
+        | Command::Lrem { .. }
+        | Command::Ltrim { .. } => {
+            handle_list_command(cmd, storage, writer, current_db).await?;
+        }
+
+        // set 命令
+        Command::Sadd { .. }
+        | Command::Srem { .. }
+        | Command::Smembers { .. }
+        | Command::Scard { .. }
+        | Command::Sismember { .. }
+        | Command::Spop { .. }
+        | Command::Srandmember { .. }
+        | Command::Sunion { .. }
+        | Command::Sinter { .. }
+        | Command::Sdiff { .. }
+        | Command::Sunionstore { .. }
+        | Command::Sinterstore { .. }
+        | Command::Sdiffstore { .. }
+        | Command::Sscan { .. } => {
+            handle_set_command(cmd, storage, writer, current_db).await?;
+        }
+
+        // hash 命令
+        Command::Hset { .. }
+        | Command::Hget { .. }
+        | Command::Hdel { .. }
+        | Command::Hexists { .. }
+        | Command::Hgetall { .. }
+        | Command::Hkeys { .. }
+        | Command::Hvals { .. }
+        | Command::Hmget { .. }
+        | Command::Hincrby { .. }
+        | Command::Hincrbyfloat { .. }
+        | Command::Hlen { .. }
+        | Command::Hscan { .. } => {
+            handle_hash_command(cmd, storage, writer, current_db).await?;
+        }
+
+        // zset 命令
+        Command::Zadd { .. }
+        | Command::Zcard { .. }
+        | Command::Zrange { .. }
+        | Command::Zscore { .. }
+        | Command::Zrem { .. }
+        | Command::Zincrby { .. } => {
+            handle_zset_command(cmd, storage, writer, current_db).await?;
+        }
+
+        // key meta 命令
+        Command::Type { .. }
+        | Command::Keys { .. }
+        | Command::Dbsize
+        | Command::Expire { .. }
+        | Command::Pexpire { .. }
+        | Command::Ttl { .. }
+        | Command::Pttl { .. }
+        | Command::Persist { .. }
+        | Command::Rename { .. }
+        | Command::Renamenx { .. }
+        | Command::Scan { .. }
+        | Command::Zscan { .. } => {
+            // 简化处理：这些命令在事务中可能需要特殊处理
+            // 但为了简单起见，我们直接返回错误
+            respond_error(writer, "ERR command not supported in transaction").await?;
+        }
+
+        // 不支持在事务中的命令
+        Command::Multi
+        | Command::Exec
+        | Command::Discard
+        | Command::Watch { .. }
+        | Command::Unwatch => {
+            respond_error(writer, "ERR command not allowed in transaction").await?;
+        }
+
+        // 其他命令返回错误
+        _ => {
+            respond_error(writer, "ERR command not supported in transaction").await?;
+        }
+    }
+    Ok(())
+}
+
 async fn handle_connection(
     stream: TcpStream,
     storage: Storage,
@@ -2471,6 +2601,14 @@ async fn handle_connection(
     let mut pattern_subscriptions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut shard_subscriptions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut subscribed_mode = false;
+
+    // 事务状态
+    let mut in_transaction = false;
+    let mut queued_commands: Vec<Command> = Vec::new();
+    // WATCH 的 key -> 版本号映射（物理 key）
+    let mut watched_keys: HashMap<String, u64> = HashMap::new();
+    // 事务是否因解析错误而中止
+    let mut transaction_aborted = false;
 
     loop {
         let cmd_result = if subscribed_mode {
@@ -2576,6 +2714,118 @@ async fn handle_connection(
                 }
                 _ => {}
             }
+        }
+
+        // 事务处理
+        match &cmd {
+            Command::Multi => {
+                if in_transaction {
+                    respond_error(&mut write_half, "ERR MULTI calls can not be nested").await?;
+                } else {
+                    in_transaction = true;
+                    transaction_aborted = false;
+                    queued_commands.clear();
+                    respond_simple_string(&mut write_half, "OK").await?;
+                }
+                continue;
+            }
+            Command::Exec => {
+                if !in_transaction {
+                    respond_error(&mut write_half, "ERR EXEC without MULTI").await?;
+                    continue;
+                }
+
+                // 如果事务因解析错误而中止
+                if transaction_aborted {
+                    in_transaction = false;
+                    transaction_aborted = false;
+                    queued_commands.clear();
+                    watched_keys.clear();
+                    respond_error(&mut write_half, "EXECABORT Transaction discarded because of previous errors.").await?;
+                    continue;
+                }
+
+                // 检查 WATCH 的 key 是否被修改
+                let mut watch_failed = false;
+                for (key, version) in &watched_keys {
+                    if storage.get_key_version(key) != *version {
+                        watch_failed = true;
+                        break;
+                    }
+                }
+                in_transaction = false;
+                watched_keys.clear();
+
+                if watch_failed {
+                    queued_commands.clear();
+                    // WATCH 失败返回 null bulk
+                    write_half.write_all(b"*-1\r\n").await?;
+                    continue;
+                }
+
+                // 执行队列中的命令
+                let commands = std::mem::take(&mut queued_commands);
+                let count = commands.len();
+                write_half
+                    .write_all(format!("*{}\r\n", count).as_bytes())
+                    .await?;
+                for queued_cmd in commands {
+                    execute_command_in_transaction(
+                        queued_cmd,
+                        &storage,
+                        &mut write_half,
+                        current_db,
+                    )
+                    .await?;
+                }
+                continue;
+            }
+            Command::Discard => {
+                if !in_transaction {
+                    respond_error(&mut write_half, "ERR DISCARD without MULTI").await?;
+                } else {
+                    in_transaction = false;
+                    transaction_aborted = false;
+                    queued_commands.clear();
+                    watched_keys.clear();
+                    respond_simple_string(&mut write_half, "OK").await?;
+                }
+                continue;
+            }
+            Command::Watch { keys } => {
+                if in_transaction {
+                    respond_error(&mut write_half, "ERR WATCH inside MULTI is not allowed")
+                        .await?;
+                } else {
+                    for key in keys {
+                        let physical = prefix_key(current_db, key);
+                        let version = storage.get_key_version(&physical);
+                        watched_keys.insert(physical, version);
+                    }
+                    respond_simple_string(&mut write_half, "OK").await?;
+                }
+                continue;
+            }
+            Command::Unwatch => {
+                watched_keys.clear();
+                respond_simple_string(&mut write_half, "OK").await?;
+                continue;
+            }
+            _ => {}
+        }
+
+        // 如果在事务中，将命令加入队列
+        if in_transaction {
+            // 检查是否是解析错误
+            if let Command::Error(ref msg) = cmd {
+                // 标记事务为中止状态，返回原始错误
+                transaction_aborted = true;
+                respond_error(&mut write_half, msg).await?;
+                continue;
+            }
+            queued_commands.push(cmd);
+            respond_simple_string(&mut write_half, "QUEUED").await?;
+            continue;
         }
 
         match cmd {
@@ -3025,6 +3275,11 @@ async fn handle_connection(
 
             Command::Auth { .. } => {
                 unreachable!();
+            }
+
+            // 事务命令已在前面处理，这里不应该到达
+            Command::Multi | Command::Exec | Command::Discard | Command::Watch { .. } | Command::Unwatch => {
+                unreachable!("transaction commands should be handled earlier");
             }
 
             // 解析阶段构造的错误命令
