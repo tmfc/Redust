@@ -192,10 +192,13 @@
   - 已支持 `KEYS` 和 `ARGV` 表访问。
   - 已支持返回值类型转换（integer, string, array, nil, boolean）。
 
-- [ ] **redis.call() / redis.pcall() 回调实现**
-  - 当前 `redis.call()` / `redis.pcall()` 返回 stub 错误，尚未实现真正的命令调用。
-  - 后续需实现在 Lua 脚本中调用 Redis 命令的能力。
-  - 需要处理命令执行结果到 Lua 值的转换。
+- [x] **redis.call() / redis.pcall() 回调实现**
+  - 已实现 `redis.call()` 和 `redis.pcall()` 在 Lua 脚本中调用 Redis 命令。
+  - 支持 40+ 常用命令：GET/SET/DEL/EXISTS/INCR/DECR/INCRBY/DECRBY/APPEND/STRLEN/MGET/MSET、
+    HGET/HSET/HDEL/HEXISTS/HGETALL/HKEYS/HVALS/HLEN/HMGET/HMSET/HINCRBY、
+    LPUSH/RPUSH/LPOP/RPOP/LLEN/LRANGE/LINDEX、SADD/SREM/SMEMBERS/SISMEMBER/SCARD、
+    ZADD/ZREM/ZSCORE/ZCARD/ZRANGE/ZREVRANGE、TYPE/TTL/PTTL/EXPIRE/PEXPIRE/PERSIST。
+  - `redis.call()` 在错误时抛出 Lua 异常，`redis.pcall()` 返回 `{err = "..."}` 表。
 
 - [ ] **事务中 Lua 脚本支持**
   - 当前 `EVAL`/`EVALSHA` 在事务中不支持（返回错误）。
@@ -212,6 +215,50 @@
 - [x] **WATCH 版本追踪优化**
   - 已在所有写路径中调用 `bump_key_version`，包括 `LPUSH`、`SADD`、`HSET`、`ZADD` 等。
   - 已在 TTL 过期删除和 LRU 淘汰时更新 key 版本。
+
+---
+
+## 运维命令（V2）
+
+- [x] **基础运维命令实现**
+  - 已实现 `CONFIG GET pattern` - 获取匹配的配置参数（支持 * 通配符）。
+  - 已实现 `CONFIG SET parameter value` - 设置配置参数（当前大多数参数不可动态修改，返回错误）。
+  - 已实现 `CLIENT LIST` - 列出当前客户端连接信息（简化版）。
+  - 已实现 `CLIENT ID` - 获取当前连接的唯一 ID。
+  - 已实现 `CLIENT SETNAME name` - 设置连接名称。
+  - 已实现 `CLIENT GETNAME` - 获取连接名称。
+  - 已实现 `SLOWLOG GET [count]` - 获取慢日志（当前返回空数组）。
+  - 已实现 `SLOWLOG RESET` - 重置慢日志。
+  - 已实现 `SLOWLOG LEN` - 获取慢日志长度（当前返回 0）。
+
+- [ ] **CONFIG 动态配置支持**
+  - 当前 CONFIG SET 对大多数参数返回错误。
+  - 后续可支持动态修改部分配置（如 maxmemory、timeout、slowlog-log-slower-than 等）。
+  - 需要考虑配置持久化（写入配置文件或环境变量）。
+
+- [ ] **SLOWLOG 实际实现**
+  - 当前 SLOWLOG 命令只是占位实现，返回空数据。
+  - 后续需要实现：
+    - 记录执行时间超过阈值的命令。
+    - 维护固定大小的慢日志队列。
+    - 支持 SLOWLOG GET/RESET/LEN 的完整语义。
+
+- [ ] **CLIENT 命令扩展**
+  - 当前仅支持 LIST/ID/SETNAME/GETNAME。
+  - 后续可支持：
+    - `CLIENT PAUSE timeout` - 暂停所有客户端。
+    - `CLIENT UNBLOCK client-id` - 解除阻塞的客户端。
+    - `CLIENT KILL` - 关闭指定客户端连接。
+    - `CLIENT REPLY ON|OFF|SKIP` - 控制响应行为。
+
+- [ ] **INFO 命令实现**
+  - 实现 `INFO [section]` 命令，返回服务器状态信息。
+  - 支持的 section：server, clients, memory, persistence, stats, replication, cpu, commandstats, cluster, keyspace。
+  - 与现有 Metrics 结构体集成。
+
+- [ ] **Prometheus metrics 导出**
+  - 提供 HTTP 端点导出 Prometheus 格式的指标。
+  - 包括：连接数、命令数、内存使用、键空间统计等。
 
 ---
 

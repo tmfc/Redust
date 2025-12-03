@@ -8,21 +8,29 @@ use std::time::Duration;
 
 use std::sync::atomic::{AtomicU16, Ordering};
 
-static PORT_COUNTER: AtomicU16 = AtomicU16::new(16500);
+// Use a higher base port and add process ID to avoid conflicts
+static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
+
+fn get_unique_port() -> u16 {
+    let base = 17000 + (std::process::id() % 1000) as u16;
+    let offset = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
+    base + offset
+}
 
 fn spawn_server() -> (Child, String) {
-    let port = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let port = get_unique_port();
     let addr = format!("127.0.0.1:{}", port);
     
     let child = Command::new("cargo")
         .args(["run", "--bin", "redust"])
         .env("REDUST_ADDR", &addr)
         .env("REDUST_AUTH_PASSWORD", "")
+        .env("REDUST_DISABLE_PERSISTENCE", "1")
         .spawn()
         .expect("Failed to start server");
     
     // Wait for server to start
-    thread::sleep(Duration::from_millis(1000));
+    thread::sleep(Duration::from_millis(1500));
     
     (child, addr)
 }

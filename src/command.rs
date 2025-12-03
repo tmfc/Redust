@@ -414,6 +414,25 @@ pub enum Command {
         sha1s: Vec<String>,
     },
     ScriptFlush,
+    // 运维命令
+    ConfigGet {
+        pattern: String,
+    },
+    ConfigSet {
+        parameter: String,
+        value: String,
+    },
+    ClientList,
+    ClientId,
+    ClientSetname {
+        name: String,
+    },
+    ClientGetname,
+    SlowlogGet {
+        count: Option<usize>,
+    },
+    SlowlogReset,
+    SlowlogLen,
     Unknown(Vec<Binary>),
     /// Represents an error that should be sent back to the client.
     Error(String),
@@ -2717,6 +2736,122 @@ pub async fn read_command(
                 }
                 _ => {
                     Command::Error(format!("ERR Unknown SCRIPT subcommand or wrong number of arguments for '{}'", subcmd))
+                }
+            }
+        }
+        "CONFIG" => {
+            let Some(subcmd_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("config")));
+            };
+            let subcmd = match parse_bulk_string(subcmd_bytes) {
+                Ok(s) => s.to_uppercase(),
+                Err(e) => return Ok(Some(e)),
+            };
+            match subcmd.as_str() {
+                "GET" => {
+                    let Some(pattern_bytes) = iter.next() else {
+                        return Ok(Some(err_wrong_args("config|get")));
+                    };
+                    let pattern = match parse_bulk_string(pattern_bytes) {
+                        Ok(s) => s,
+                        Err(e) => return Ok(Some(e)),
+                    };
+                    if iter.next().is_some() {
+                        return Ok(Some(err_wrong_args("config|get")));
+                    }
+                    Command::ConfigGet { pattern }
+                }
+                "SET" => {
+                    let Some(param_bytes) = iter.next() else {
+                        return Ok(Some(err_wrong_args("config|set")));
+                    };
+                    let parameter = match parse_bulk_string(param_bytes) {
+                        Ok(s) => s,
+                        Err(e) => return Ok(Some(e)),
+                    };
+                    let Some(value_bytes) = iter.next() else {
+                        return Ok(Some(err_wrong_args("config|set")));
+                    };
+                    let value = match parse_bulk_string(value_bytes) {
+                        Ok(s) => s,
+                        Err(e) => return Ok(Some(e)),
+                    };
+                    if iter.next().is_some() {
+                        return Ok(Some(err_wrong_args("config|set")));
+                    }
+                    Command::ConfigSet { parameter, value }
+                }
+                _ => {
+                    Command::Error(format!("ERR Unknown subcommand or wrong number of arguments for 'config|{}'", subcmd.to_lowercase()))
+                }
+            }
+        }
+        "CLIENT" => {
+            let Some(subcmd_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("client")));
+            };
+            let subcmd = match parse_bulk_string(subcmd_bytes) {
+                Ok(s) => s.to_uppercase(),
+                Err(e) => return Ok(Some(e)),
+            };
+            match subcmd.as_str() {
+                "LIST" => {
+                    // CLIENT LIST 可能有可选参数，但我们简化处理
+                    Command::ClientList
+                }
+                "ID" => {
+                    Command::ClientId
+                }
+                "SETNAME" => {
+                    let Some(name_bytes) = iter.next() else {
+                        return Ok(Some(err_wrong_args("client|setname")));
+                    };
+                    let name = match parse_bulk_string(name_bytes) {
+                        Ok(s) => s,
+                        Err(e) => return Ok(Some(e)),
+                    };
+                    Command::ClientSetname { name }
+                }
+                "GETNAME" => {
+                    Command::ClientGetname
+                }
+                _ => {
+                    Command::Error(format!("ERR Unknown subcommand or wrong number of arguments for 'client|{}'", subcmd.to_lowercase()))
+                }
+            }
+        }
+        "SLOWLOG" => {
+            let Some(subcmd_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("slowlog")));
+            };
+            let subcmd = match parse_bulk_string(subcmd_bytes) {
+                Ok(s) => s.to_uppercase(),
+                Err(e) => return Ok(Some(e)),
+            };
+            match subcmd.as_str() {
+                "GET" => {
+                    let count = if let Some(count_bytes) = iter.next() {
+                        let count_str = match parse_bulk_string(count_bytes) {
+                            Ok(s) => s,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        match count_str.parse::<usize>() {
+                            Ok(n) => Some(n),
+                            Err(_) => return Ok(Some(err_not_integer())),
+                        }
+                    } else {
+                        None
+                    };
+                    Command::SlowlogGet { count }
+                }
+                "RESET" => {
+                    Command::SlowlogReset
+                }
+                "LEN" => {
+                    Command::SlowlogLen
+                }
+                _ => {
+                    Command::Error(format!("ERR Unknown subcommand or wrong number of arguments for 'slowlog|{}'", subcmd.to_lowercase()))
                 }
             }
         }

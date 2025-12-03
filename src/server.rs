@@ -23,6 +23,9 @@ use crate::resp::{
 use crate::scripting::{execute_script, ScriptCache, ScriptContext};
 use crate::storage::Storage;
 
+// 全局客户端 ID 计数器
+static CLIENT_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 struct Metrics {
     start_time: Instant,
     connected_clients: AtomicUsize,
@@ -2602,6 +2605,10 @@ async fn handle_connection(
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut current_db: u8 = 0;
+    
+    // 客户端标识
+    let client_id = CLIENT_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut client_name = String::new();
 
     let auth_password = env::var("REDUST_AUTH_PASSWORD")
         .ok()
@@ -3355,6 +3362,63 @@ async fn handle_connection(
                 respond_simple_string(&mut write_half, "OK").await?;
             }
 
+            // 运维命令
+            Command::ConfigGet { pattern } => {
+                // 返回匹配的配置参数
+                let configs = get_config_values(&pattern);
+                let mut resp = format!("*{}\r\n", configs.len() * 2);
+                for (key, value) in configs {
+                    resp.push_str(&format!("${}\r\n{}\r\n", key.len(), key));
+                    resp.push_str(&format!("${}\r\n{}\r\n", value.len(), value));
+                }
+                write_half.write_all(resp.as_bytes()).await?;
+            }
+            Command::ConfigSet { parameter, value } => {
+                // 尝试设置配置参数
+                match set_config_value(&parameter, &value) {
+                    Ok(()) => respond_simple_string(&mut write_half, "OK").await?,
+                    Err(e) => respond_error(&mut write_half, &e).await?,
+                }
+            }
+            Command::ClientList => {
+                // 返回当前连接信息（简化版）
+                let info = format!(
+                    "id={} addr={} name={} db={}\n",
+                    client_id,
+                    peer_addr.map(|a| a.to_string()).unwrap_or_else(|| "unknown".to_string()),
+                    client_name,
+                    current_db
+                );
+                let resp = format!("${}\r\n{}\r\n", info.len(), info);
+                write_half.write_all(resp.as_bytes()).await?;
+            }
+            Command::ClientId => {
+                respond_integer(&mut write_half, client_id as i64).await?;
+            }
+            Command::ClientSetname { name } => {
+                client_name = name;
+                respond_simple_string(&mut write_half, "OK").await?;
+            }
+            Command::ClientGetname => {
+                if client_name.is_empty() {
+                    write_half.write_all(b"$-1\r\n").await?;
+                } else {
+                    let resp = format!("${}\r\n{}\r\n", client_name.len(), client_name);
+                    write_half.write_all(resp.as_bytes()).await?;
+                }
+            }
+            Command::SlowlogGet { count } => {
+                // 简化实现：返回空数组
+                let _ = count;
+                write_half.write_all(b"*0\r\n").await?;
+            }
+            Command::SlowlogReset => {
+                respond_simple_string(&mut write_half, "OK").await?;
+            }
+            Command::SlowlogLen => {
+                respond_integer(&mut write_half, 0).await?;
+            }
+
             // 解析阶段构造的错误命令
             Command::Error(msg) => {
                 respond_error(&mut write_half, &msg).await?;
@@ -3613,4 +3677,70 @@ pub async fn run_server(
     info!("Redust listening on {}", local_addr);
 
     serve(listener, shutdown).await
+}
+
+// ============================================================================
+// CONFIG GET/SET 辅助函数
+// ============================================================================
+
+/// 获取匹配模式的配置值
+fn get_config_values(pattern: &str) -> Vec<(String, String)> {
+    let mut results = Vec::new();
+    
+    // 支持的配置参数
+    let configs = [
+        ("maxmemory", env::var("REDUST_MAXMEMORY_BYTES").unwrap_or_else(|_| "0".to_string())),
+        ("maxmemory-policy", "noeviction".to_string()),
+        ("timeout", "0".to_string()),
+        ("tcp-keepalive", "300".to_string()),
+        ("databases", "16".to_string()),
+        ("save", "".to_string()),
+        ("appendonly", env::var("REDUST_AOF_ENABLED").unwrap_or_else(|_| "no".to_string())),
+        ("appendfsync", "everysec".to_string()),
+        ("dir", ".".to_string()),
+        ("dbfilename", env::var("REDUST_RDB_PATH").unwrap_or_else(|_| "redust.rdb".to_string())),
+        ("appendfilename", env::var("REDUST_AOF_PATH").unwrap_or_else(|_| "redust.aof".to_string())),
+        ("requirepass", if env::var("REDUST_AUTH_PASSWORD").is_ok() { "yes".to_string() } else { "".to_string() }),
+        ("loglevel", "notice".to_string()),
+        ("slowlog-log-slower-than", "10000".to_string()),
+        ("slowlog-max-len", "128".to_string()),
+    ];
+    
+    for (key, value) in configs {
+        if pattern_match_config(pattern, key) {
+            results.push((key.to_string(), value));
+        }
+    }
+    
+    results
+}
+
+/// 设置配置值（大多数配置在运行时不可修改）
+fn set_config_value(parameter: &str, _value: &str) -> Result<(), String> {
+    // 大多数配置在运行时不可修改，返回错误
+    match parameter.to_lowercase().as_str() {
+        "maxmemory" | "timeout" | "tcp-keepalive" | "slowlog-log-slower-than" | "slowlog-max-len" => {
+            // 这些配置理论上可以动态修改，但我们简化实现，暂不支持
+            Err(format!("ERR Unsupported CONFIG parameter: {}", parameter))
+        }
+        _ => {
+            Err(format!("ERR Unsupported CONFIG parameter: {}", parameter))
+        }
+    }
+}
+
+/// 简单的配置模式匹配（支持 * 通配符）
+fn pattern_match_config(pattern: &str, key: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if pattern.ends_with('*') {
+        let prefix = &pattern[..pattern.len() - 1];
+        return key.starts_with(prefix);
+    }
+    if pattern.starts_with('*') {
+        let suffix = &pattern[1..];
+        return key.ends_with(suffix);
+    }
+    pattern.eq_ignore_ascii_case(key)
 }

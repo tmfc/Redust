@@ -289,13 +289,21 @@
 - [x] ECHO
 - [x] QUIT
 - [ ] AUTH
-- [ ] CLIENT *（如 CLIENT LIST / SETNAME / GETNAME 等）*
+- [x] CLIENT LIST - 列出客户端连接信息
+- [x] CLIENT ID - 获取当前连接 ID
+- [x] CLIENT SETNAME - 设置连接名称
+- [x] CLIENT GETNAME - 获取连接名称
+- [ ] CLIENT PAUSE / UNBLOCK / KILL / REPLY
 - [ ] HELLO
 - [ ] SELECT
 - [ ] INFO
-- [ ] CONFIG *（GET/SET/RESETSTAT 等）*
+- [x] CONFIG GET - 获取配置参数（支持模式匹配）
+- [x] CONFIG SET - 设置配置参数（大多数参数不可动态修改）
+- [ ] CONFIG RESETSTAT
 - [ ] MONITOR
-- [ ] SLOWLOG
+- [x] SLOWLOG GET - 获取慢日志（当前返回空）
+- [x] SLOWLOG RESET - 重置慢日志
+- [x] SLOWLOG LEN - 获取慢日志长度
 - [ ] TIME
 - [ ] COMMAND *（完整 COMMAND 系列）*
 
