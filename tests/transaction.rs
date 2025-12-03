@@ -569,3 +569,44 @@ async fn discard_after_parse_error_allows_new_transaction() {
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
 }
+
+/// 测试 WATCH 检测 key 过期（TTL 过期时更新版本）
+#[tokio::test]
+async fn watch_detects_key_expiration() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // 设置一个很短 TTL 的 key
+    client.send_array(&["SET", "expiring", "value", "PX", "50"]).await;
+    let _ = client.read_simple_line().await;
+
+    // WATCH 这个 key
+    client.send_array(&["WATCH", "expiring"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "+OK\r\n");
+
+    // MULTI
+    client.send_array(&["MULTI"]).await;
+    let _ = client.read_simple_line().await;
+
+    // 等待 key 过期
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // 触发过期检查（通过 GET）
+    let mut client2 = TestClient::connect(addr).await;
+    client2.send_array(&["GET", "expiring"]).await;
+    let _ = client2.read_bulk_string().await;
+
+    // SET something -> QUEUED
+    client.send_array(&["SET", "other", "value"]).await;
+    let _ = client.read_simple_line().await;
+
+    // EXEC（应该失败，因为 watched key 过期了）
+    client.send_array(&["EXEC"]).await;
+    let mut header = String::new();
+    client.reader.read_line(&mut header).await.unwrap();
+    assert_eq!(header, "*-1\r\n", "EXEC should return null when watched key expires");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}

@@ -2051,9 +2051,8 @@ impl Storage {
                 StorageValue::Hash { expires_at, .. } => {
                     (3u8, Self::remaining_millis(*expires_at, now))
                 }
-                StorageValue::Zset { .. } => {
-                    // 当前 RDB v1 不支持 ZSET，直接跳过该 key
-                    continue;
+                StorageValue::Zset { expires_at, .. } => {
+                    (4u8, Self::remaining_millis(*expires_at, now))
                 }
             };
 
@@ -2106,8 +2105,19 @@ impl Storage {
                         file.write_all(v_bytes)?;
                     }
                 }
-                StorageValue::Zset { .. } => {
-                    // 上面 match 已经 continue，这里理论上不会到达
+                StorageValue::Zset { value: zset, .. } => {
+                    // 序列化 ZSET: 元素数量 + (score, member) 对
+                    let len = zset.by_member.len() as u32;
+                    file.write_all(&len.to_le_bytes())?;
+                    for (member, score) in zset.by_member.iter() {
+                        // 写入 score (f64, 8 bytes)
+                        file.write_all(&score.to_le_bytes())?;
+                        // 写入 member
+                        let m_bytes = member.as_bytes();
+                        let m_len = m_bytes.len() as u32;
+                        file.write_all(&m_len.to_le_bytes())?;
+                        file.write_all(m_bytes)?;
+                    }
                 }
             }
         }
@@ -2312,8 +2322,46 @@ impl Storage {
                     }
                 }
                 4 => {
-                    // RDB v1 尚未定义 ZSET 类型，遇到未知类型时直接结束加载，视为旧版本文件
-                    return Ok(());
+                    // ZSET 类型
+                    let mut len_buf = [0u8; 4];
+                    if file.read_exact(&mut len_buf).is_err() {
+                        break;
+                    }
+                    let len = u32::from_le_bytes(len_buf) as usize;
+                    let mut by_member = HashMap::with_capacity(len);
+                    let mut by_score = BTreeSet::new();
+                    for _ in 0..len {
+                        // 读取 score (f64, 8 bytes)
+                        let mut score_buf = [0u8; 8];
+                        if file.read_exact(&mut score_buf).is_err() {
+                            break;
+                        }
+                        let score = f64::from_le_bytes(score_buf);
+
+                        // 读取 member
+                        let mut mlen_buf = [0u8; 4];
+                        if file.read_exact(&mut mlen_buf).is_err() {
+                            break;
+                        }
+                        let mlen = u32::from_le_bytes(mlen_buf) as usize;
+                        let mut member = vec![0u8; mlen];
+                        if file.read_exact(&mut member).is_err() {
+                            break;
+                        }
+                        let member_str = match String::from_utf8(member) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                return Ok(());
+                            }
+                        };
+
+                        by_member.insert(member_str.clone(), score);
+                        by_score.insert((OrderedFloat(score), member_str));
+                    }
+                    StorageValue::Zset {
+                        value: ZSetInner { by_member, by_score },
+                        expires_at,
+                    }
                 }
                 _ => {
                     return Ok(());
@@ -2669,6 +2717,7 @@ impl Storage {
         if should_remove {
             if self.data.remove(key).is_some() {
                 self.last_access.remove(key);
+                self.bump_key_version(key);
             }
             true
         } else {
@@ -2743,6 +2792,7 @@ impl Storage {
 
         self.data.remove(&key);
         self.last_access.remove(&key);
+        self.bump_key_version(&key);
         true
     }
 

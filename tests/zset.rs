@@ -242,3 +242,45 @@ async fn zscan_roundtrip_and_wrongtype() {
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
 }
+
+/// 测试 ZSET 持久化（RDB save/load）
+#[tokio::test]
+async fn zset_persistence_roundtrip() {
+    use std::path::PathBuf;
+    use redust::storage::Storage;
+
+    let temp_dir = std::env::temp_dir();
+    let rdb_path: PathBuf = temp_dir.join(format!("test_zset_{}.rdb", std::process::id()));
+
+    // 创建 storage 并添加 ZSET 数据
+    let storage = Storage::new(None);
+    assert!(storage.zadd("0:myzset", &[(1.5, "a".to_string()), (2.5, "b".to_string()), (3.0, "c".to_string())]).is_ok());
+    assert!(storage.zadd("0:anotherzset", &[(100.0, "x".to_string())]).is_ok());
+
+    // 保存 RDB
+    storage.save_rdb(&rdb_path).expect("save_rdb should succeed");
+
+    // 创建新的 storage 并加载
+    let storage2 = Storage::new(None);
+    storage2.load_rdb(&rdb_path).expect("load_rdb should succeed");
+
+    // 验证 ZSET 数据已恢复
+    let score_a = storage2.zscore("0:myzset", "a").unwrap();
+    assert_eq!(score_a, Some(1.5), "score of 'a' should be 1.5");
+
+    let score_b = storage2.zscore("0:myzset", "b").unwrap();
+    assert_eq!(score_b, Some(2.5), "score of 'b' should be 2.5");
+
+    let score_c = storage2.zscore("0:myzset", "c").unwrap();
+    assert_eq!(score_c, Some(3.0), "score of 'c' should be 3.0");
+
+    let score_x = storage2.zscore("0:anotherzset", "x").unwrap();
+    assert_eq!(score_x, Some(100.0), "score of 'x' should be 100.0");
+
+    // ZCARD 验证
+    let card = storage2.zcard("0:myzset").unwrap();
+    assert_eq!(card, 3, "myzset should have 3 members");
+
+    // 清理
+    let _ = std::fs::remove_file(&rdb_path);
+}
