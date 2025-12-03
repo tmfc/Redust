@@ -2,16 +2,16 @@ use std::collections::HashMap;
 use std::env;
 use std::future::Future;
 use std::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use tokio::io::{self, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
-use tokio::time::sleep;
+use tokio::time::{sleep, Duration};
 
 use log::{error, info};
 
@@ -32,6 +32,14 @@ struct Metrics {
     pubsub_shard_subs: AtomicU64,
     pubsub_messages_delivered: AtomicU64,
     pubsub_messages_dropped: AtomicU64,
+}
+
+struct PersistenceState {
+    rdb_path: String,
+    aof_path: Option<String>,
+    last_save: AtomicI64,
+    bgsave_running: AtomicBool,
+    enabled: bool,
 }
 
 #[derive(Clone)]
@@ -348,11 +356,41 @@ fn pattern_match(pattern: &str, value: &str) -> bool {
     helper(pattern.as_bytes(), 0, value.as_bytes(), 0)
 }
 
+async fn perform_save(
+    storage: Storage,
+    path: String,
+    persistence: Arc<PersistenceState>,
+) -> io::Result<()> {
+    let res = tokio::task::spawn_blocking(move || storage.save_rdb(&path)).await;
+    match res {
+        Ok(Ok(())) => {
+            if let Ok(dur) = SystemTime::now().duration_since(UNIX_EPOCH) {
+                persistence
+                    .last_save
+                    .store(dur.as_secs() as i64, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("save task failed: {}", e),
+        )),
+    }
+}
+
 fn current_max_value_bytes() -> Option<u64> {
     env::var("REDUST_MAXVALUE_BYTES")
         .ok()
         .and_then(|s| parse_maxmemory_bytes(&s))
         .filter(|v| *v > 0)
+}
+
+fn file_mtime_seconds(path: &str) -> Option<i64> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    let dur = modified.duration_since(UNIX_EPOCH).ok()?;
+    Some(dur.as_secs() as i64)
 }
 
 fn build_prometheus_metrics(storage: &Storage, metrics: &Metrics) -> String {
@@ -556,6 +594,7 @@ async fn handle_string_command(
             key,
             value,
             expire_millis,
+            expire_at_millis,
             nx,
             xx,
             keep_ttl,
@@ -603,13 +642,26 @@ async fn handle_string_command(
                 // 写入新值
                 storage.set(physical.clone(), value);
 
+                // 先根据 EX/PX/EXAT/PXAT 计算“显式指定”的 TTL；存在显式 TTL 时优先级高于 KEEPTTL。
+                let explicit_ttl_ms: Option<i64> = if let Some(at_ms) = expire_at_millis {
+                    use std::time::{SystemTime, UNIX_EPOCH};
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64;
+                    Some(at_ms.saturating_sub(now_ms))
+                } else {
+                    expire_millis
+                };
+
                 // TTL 处理优先级：
-                // 1. KEEPTTL：恢复旧 TTL（如果存在）
-                // 2. EX/PX：设置新的 TTL
+                // 1. 显式 TTL（EX/PX/EXAT/PXAT）：覆盖旧 TTL
+                // 2. KEEPTTL：在无显式 TTL 时，恢复旧 TTL（如果存在）
                 // 3. 否则：清除已有 TTL
-                if let Some(ms) = keep_ttl_ms {
+                if let Some(ms) = explicit_ttl_ms {
+                    // Redis 语义：到期时间在“现在及以前”视为立即过期
                     storage.expire_millis(&physical, ms);
-                } else if let Some(ms) = expire_millis {
+                } else if let Some(ms) = keep_ttl_ms {
                     storage.expire_millis(&physical, ms);
                 } else {
                     let _ = storage.persist(&physical);
@@ -1203,6 +1255,48 @@ async fn handle_list_command(
                 }
             }
         }
+        Command::Hscan {
+            key,
+            cursor: _,
+            pattern,
+            count: _,
+        } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.hgetall(&physical) {
+                Ok(entries) => {
+                    // entries: Vec<(String, String)>
+                    let pat = pattern.unwrap_or_else(|| "*".to_string());
+                    let mut flat: Vec<(String, String)> = Vec::new();
+                    for (field, value) in &entries {
+                        if pattern_match(&pat, field) {
+                            flat.push((field.to_string(), value.clone()));
+                        }
+                    }
+
+                    let next_cursor = 0u64;
+                    let cursor_str = next_cursor.to_string();
+
+                    let mut response = format!(
+                        "*2\r\n${}\r\n{}\r\n*{}\r\n",
+                        cursor_str.len(),
+                        cursor_str,
+                        flat.len() * 2
+                    );
+                    for (f, v) in flat {
+                        response.push_str(&format!("${}\r\n{}\r\n", f.len(), f));
+                        response.push_str(&format!("${}\r\n{}\r\n", v.len(), v));
+                    }
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
         _ => {}
     }
 
@@ -1357,6 +1451,52 @@ async fn handle_set_command(
                 Ok(members) => {
                     let mut response = format!("*{}\r\n", members.len());
                     for m in members {
+                        response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
+                    }
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Sscan {
+            key,
+            cursor,
+            pattern,
+            count,
+        } => {
+            let physical = prefix_key(current_db, &key);
+            // 复用 smembers 提供的有序成员视图
+            match storage.smembers(&physical) {
+                Ok(members) => {
+                    let total = members.len() as u64;
+                    let start = if cursor > total { total } else { cursor } as usize;
+                    let batch_size = count.unwrap_or(10) as usize;
+                    let end = std::cmp::min(start + batch_size, members.len());
+
+                    let pat = pattern.unwrap_or_else(|| "*".to_string());
+                    let mut matched: Vec<String> = Vec::new();
+                    for m in &members[start..end] {
+                        if pattern_match(&pat, m) {
+                            matched.push(m.to_string());
+                        }
+                    }
+
+                    let next_cursor = if end >= members.len() { 0 } else { end as u64 };
+
+                    let cursor_str = next_cursor.to_string();
+                    let mut response = format!(
+                        "*2\r\n${}\r\n{}\r\n*{}\r\n",
+                        cursor_str.len(),
+                        cursor_str,
+                        matched.len()
+                    );
+                    for m in matched {
                         response.push_str(&format!("${}\r\n{}\r\n", m.len(), m));
                     }
                     writer.write_all(response.as_bytes()).await?;
@@ -1725,6 +1865,302 @@ async fn handle_hash_command(
                 }
             }
         }
+        Command::Hscan {
+            key,
+            cursor,
+            pattern,
+            count,
+        } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.hgetall(&physical) {
+                Ok(entries) => {
+                    let total = entries.len() as u64;
+                    let start = if cursor > total { total } else { cursor } as usize;
+                    let batch_size = count.unwrap_or(10) as usize;
+                    let end = std::cmp::min(start + batch_size, entries.len());
+
+                    let pat = pattern.unwrap_or_else(|| "*".to_string());
+                    let mut flat: Vec<(String, String)> = Vec::new();
+                    for (field, value) in &entries[start..end] {
+                        if pattern_match(&pat, field) {
+                            flat.push((field.clone(), value.clone()));
+                        }
+                    }
+
+                    let next_cursor = if end >= entries.len() { 0 } else { end as u64 };
+
+                    let cursor_str = next_cursor.to_string();
+
+                    let mut response = format!(
+                        "*2\r\n${}\r\n{}\r\n*{}\r\n",
+                        cursor_str.len(),
+                        cursor_str,
+                        flat.len() * 2
+                    );
+                    for (f, v) in flat {
+                        response.push_str(&format!("${}\r\n{}\r\n", f.len(), f));
+                        response.push_str(&format!("${}\r\n{}\r\n", v.len(), v));
+                    }
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+async fn handle_zset_command(
+    cmd: Command,
+    storage: &Storage,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    current_db: u8,
+) -> io::Result<()> {
+    // helper to format floating scores similar to Redis (trim trailing zeros)
+    let format_score = |score: f64| {
+        let mut s = score.to_string();
+        if s.contains('.') {
+            while s.ends_with('0') {
+                s.pop();
+            }
+            if s.ends_with('.') {
+                s.push('0');
+            }
+        }
+        s
+    };
+
+    match cmd {
+        Command::Zadd { key, entries } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.zadd(&physical, &entries) {
+                Ok(added) => {
+                    respond_integer(writer, added as i64).await?;
+                }
+                Err(crate::storage::ZsetError::WrongType) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::ZsetError::NotFloat) => {
+                    respond_error(writer, "ERR value is not a valid float").await?;
+                }
+            }
+        }
+        Command::Zcard { key } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.zcard(&physical) {
+                Ok(len) => respond_integer(writer, len as i64).await?,
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Zrange {
+            key,
+            start,
+            stop,
+            withscores,
+            rev,
+        } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.zrange(&physical, start, stop, rev) {
+                Ok(items) => {
+                    let mut response = if withscores {
+                        format!("*{}\r\n", items.len() * 2)
+                    } else {
+                        format!("*{}\r\n", items.len())
+                    };
+                    for (member, score) in items {
+                        response.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
+                        if withscores {
+                            let score_s = format_score(score);
+                            response.push_str(&format!("${}\r\n{}\r\n", score_s.len(), score_s));
+                        }
+                    }
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Zscore { key, member } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.zscore(&physical, &member) {
+                Ok(Some(score)) => {
+                    let s = format_score(score);
+                    respond_bulk_string(writer, &s).await?;
+                }
+                Ok(None) => {
+                    respond_null_bulk(writer).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Zrem { key, members } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.zrem(&physical, &members) {
+                Ok(removed) => {
+                    respond_integer(writer, removed as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Zincrby {
+            key,
+            increment,
+            member,
+        } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.zincrby(&physical, increment, &member) {
+                Ok(score) => {
+                    let s = format_score(score);
+                    respond_bulk_string(writer, &s).await?;
+                }
+                Err(crate::storage::ZsetError::WrongType) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::ZsetError::NotFloat) => {
+                    respond_error(writer, "ERR value is not a valid float").await?;
+                }
+            }
+        }
+        Command::Zscan {
+            key,
+            cursor,
+            pattern,
+            count,
+        } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.zscan_entries(&physical) {
+                Ok(entries) => {
+                    let total = entries.len() as u64;
+                    let start = if cursor > total { total } else { cursor } as usize;
+                    let batch_size = count.unwrap_or(10) as usize;
+                    let end = std::cmp::min(start + batch_size, entries.len());
+
+                    let pat = pattern.unwrap_or_else(|| "*".to_string());
+                    let mut flat: Vec<(String, f64)> = Vec::new();
+                    for (member, score) in &entries[start..end] {
+                        if pattern_match(&pat, member) {
+                            flat.push((member.clone(), *score));
+                        }
+                    }
+
+                    let next_cursor = if end >= entries.len() { 0 } else { end as u64 };
+                    let cursor_str = next_cursor.to_string();
+
+                    let mut response = format!(
+                        "*2\r\n${}\r\n{}\r\n*{}\r\n",
+                        cursor_str.len(),
+                        cursor_str,
+                        flat.len() * 2
+                    );
+                    for (member, score) in flat {
+                        let score_s = format_score(score);
+                        response.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
+                        response.push_str(&format!("${}\r\n{}\r\n", score_s.len(), score_s));
+                    }
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+async fn handle_persistence_command(
+    cmd: Command,
+    storage: &Storage,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    persistence: Arc<PersistenceState>,
+) -> io::Result<()> {
+    if !persistence.enabled {
+        respond_error(writer, "ERR persistence disabled").await?;
+        return Ok(());
+    }
+    match cmd {
+        Command::Save => {
+            let path = persistence.rdb_path.clone();
+            let save_res = perform_save(storage.clone(), path.clone(), persistence.clone()).await;
+            match save_res {
+                Ok(()) => respond_simple_string(writer, "OK").await?,
+                Err(e) => {
+                    error!("[rdb] SAVE failed: {}", e);
+                    respond_error(writer, "ERR save failed").await?;
+                }
+            }
+        }
+        Command::Bgsave => {
+            if persistence
+                .bgsave_running
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                respond_error(writer, "ERR Background save already in progress")
+                    .await?;
+            } else {
+                let path = persistence.rdb_path.clone();
+                let storage_clone = storage.clone();
+                let persistence_clone = persistence.clone();
+                tokio::spawn(async move {
+                    let res = perform_save(storage_clone, path, persistence_clone.clone()).await;
+                    persistence_clone.bgsave_running.store(false, Ordering::SeqCst);
+                    if let Err(e) = res {
+                        error!("[rdb] BGSAVE failed: {}", e);
+                    }
+                });
+                respond_simple_string(writer, "Background saving started").await?;
+            }
+        }
+        Command::Lastsave => {
+            let ts = persistence.last_save.load(Ordering::Relaxed);
+            respond_integer(writer, ts).await?;
+        }
         _ => {}
     }
 
@@ -1772,29 +2208,63 @@ async fn handle_key_meta_command(
             respond_simple_string(writer, &t).await?;
         }
         Command::Keys { pattern } => {
-            let mut result: Vec<String> = Vec::new();
-
-            if pattern == "*" {
-                let all = storage.keys("*");
-                let prefix = format!("{}:", current_db);
-                for k in all {
-                    if let Some(rest) = k.strip_prefix(&prefix) {
-                        result.push(rest.to_string());
-                    }
+            let all = storage.keys("*");
+            let prefix = format!("{}:", current_db);
+            let mut logical_keys: Vec<String> = Vec::new();
+            for k in all {
+                if let Some(rest) = k.strip_prefix(&prefix) {
+                    logical_keys.push(rest.to_string());
                 }
-            } else {
-                let physical_pattern = prefix_key(current_db, &pattern);
-                let physical_keys = storage.keys(&physical_pattern);
-                let prefix = format!("{}:", current_db);
-                for k in physical_keys {
-                    if let Some(rest) = k.strip_prefix(&prefix) {
-                        result.push(rest.to_string());
-                    }
+            }
+
+            let mut result: Vec<String> = Vec::new();
+            for k in logical_keys {
+                if pattern_match(&pattern, &k) {
+                    result.push(k);
                 }
             }
 
             let mut response = format!("*{}\r\n", result.len());
             for k in result {
+                response.push_str(&format!("${}\r\n{}\r\n", k.len(), k));
+            }
+            writer.write_all(response.as_bytes()).await?;
+        }
+        Command::Scan {
+            cursor,
+            pattern,
+            count,
+        } => {
+            // 简化实现：基于当前 DB 的逻辑 key 列表做一次切片扫描。
+            let all = storage.keys("*");
+            let prefix = format!("{}:", current_db);
+            let mut logical: Vec<String> = Vec::new();
+            for k in all {
+                if let Some(rest) = k.strip_prefix(&prefix) {
+                    logical.push(rest.to_string());
+                }
+            }
+
+            let total = logical.len() as u64;
+            let start = if cursor > total { total } else { cursor } as usize;
+            let batch_size = count.unwrap_or(10) as usize;
+            let end = std::cmp::min(start + batch_size, logical.len());
+
+            let pat = pattern.unwrap_or_else(|| "*".to_string());
+            let mut matched: Vec<String> = Vec::new();
+            for k in &logical[start..end] {
+                if pattern_match(&pat, k) {
+                    matched.push(k.clone());
+                }
+            }
+
+            let next_cursor = if end >= logical.len() { 0 } else { end as u64 };
+
+            // RESP: *2 \r\n :<cursor> \r\n *N ...
+            let cursor_str = next_cursor.to_string();
+            let mut response =
+                format!("*2\r\n${}\r\n{}\r\n*{}\r\n", cursor_str.len(), cursor_str, matched.len());
+            for k in matched {
                 response.push_str(&format!("${}\r\n{}\r\n", k.len(), k));
             }
             writer.write_all(response.as_bytes()).await?;
@@ -1975,12 +2445,143 @@ async fn run_metrics_exporter(
     }
 }
 
+/// 在事务中执行单个命令，返回结果写入 writer
+async fn execute_command_in_transaction(
+    cmd: Command,
+    storage: &Storage,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    current_db: u8,
+) -> io::Result<()> {
+    match cmd {
+        // string / generic key-value 命令
+        Command::Ping
+        | Command::PingWithPayload(_)
+        | Command::Echo(_)
+        | Command::Set { .. }
+        | Command::Get { .. }
+        | Command::Getdel { .. }
+        | Command::Getex { .. }
+        | Command::Getrange { .. }
+        | Command::Setrange { .. }
+        | Command::Append { .. }
+        | Command::Strlen { .. }
+        | Command::Getset { .. }
+        | Command::Incr { .. }
+        | Command::Decr { .. }
+        | Command::Incrby { .. }
+        | Command::Decrby { .. }
+        | Command::Incrbyfloat { .. }
+        | Command::Del { .. }
+        | Command::Exists { .. }
+        | Command::Mget { .. }
+        | Command::Mset { .. }
+        | Command::Msetnx { .. }
+        | Command::Setnx { .. }
+        | Command::Setex { .. }
+        | Command::Psetex { .. }
+        | Command::Quit => {
+            handle_string_command(cmd, storage, writer, current_db).await?;
+        }
+
+        // list 命令
+        Command::Lpush { .. }
+        | Command::Rpush { .. }
+        | Command::Lrange { .. }
+        | Command::Lpop { .. }
+        | Command::Rpop { .. }
+        | Command::Llen { .. }
+        | Command::Lindex { .. }
+        | Command::Lrem { .. }
+        | Command::Ltrim { .. } => {
+            handle_list_command(cmd, storage, writer, current_db).await?;
+        }
+
+        // set 命令
+        Command::Sadd { .. }
+        | Command::Srem { .. }
+        | Command::Smembers { .. }
+        | Command::Scard { .. }
+        | Command::Sismember { .. }
+        | Command::Spop { .. }
+        | Command::Srandmember { .. }
+        | Command::Sunion { .. }
+        | Command::Sinter { .. }
+        | Command::Sdiff { .. }
+        | Command::Sunionstore { .. }
+        | Command::Sinterstore { .. }
+        | Command::Sdiffstore { .. }
+        | Command::Sscan { .. } => {
+            handle_set_command(cmd, storage, writer, current_db).await?;
+        }
+
+        // hash 命令
+        Command::Hset { .. }
+        | Command::Hget { .. }
+        | Command::Hdel { .. }
+        | Command::Hexists { .. }
+        | Command::Hgetall { .. }
+        | Command::Hkeys { .. }
+        | Command::Hvals { .. }
+        | Command::Hmget { .. }
+        | Command::Hincrby { .. }
+        | Command::Hincrbyfloat { .. }
+        | Command::Hlen { .. }
+        | Command::Hscan { .. } => {
+            handle_hash_command(cmd, storage, writer, current_db).await?;
+        }
+
+        // zset 命令
+        Command::Zadd { .. }
+        | Command::Zcard { .. }
+        | Command::Zrange { .. }
+        | Command::Zscore { .. }
+        | Command::Zrem { .. }
+        | Command::Zincrby { .. } => {
+            handle_zset_command(cmd, storage, writer, current_db).await?;
+        }
+
+        // key meta 命令
+        Command::Type { .. }
+        | Command::Keys { .. }
+        | Command::Dbsize
+        | Command::Expire { .. }
+        | Command::Pexpire { .. }
+        | Command::Ttl { .. }
+        | Command::Pttl { .. }
+        | Command::Persist { .. }
+        | Command::Rename { .. }
+        | Command::Renamenx { .. }
+        | Command::Scan { .. }
+        | Command::Zscan { .. } => {
+            // 简化处理：这些命令在事务中可能需要特殊处理
+            // 但为了简单起见，我们直接返回错误
+            respond_error(writer, "ERR command not supported in transaction").await?;
+        }
+
+        // 不支持在事务中的命令
+        Command::Multi
+        | Command::Exec
+        | Command::Discard
+        | Command::Watch { .. }
+        | Command::Unwatch => {
+            respond_error(writer, "ERR command not allowed in transaction").await?;
+        }
+
+        // 其他命令返回错误
+        _ => {
+            respond_error(writer, "ERR command not supported in transaction").await?;
+        }
+    }
+    Ok(())
+}
+
 async fn handle_connection(
     stream: TcpStream,
     storage: Storage,
     metrics: Arc<Metrics>,
     pubsub: PubSubHub,
     overflow_strategy: PubSubOverflowStrategy,
+    persistence: Arc<PersistenceState>,
 ) -> io::Result<()> {
     let peer_addr = stream.peer_addr().ok();
     info!("[conn] new connection from {:?}", peer_addr);
@@ -2000,6 +2601,14 @@ async fn handle_connection(
     let mut pattern_subscriptions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut shard_subscriptions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut subscribed_mode = false;
+
+    // 事务状态
+    let mut in_transaction = false;
+    let mut queued_commands: Vec<Command> = Vec::new();
+    // WATCH 的 key -> 版本号映射（物理 key）
+    let mut watched_keys: HashMap<String, u64> = HashMap::new();
+    // 事务是否因解析错误而中止
+    let mut transaction_aborted = false;
 
     loop {
         let cmd_result = if subscribed_mode {
@@ -2107,6 +2716,118 @@ async fn handle_connection(
             }
         }
 
+        // 事务处理
+        match &cmd {
+            Command::Multi => {
+                if in_transaction {
+                    respond_error(&mut write_half, "ERR MULTI calls can not be nested").await?;
+                } else {
+                    in_transaction = true;
+                    transaction_aborted = false;
+                    queued_commands.clear();
+                    respond_simple_string(&mut write_half, "OK").await?;
+                }
+                continue;
+            }
+            Command::Exec => {
+                if !in_transaction {
+                    respond_error(&mut write_half, "ERR EXEC without MULTI").await?;
+                    continue;
+                }
+
+                // 如果事务因解析错误而中止
+                if transaction_aborted {
+                    in_transaction = false;
+                    transaction_aborted = false;
+                    queued_commands.clear();
+                    watched_keys.clear();
+                    respond_error(&mut write_half, "EXECABORT Transaction discarded because of previous errors.").await?;
+                    continue;
+                }
+
+                // 检查 WATCH 的 key 是否被修改
+                let mut watch_failed = false;
+                for (key, version) in &watched_keys {
+                    if storage.get_key_version(key) != *version {
+                        watch_failed = true;
+                        break;
+                    }
+                }
+                in_transaction = false;
+                watched_keys.clear();
+
+                if watch_failed {
+                    queued_commands.clear();
+                    // WATCH 失败返回 null bulk
+                    write_half.write_all(b"*-1\r\n").await?;
+                    continue;
+                }
+
+                // 执行队列中的命令
+                let commands = std::mem::take(&mut queued_commands);
+                let count = commands.len();
+                write_half
+                    .write_all(format!("*{}\r\n", count).as_bytes())
+                    .await?;
+                for queued_cmd in commands {
+                    execute_command_in_transaction(
+                        queued_cmd,
+                        &storage,
+                        &mut write_half,
+                        current_db,
+                    )
+                    .await?;
+                }
+                continue;
+            }
+            Command::Discard => {
+                if !in_transaction {
+                    respond_error(&mut write_half, "ERR DISCARD without MULTI").await?;
+                } else {
+                    in_transaction = false;
+                    transaction_aborted = false;
+                    queued_commands.clear();
+                    watched_keys.clear();
+                    respond_simple_string(&mut write_half, "OK").await?;
+                }
+                continue;
+            }
+            Command::Watch { keys } => {
+                if in_transaction {
+                    respond_error(&mut write_half, "ERR WATCH inside MULTI is not allowed")
+                        .await?;
+                } else {
+                    for key in keys {
+                        let physical = prefix_key(current_db, key);
+                        let version = storage.get_key_version(&physical);
+                        watched_keys.insert(physical, version);
+                    }
+                    respond_simple_string(&mut write_half, "OK").await?;
+                }
+                continue;
+            }
+            Command::Unwatch => {
+                watched_keys.clear();
+                respond_simple_string(&mut write_half, "OK").await?;
+                continue;
+            }
+            _ => {}
+        }
+
+        // 如果在事务中，将命令加入队列
+        if in_transaction {
+            // 检查是否是解析错误
+            if let Command::Error(ref msg) = cmd {
+                // 标记事务为中止状态，返回原始错误
+                transaction_aborted = true;
+                respond_error(&mut write_half, msg).await?;
+                continue;
+            }
+            queued_commands.push(cmd);
+            respond_simple_string(&mut write_half, "QUEUED").await?;
+            continue;
+        }
+
         match cmd {
             // string / generic key-value 命令
             Command::Ping
@@ -2168,7 +2889,8 @@ async fn handle_connection(
             | Command::Sdiff { .. }
             | Command::Sunionstore { .. }
             | Command::Sinterstore { .. }
-            | Command::Sdiffstore { .. } => {
+            | Command::Sdiffstore { .. }
+            | Command::Sscan { .. } => {
                 handle_set_command(cmd, &storage, &mut write_half, current_db).await?;
             }
 
@@ -2183,8 +2905,26 @@ async fn handle_connection(
             | Command::Hmget { .. }
             | Command::Hincrby { .. }
             | Command::Hincrbyfloat { .. }
-            | Command::Hlen { .. } => {
+            | Command::Hlen { .. }
+            | Command::Hscan { .. } => {
                 handle_hash_command(cmd, &storage, &mut write_half, current_db).await?;
+            }
+
+            // zset 命令
+            Command::Zadd { .. }
+            | Command::Zcard { .. }
+            | Command::Zrange { .. }
+            | Command::Zscore { .. }
+            | Command::Zrem { .. }
+            | Command::Zincrby { .. }
+            | Command::Zscan { .. } => {
+                handle_zset_command(cmd, &storage, &mut write_half, current_db).await?;
+            }
+
+            // 持久化控制
+            Command::Save | Command::Bgsave | Command::Lastsave => {
+                handle_persistence_command(cmd, &storage, &mut write_half, persistence.clone())
+                    .await?;
             }
 
             // key 元信息、过期相关命令
@@ -2195,6 +2935,7 @@ async fn handle_connection(
             | Command::Persist { .. }
             | Command::Type { .. }
             | Command::Keys { .. }
+            | Command::Scan { .. }
             | Command::Dbsize
             | Command::Rename { .. }
             | Command::Renamenx { .. }
@@ -2536,6 +3277,11 @@ async fn handle_connection(
                 unreachable!();
             }
 
+            // 事务命令已在前面处理，这里不应该到达
+            Command::Multi | Command::Exec | Command::Discard | Command::Watch { .. } | Command::Unwatch => {
+                unreachable!("transaction commands should be handled earlier");
+            }
+
             // 解析阶段构造的错误命令
             Command::Error(msg) => {
                 respond_error(&mut write_half, &msg).await?;
@@ -2598,48 +3344,113 @@ pub async fn serve(
     let storage = Storage::new(maxmemory_bytes);
 
     let rdb_path = env::var("REDUST_RDB_PATH").unwrap_or_else(|_| "redust.rdb".to_string());
-    if let Err(e) = storage.load_rdb(&rdb_path) {
-        error!("[rdb] failed to load RDB from {}: {}", rdb_path, e);
-    } else {
-        info!("[rdb] loaded RDB from {} (if existing and valid)", rdb_path);
+    let persistence_disabled = env::var("REDUST_DISABLE_PERSISTENCE")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    let aof_enabled = env::var("REDUST_AOF_ENABLED")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    let aof_path = env::var("REDUST_AOF_PATH").unwrap_or_else(|_| "redust.aof".to_string());
+
+    let persistence = Arc::new(PersistenceState {
+        rdb_path: rdb_path.clone(),
+        aof_path: if aof_enabled && !persistence_disabled {
+            Some(aof_path.clone())
+        } else {
+            None
+        },
+        last_save: AtomicI64::new(-1),
+        bgsave_running: AtomicBool::new(false),
+        enabled: !persistence_disabled,
+    });
+
+    if !persistence_disabled {
+        let mut loaded_ok = false;
+        if let Some(path) = persistence.aof_path.clone() {
+            let exists = std::path::Path::new(&path).exists();
+            if exists {
+                match storage.load_rdb(&path) {
+                    Ok(()) => {
+                        loaded_ok = true;
+                        if let Some(ts) = file_mtime_seconds(&path) {
+                            persistence.last_save.store(ts, Ordering::Relaxed);
+                        }
+                        info!("[aof] loaded snapshot from {}", path);
+                    }
+                    Err(e) => {
+                        error!("[aof] failed to load AOF snapshot {}: {}", path, e);
+                    }
+                }
+            }
+        }
+
+        if !loaded_ok {
+            if let Err(e) = storage.load_rdb(&rdb_path) {
+                error!("[rdb] failed to load RDB from {}: {}", rdb_path, e);
+            } else {
+                if let Some(ts) = file_mtime_seconds(&rdb_path) {
+                    persistence.last_save.store(ts, Ordering::Relaxed);
+                }
+                info!("[rdb] loaded RDB from {} (if existing and valid)", rdb_path);
+            }
+        }
     }
 
     storage.spawn_expiration_task();
 
-    if let Ok(interval_str) = env::var("REDUST_RDB_AUTO_SAVE_SECS") {
-        if let Ok(secs) = interval_str.parse::<u64>() {
-            if secs > 0 {
-                let storage_clone = storage.clone();
-                let path_clone = rdb_path.clone();
-                info!(
-                    "[rdb] auto-save enabled: every {} seconds to {}",
-                    secs, path_clone
-                );
-                tokio::spawn(async move {
-                    let interval = std::time::Duration::from_secs(secs);
-                    loop {
-                        sleep(interval).await;
-                        let storage_for_blocking = storage_clone.clone();
-                        let path_for_blocking = path_clone.clone();
-                        let result = tokio::task::spawn_blocking(move || {
-                            storage_for_blocking.save_rdb(&path_for_blocking)
-                        })
-                        .await;
-
-                        match result {
-                            Ok(Ok(())) => {
-                                // saved successfully
-                            }
-                            Ok(Err(e)) => {
+    if !persistence_disabled && persistence.aof_path.is_none() {
+        if let Ok(interval_str) = env::var("REDUST_RDB_AUTO_SAVE_SECS") {
+            if let Ok(secs) = interval_str.parse::<u64>() {
+                if secs > 0 {
+                    let storage_clone = storage.clone();
+                    let path_clone = rdb_path.clone();
+                    let persistence_clone = persistence.clone();
+                    info!(
+                        "[rdb] auto-save enabled: every {} seconds to {}",
+                        secs, path_clone
+                    );
+                    tokio::spawn(async move {
+                        let interval = std::time::Duration::from_secs(secs);
+                        loop {
+                            sleep(interval).await;
+                            let storage_for_blocking = storage_clone.clone();
+                            let path_for_blocking = path_clone.clone();
+                            if let Err(e) = perform_save(
+                                storage_for_blocking.clone(),
+                                path_for_blocking.clone(),
+                                persistence_clone.clone(),
+                            )
+                            .await
+                            {
                                 error!("[rdb] auto-save failed: {}", e);
                             }
-                            Err(e) => {
-                                error!("[rdb] auto-save task panicked: {}", e);
-                            }
                         }
-                    }
-                });
+                    });
+                }
             }
+        }
+    }
+
+    if !persistence_disabled {
+        if let Some(path) = persistence.aof_path.clone() {
+            let storage_clone = storage.clone();
+            let persistence_clone = persistence.clone();
+            let path_for_log = path.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                // align to run after the first full interval
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    if let Err(e) =
+                        perform_save(storage_clone.clone(), path.clone(), persistence_clone.clone())
+                            .await
+                    {
+                        error!("[aof] everysec save failed: {}", e);
+                    }
+                }
+            });
+            info!("[aof] everysec snapshot enabled to {}", path_for_log);
         }
     }
 
@@ -2669,6 +3480,7 @@ pub async fn serve(
             });
         }
     }
+    let aof_path_for_shutdown = persistence.aof_path.clone();
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -2685,14 +3497,30 @@ pub async fn serve(
                     Err(_) => PubSubOverflowStrategy::Drop,
                 };
                 info!("Accepted connection from {}", addr);
+                let persistence_clone = persistence.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_connection(stream, storage, metrics, pubsub, overflow_strategy).await {
+                    if let Err(err) = handle_connection(stream, storage, metrics, pubsub, overflow_strategy, persistence_clone.clone()).await {
                         error!("Connection error: {}", err);
                     }
                 });
             }
             _ = &mut shutdown => {
                 break;
+            }
+        }
+    }
+
+    // 尝试在关闭前做一次快照（优先 aof 路径）
+    if persistence.enabled {
+        if let Some(path) = aof_path_for_shutdown {
+            if let Err(e) = perform_save(storage.clone(), path.clone(), persistence.clone()).await {
+                error!("[aof] final save failed: {}", e);
+            }
+        } else {
+            if let Err(e) =
+                perform_save(storage.clone(), rdb_path.clone(), persistence.clone()).await
+            {
+                error!("[rdb] final save failed: {}", e);
             }
         }
     }

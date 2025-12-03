@@ -13,6 +13,7 @@ async fn spawn_server() -> (
     oneshot::Sender<()>,
     tokio::task::JoinHandle<tokio::io::Result<()>>,
 ) {
+    std::env::set_var("REDUST_DISABLE_PERSISTENCE", "1");
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
     let addr = listener.local_addr().expect("local addr");
     let (tx, rx) = oneshot::channel();

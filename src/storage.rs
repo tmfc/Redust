@@ -1,7 +1,8 @@
 use dashmap::DashMap;
+use ordered_float::OrderedFloat;
 use rand::prelude::SliceRandom;
 use rand::{seq::IteratorRandom, thread_rng};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -12,6 +13,12 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 type ByteString = Vec<u8>;
+
+#[derive(Debug, Clone)]
+struct ZSetInner {
+    by_member: HashMap<String, f64>,
+    by_score: BTreeSet<(OrderedFloat<f64>, String)>,
+}
 
 #[derive(Debug, Clone)]
 enum StorageValue {
@@ -31,6 +38,10 @@ enum StorageValue {
         value: HashMap<String, String>,
         expires_at: Option<Instant>,
     },
+    Zset {
+        value: ZSetInner,
+        expires_at: Option<Instant>,
+    },
 }
 
 #[derive(Clone)]
@@ -39,6 +50,10 @@ pub struct Storage {
     maxmemory_bytes: Option<u64>,
     last_access: Arc<DashMap<String, u64>>,
     access_counter: Arc<AtomicU64>,
+    /// 全局版本计数器，每次写操作递增
+    global_version: Arc<AtomicU64>,
+    /// 每个 key 的版本号，用于 WATCH 机制
+    key_versions: Arc<DashMap<String, u64>>,
 }
 
 // HINCRBY 专用错误类型，用于区分 WRONGTYPE / 非整数 / 溢出 / 超过 maxvalue 限制
@@ -55,6 +70,11 @@ pub enum HincrFloatError {
     MaxValueExceeded,
 }
 
+pub enum ZsetError {
+    WrongType,
+    NotFloat,
+}
+
 impl Default for Storage {
     fn default() -> Self {
         Storage::new(None)
@@ -68,7 +88,20 @@ impl Storage {
             maxmemory_bytes,
             last_access: Arc::new(DashMap::new()),
             access_counter: Arc::new(AtomicU64::new(0)),
+            global_version: Arc::new(AtomicU64::new(0)),
+            key_versions: Arc::new(DashMap::new()),
         }
+    }
+
+    /// 获取指定 key 的当前版本号
+    pub fn get_key_version(&self, key: &str) -> u64 {
+        self.key_versions.get(key).map(|v| *v).unwrap_or(0)
+    }
+
+    /// 递增指定 key 的版本号（在写操作后调用）
+    pub fn bump_key_version(&self, key: &str) {
+        let new_version = self.global_version.fetch_add(1, Ordering::SeqCst) + 1;
+        self.key_versions.insert(key.to_string(), new_version);
     }
 
     pub fn flushdb(&self, db: u8) {
@@ -80,13 +113,19 @@ impl Storage {
             .filter(|k| k.starts_with(&prefix))
             .collect();
 
-        for k in keys_to_remove {
-            self.data.remove(&k);
-            self.last_access.remove(&k);
+        for k in &keys_to_remove {
+            self.data.remove(k);
+            self.last_access.remove(k);
+            self.bump_key_version(k);
         }
     }
 
     pub fn flushall(&self) {
+        // 先记录所有 key 并更新版本
+        let all_keys: Vec<String> = self.data.iter().map(|e| e.key().clone()).collect();
+        for k in &all_keys {
+            self.bump_key_version(k);
+        }
         self.data.clear();
         self.last_access.clear();
         self.access_counter.store(0, Ordering::Relaxed);
@@ -121,8 +160,10 @@ impl Storage {
             );
         }
 
+        // hset 总是修改 key（即使 field 已存在），需要更新版本
+        self.touch_key(key);
+        self.bump_key_version(key);
         if added > 0 {
-            self.touch_key(key);
             self.maybe_evict_for_write();
         }
 
@@ -276,6 +317,7 @@ impl Storage {
         map.insert(field.to_string(), new_str);
 
         self.touch_key(key);
+        self.bump_key_version(key);
         self.maybe_evict_for_write();
 
         Ok(new_val)
@@ -335,6 +377,7 @@ impl Storage {
         map.insert(field.to_string(), s);
 
         self.touch_key(key);
+        self.bump_key_version(key);
         self.maybe_evict_for_write();
 
         Ok(new_val)
@@ -384,6 +427,7 @@ impl Storage {
 
         if removed > 0 {
             self.touch_key(key);
+            self.bump_key_version(key);
         }
 
         Ok(removed)
@@ -434,6 +478,7 @@ impl Storage {
 
         if !result.is_empty() {
             self.touch_key(key);
+            self.bump_key_version(key);
         }
 
         Ok(result)
@@ -537,14 +582,28 @@ impl Storage {
     }
 
     pub fn set(&self, key: String, value: ByteString) {
-        self.data.insert(
-            key.clone(),
-            StorageValue::String {
+        let now = Instant::now();
+        self.remove_if_expired(&key, now);
+
+        self.data
+            .entry(key.clone())
+            .and_modify(|existing| {
+                if let StorageValue::String { value: v, expires_at } = existing {
+                    *v = value.clone();
+                    *expires_at = None;
+                } else {
+                    *existing = StorageValue::String {
+                        value: value.clone(),
+                        expires_at: None,
+                    };
+                }
+            })
+            .or_insert(StorageValue::String {
                 value,
                 expires_at: None,
-            },
-        );
+            });
         self.touch_key(&key);
+        self.bump_key_version(&key);
         self.maybe_evict_for_write();
     }
 
@@ -591,6 +650,7 @@ impl Storage {
 
         // 删除访问记录
         self.last_access.remove(key);
+        self.bump_key_version(key);
 
         Ok(result)
     }
@@ -666,8 +726,9 @@ impl Storage {
             );
             len
         };
+        self.touch_key(key);
+        self.bump_key_version(key);
         if len > 0 {
-            self.touch_key(key);
             self.maybe_evict_for_write();
         }
 
@@ -717,6 +778,7 @@ impl Storage {
         }
 
         self.touch_key(key);
+        self.bump_key_version(key);
         self.maybe_evict_for_write();
 
         Ok(old)
@@ -757,8 +819,9 @@ impl Storage {
             len
         };
 
+        self.touch_key(key);
+        self.bump_key_version(key);
         if new_len > 0 {
-            self.touch_key(key);
             self.maybe_evict_for_write();
         }
 
@@ -821,6 +884,7 @@ impl Storage {
             });
         if inserted {
             self.touch_key(key);
+            self.bump_key_version(key);
             self.maybe_evict_for_write();
         }
         inserted
@@ -841,6 +905,7 @@ impl Storage {
         for key in keys {
             if self.data.remove(key).is_some() {
                 self.last_access.remove(key);
+                self.bump_key_version(key);
                 removed += 1;
             }
         }
@@ -875,10 +940,12 @@ impl Storage {
 
         // 删除旧的访问记录
         self.last_access.remove(from);
+        self.bump_key_version(from);
 
         // 插入新 key，保留 TTL 信息
         self.data.insert(to.to_string(), value);
         self.touch_key(to);
+        self.bump_key_version(to);
 
         Ok(())
     }
@@ -914,8 +981,10 @@ impl Storage {
         };
 
         self.last_access.remove(from);
+        self.bump_key_version(from);
         self.data.insert(to.to_string(), value);
         self.touch_key(to);
+        self.bump_key_version(to);
 
         Ok(true)
     }
@@ -959,6 +1028,7 @@ impl Storage {
         let new_val = value.checked_add(delta).ok_or(())?;
         *current_val = new_val.to_string().into_bytes();
         self.touch_key(key);
+        self.bump_key_version(key);
         self.maybe_evict_for_write();
         Ok(new_val)
     }
@@ -1008,6 +1078,7 @@ impl Storage {
 
         *current_val = s.into_bytes();
         self.touch_key(key);
+        self.bump_key_version(key);
         self.maybe_evict_for_write();
         Ok(new_val)
     }
@@ -1025,30 +1096,23 @@ impl Storage {
                 StorageValue::List { .. } => "list".to_string(),
                 StorageValue::Set { .. } => "set".to_string(),
                 StorageValue::Hash { .. } => "hash".to_string(),
+                StorageValue::Zset { .. } => "zset".to_string(),
             },
         )
     }
 
-    pub fn keys(&self, pattern: &str) -> Vec<String> {
-        // Very simple implementation: only support "*" (all keys) and exact match.
-        if pattern == "*" {
-            let now = Instant::now();
-            let mut all: Vec<String> = self
-                .data
-                .iter()
-                .map(|entry| entry.key().clone())
-                .filter(|k| !self.remove_if_expired(k, now))
-                .collect();
-            all.sort();
-            all
-        } else {
-            let mut result = Vec::new();
-            let now = Instant::now();
-            if !self.remove_if_expired(pattern, now) && self.data.contains_key(pattern) {
-                result.push(pattern.to_string());
-            }
-            result
-        }
+    pub fn keys(&self, _pattern: &str) -> Vec<String> {
+        // 当前实现：忽略 pattern，仅负责返回所有未过期的物理 key，排序后交给上层做模式匹配。
+        // 这样可以复用同一 API 支撑 KEYS/SCAN/INFO 等调用场景。
+        let now = Instant::now();
+        let mut all: Vec<String> = self
+            .data
+            .iter()
+            .map(|entry| entry.key().clone())
+            .filter(|k| !self.remove_if_expired(k, now))
+            .collect();
+        all.sort();
+        all
     }
 
     pub fn lpush(&self, key: &str, values: &[String]) -> Result<usize, ()> {
@@ -1098,8 +1162,9 @@ impl Storage {
             );
         }
 
+        self.touch_key(key);
+        self.bump_key_version(key);
         if len > 0 {
-            self.touch_key(key);
             self.maybe_evict_for_write();
         }
 
@@ -1177,6 +1242,10 @@ impl Storage {
             _ => return Err(()),
         };
 
+        if result.is_some() {
+            self.bump_key_version(key);
+        }
+
         Ok(result)
     }
 
@@ -1194,6 +1263,10 @@ impl Storage {
             StorageValue::List { value: list, .. } => list.pop_back(),
             _ => return Err(()),
         };
+
+        if result.is_some() {
+            self.bump_key_version(key);
+        }
 
         Ok(result)
     }
@@ -1305,6 +1378,7 @@ impl Storage {
 
         if removed > 0 {
             self.touch_key(key);
+            self.bump_key_version(key);
         }
 
         Ok(removed)
@@ -1352,6 +1426,7 @@ impl Storage {
             // Result is empty list
             list.clear();
             self.touch_key(key);
+            self.bump_key_version(key);
             return Ok(());
         }
 
@@ -1369,6 +1444,7 @@ impl Storage {
         }
 
         self.touch_key(key);
+        self.bump_key_version(key);
         // ltrim 只会收缩列表，不会增加内存，这里不触发淘汰
 
         Ok(())
@@ -1409,6 +1485,7 @@ impl Storage {
 
         if added > 0 {
             self.touch_key(key);
+            self.bump_key_version(key);
             self.maybe_evict_for_write();
         }
 
@@ -1440,6 +1517,7 @@ impl Storage {
 
         if removed > 0 {
             self.touch_key(key);
+            self.bump_key_version(key);
         }
 
         Ok(removed)
@@ -1554,8 +1632,9 @@ impl Storage {
                 expires_at: None,
             },
         );
+        self.touch_key(dest);
+        self.bump_key_version(dest);
         if len > 0 {
-            self.touch_key(dest);
             self.maybe_evict_for_write();
         }
         len
@@ -1662,6 +1741,287 @@ impl Storage {
         Ok(self.set_store_result(dest, result))
     }
 
+    pub fn zadd(&self, key: &str, entries: &[(f64, String)]) -> Result<usize, ZsetError> {
+        let now = Instant::now();
+        self.remove_if_expired(key, now);
+
+        for (score, _) in entries {
+            if !score.is_finite() {
+                return Err(ZsetError::NotFloat);
+            }
+        }
+
+        let mut added = 0usize;
+
+        if let Some(mut entry) = self.data.get_mut(key) {
+            match entry.value_mut() {
+                StorageValue::Zset { value, .. } => {
+                    for (score, member) in entries {
+                        let ord_score = OrderedFloat(*score);
+                        if let Some(old_score) = value.by_member.insert(member.clone(), *score) {
+                            let _ = value
+                                .by_score
+                                .remove(&(OrderedFloat(old_score), member.clone()));
+                        } else {
+                            added += 1;
+                        }
+                        value.by_score.insert((ord_score, member.clone()));
+                    }
+                }
+                _ => return Err(ZsetError::WrongType),
+            }
+        } else {
+            let mut inner = ZSetInner {
+                by_member: HashMap::new(),
+                by_score: BTreeSet::new(),
+            };
+            for (score, member) in entries {
+                let ord_score = OrderedFloat(*score);
+                inner.by_member.insert(member.clone(), *score);
+                inner.by_score.insert((ord_score, member.clone()));
+                added += 1;
+            }
+            self.data.insert(
+                key.to_string(),
+                StorageValue::Zset {
+                    value: inner,
+                    expires_at: None,
+                },
+            );
+        }
+
+        if !entries.is_empty() {
+            self.touch_key(key);
+            self.bump_key_version(key);
+            self.maybe_evict_for_write();
+        }
+
+        Ok(added)
+    }
+
+    pub fn zcard(&self, key: &str) -> Result<usize, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(0);
+        }
+
+        let Some(entry) = self.data.get(key) else {
+            return Ok(0);
+        };
+
+        match entry.value() {
+            StorageValue::Zset { value, .. } => Ok(value.by_member.len()),
+            _ => Err(()),
+        }
+    }
+
+    pub fn zrem(&self, key: &str, members: &[String]) -> Result<usize, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(0);
+        }
+
+        let removed = if let Some(mut entry) = self.data.get_mut(key) {
+            match entry.value_mut() {
+                StorageValue::Zset { value, .. } => {
+                    let mut removed = 0;
+                    for member in members {
+                        if let Some(old_score) = value.by_member.remove(member) {
+                            value
+                                .by_score
+                                .remove(&(OrderedFloat(old_score), member.clone()));
+                            removed += 1;
+                        }
+                    }
+                    removed
+                }
+                _ => return Err(()),
+            }
+        } else {
+            0
+        };
+
+        if removed > 0 {
+            self.touch_key(key);
+            self.bump_key_version(key);
+        }
+
+        Ok(removed)
+    }
+
+    pub fn zscore(&self, key: &str, member: &str) -> Result<Option<f64>, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(None);
+        }
+
+        let Some(entry) = self.data.get(key) else {
+            return Ok(None);
+        };
+
+        match entry.value() {
+            StorageValue::Zset { value, .. } => Ok(value.by_member.get(member).cloned()),
+            _ => Err(()),
+        }
+    }
+
+    pub fn zincrby(&self, key: &str, increment: f64, member: &str) -> Result<f64, ZsetError> {
+        if !increment.is_finite() {
+            return Err(ZsetError::NotFloat);
+        }
+
+        let now = Instant::now();
+        self.remove_if_expired(key, now);
+
+        let new_score: f64;
+
+        if let Some(mut entry) = self.data.get_mut(key) {
+            match entry.value_mut() {
+                StorageValue::Zset { value, .. } => {
+                    let old = value.by_member.get(member).cloned().unwrap_or(0.0);
+                    new_score = old + increment;
+                    if !new_score.is_finite() {
+                        return Err(ZsetError::NotFloat);
+                    }
+                    let _ = value
+                        .by_score
+                        .remove(&(OrderedFloat(old), member.to_string()));
+                    value
+                        .by_score
+                        .insert((OrderedFloat(new_score), member.to_string()));
+                    value
+                        .by_member
+                        .insert(member.to_string(), new_score);
+                }
+                _ => return Err(ZsetError::WrongType),
+            }
+        } else {
+            new_score = increment;
+            let mut inner = ZSetInner {
+                by_member: HashMap::new(),
+                by_score: BTreeSet::new(),
+            };
+            inner
+                .by_member
+                .insert(member.to_string(), new_score);
+            inner
+                .by_score
+                .insert((OrderedFloat(new_score), member.to_string()));
+            self.data.insert(
+                key.to_string(),
+                StorageValue::Zset {
+                    value: inner,
+                    expires_at: None,
+                },
+            );
+        }
+
+        self.touch_key(key);
+        self.bump_key_version(key);
+        self.maybe_evict_for_write();
+
+        Ok(new_score)
+    }
+
+    pub fn zrange(
+        &self,
+        key: &str,
+        start: isize,
+        stop: isize,
+        rev: bool,
+    ) -> Result<Vec<(String, f64)>, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(Vec::new());
+        }
+
+        let entry = match self.data.get(key) {
+            Some(e) => e,
+            None => return Ok(Vec::new()),
+        };
+
+        let zset = match entry.value() {
+            StorageValue::Zset { value, .. } => value,
+            _ => return Err(()),
+        };
+
+        let mut items: Vec<(String, f64)> = zset
+            .by_score
+            .iter()
+            .map(|(score, member)| (member.clone(), score.0))
+            .collect();
+
+        if rev {
+            items.reverse();
+        }
+
+        let len = items.len() as isize;
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let normalize = |idx: isize| -> isize {
+            if idx < 0 {
+                len + idx
+            } else {
+                idx
+            }
+        };
+
+        let mut s = normalize(start);
+        let mut e = normalize(stop);
+
+        if s < 0 {
+            s = 0;
+        }
+        if e < 0 {
+            return Ok(Vec::new());
+        }
+        if s >= len {
+            return Ok(Vec::new());
+        }
+        if e >= len {
+            e = len - 1;
+        }
+        if s > e {
+            return Ok(Vec::new());
+        }
+
+        let take_len = (e - s + 1) as usize;
+        let result = items
+            .into_iter()
+            .skip(s as usize)
+            .take(take_len)
+            .collect();
+
+        Ok(result)
+    }
+
+    pub fn zscan_entries(&self, key: &str) -> Result<Vec<(String, f64)>, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(Vec::new());
+        }
+
+        let entry = match self.data.get(key) {
+            Some(e) => e,
+            None => return Ok(Vec::new()),
+        };
+
+        let zset = match entry.value() {
+            StorageValue::Zset { value, .. } => value,
+            _ => return Err(()),
+        };
+
+        let items: Vec<(String, f64)> = zset
+            .by_score
+            .iter()
+            .map(|(score, member)| (member.clone(), score.0))
+            .collect();
+
+        Ok(items)
+    }
+
     pub fn save_rdb<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let mut file = File::create(path)?;
 
@@ -1690,6 +2050,9 @@ impl Storage {
                 }
                 StorageValue::Hash { expires_at, .. } => {
                     (3u8, Self::remaining_millis(*expires_at, now))
+                }
+                StorageValue::Zset { expires_at, .. } => {
+                    (4u8, Self::remaining_millis(*expires_at, now))
                 }
             };
 
@@ -1740,6 +2103,20 @@ impl Storage {
                         let v_len = v_bytes.len() as u32;
                         file.write_all(&v_len.to_le_bytes())?;
                         file.write_all(v_bytes)?;
+                    }
+                }
+                StorageValue::Zset { value: zset, .. } => {
+                    // 序列化 ZSET: 元素数量 + (score, member) 对
+                    let len = zset.by_member.len() as u32;
+                    file.write_all(&len.to_le_bytes())?;
+                    for (member, score) in zset.by_member.iter() {
+                        // 写入 score (f64, 8 bytes)
+                        file.write_all(&score.to_le_bytes())?;
+                        // 写入 member
+                        let m_bytes = member.as_bytes();
+                        let m_len = m_bytes.len() as u32;
+                        file.write_all(&m_len.to_le_bytes())?;
+                        file.write_all(m_bytes)?;
                     }
                 }
             }
@@ -1944,6 +2321,48 @@ impl Storage {
                         expires_at,
                     }
                 }
+                4 => {
+                    // ZSET 类型
+                    let mut len_buf = [0u8; 4];
+                    if file.read_exact(&mut len_buf).is_err() {
+                        break;
+                    }
+                    let len = u32::from_le_bytes(len_buf) as usize;
+                    let mut by_member = HashMap::with_capacity(len);
+                    let mut by_score = BTreeSet::new();
+                    for _ in 0..len {
+                        // 读取 score (f64, 8 bytes)
+                        let mut score_buf = [0u8; 8];
+                        if file.read_exact(&mut score_buf).is_err() {
+                            break;
+                        }
+                        let score = f64::from_le_bytes(score_buf);
+
+                        // 读取 member
+                        let mut mlen_buf = [0u8; 4];
+                        if file.read_exact(&mut mlen_buf).is_err() {
+                            break;
+                        }
+                        let mlen = u32::from_le_bytes(mlen_buf) as usize;
+                        let mut member = vec![0u8; mlen];
+                        if file.read_exact(&mut member).is_err() {
+                            break;
+                        }
+                        let member_str = match String::from_utf8(member) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                return Ok(());
+                            }
+                        };
+
+                        by_member.insert(member_str.clone(), score);
+                        by_score.insert((OrderedFloat(score), member_str));
+                    }
+                    StorageValue::Zset {
+                        value: ZSetInner { by_member, by_score },
+                        expires_at,
+                    }
+                }
                 _ => {
                     return Ok(());
                 }
@@ -1961,6 +2380,7 @@ impl Storage {
             let existed = self.data.remove(key).is_some();
             if existed {
                 self.last_access.remove(key);
+                self.bump_key_version(key);
             }
             return existed;
         }
@@ -1980,8 +2400,10 @@ impl Storage {
             StorageValue::String { expires_at, .. }
             | StorageValue::List { expires_at, .. }
             | StorageValue::Set { expires_at, .. }
-            | StorageValue::Hash { expires_at, .. } => {
+            | StorageValue::Hash { expires_at, .. }
+            | StorageValue::Zset { expires_at, .. } => {
                 *expires_at = Some(deadline);
+                self.bump_key_version(key);
                 true
             }
         }
@@ -1992,6 +2414,7 @@ impl Storage {
             let existed = self.data.remove(key).is_some();
             if existed {
                 self.last_access.remove(key);
+                self.bump_key_version(key);
             }
             return existed;
         }
@@ -2011,8 +2434,10 @@ impl Storage {
             StorageValue::String { expires_at, .. }
             | StorageValue::List { expires_at, .. }
             | StorageValue::Set { expires_at, .. }
-            | StorageValue::Hash { expires_at, .. } => {
+            | StorageValue::Hash { expires_at, .. }
+            | StorageValue::Zset { expires_at, .. } => {
                 *expires_at = Some(deadline);
+                self.bump_key_version(key);
                 true
             }
         }
@@ -2036,7 +2461,8 @@ impl Storage {
             StorageValue::String { expires_at, .. }
             | StorageValue::List { expires_at, .. }
             | StorageValue::Set { expires_at, .. }
-            | StorageValue::Hash { expires_at, .. } => expires_at,
+            | StorageValue::Hash { expires_at, .. }
+            | StorageValue::Zset { expires_at, .. } => expires_at,
         };
 
         let Some(deadline) = expires_at else {
@@ -2072,7 +2498,8 @@ impl Storage {
             StorageValue::String { expires_at, .. }
             | StorageValue::List { expires_at, .. }
             | StorageValue::Set { expires_at, .. }
-            | StorageValue::Hash { expires_at, .. } => expires_at,
+            | StorageValue::Hash { expires_at, .. }
+            | StorageValue::Zset { expires_at, .. } => expires_at,
         };
 
         let Some(deadline) = expires_at else {
@@ -2104,9 +2531,11 @@ impl Storage {
             StorageValue::String { expires_at, .. }
             | StorageValue::List { expires_at, .. }
             | StorageValue::Set { expires_at, .. }
-            | StorageValue::Hash { expires_at, .. } => {
+            | StorageValue::Hash { expires_at, .. }
+            | StorageValue::Zset { expires_at, .. } => {
                 if expires_at.is_some() {
                     *expires_at = None;
+                    self.bump_key_version(key);
                     true
                 } else {
                     false
@@ -2253,6 +2682,7 @@ impl Storage {
             StorageValue::List { expires_at, .. } => expires_at,
             StorageValue::Set { expires_at, .. } => expires_at,
             StorageValue::Hash { expires_at, .. } => expires_at,
+            StorageValue::Zset { expires_at, .. } => expires_at,
         };
 
         match expires_at {
@@ -2287,6 +2717,7 @@ impl Storage {
         if should_remove {
             if self.data.remove(key).is_some() {
                 self.last_access.remove(key);
+                self.bump_key_version(key);
             }
             true
         } else {
@@ -2361,6 +2792,7 @@ impl Storage {
 
         self.data.remove(&key);
         self.last_access.remove(&key);
+        self.bump_key_version(&key);
         true
     }
 
@@ -2395,6 +2827,13 @@ impl Storage {
                 StorageValue::Set { value: set, .. } => set.iter().map(|v| v.len() as u64).sum(),
                 StorageValue::Hash { value: map, .. } => {
                     map.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum()
+                }
+                StorageValue::Zset { value, .. } => {
+                    value
+                        .by_member
+                        .iter()
+                        .map(|(member, _)| member.len() as u64 + std::mem::size_of::<f64>() as u64)
+                        .sum()
                 }
             };
 

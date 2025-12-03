@@ -10,6 +10,7 @@ rand = "0.8"
 
 log = "0.4"
 env_logger = "0.11"
+ordered-float = "3.9"
 
 [dev-dependencies]
 redis = { version = "0.25", features = ["tokio-comp"] }
