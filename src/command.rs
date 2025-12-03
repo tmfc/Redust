@@ -396,6 +396,24 @@ pub enum Command {
         increment: f64,
         member: String,
     },
+    // Lua 脚本命令
+    Eval {
+        script: String,
+        keys: Vec<String>,
+        args: Vec<String>,
+    },
+    Evalsha {
+        sha1: String,
+        keys: Vec<String>,
+        args: Vec<String>,
+    },
+    ScriptLoad {
+        script: String,
+    },
+    ScriptExists {
+        sha1s: Vec<String>,
+    },
+    ScriptFlush,
     Unknown(Vec<Binary>),
     /// Represents an error that should be sent back to the client.
     Error(String),
@@ -2586,6 +2604,121 @@ pub async fn read_command(
                 return Ok(Some(err_not_integer()));
             }
             Command::Psetex { key, millis, value }
+        }
+        "EVAL" => {
+            // EVAL script numkeys [key ...] [arg ...]
+            let Some(script_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("eval")));
+            };
+            let script = match parse_bulk_string(script_bytes) {
+                Ok(s) => s,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(numkeys_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("eval")));
+            };
+            let numkeys = match parse_i64_from_bulk(numkeys_bytes) {
+                Ok(n) if n >= 0 => n as usize,
+                _ => return Ok(Some(err_not_integer())),
+            };
+            let mut keys = Vec::with_capacity(numkeys);
+            for _ in 0..numkeys {
+                let Some(key_bytes) = iter.next() else {
+                    return Ok(Some(err_wrong_args("eval")));
+                };
+                match parse_bulk_string(key_bytes) {
+                    Ok(k) => keys.push(k),
+                    Err(e) => return Ok(Some(e)),
+                }
+            }
+            let mut args = Vec::new();
+            for b in iter {
+                match parse_bulk_string(b) {
+                    Ok(a) => args.push(a),
+                    Err(e) => return Ok(Some(e)),
+                }
+            }
+            Command::Eval { script, keys, args }
+        }
+        "EVALSHA" => {
+            // EVALSHA sha1 numkeys [key ...] [arg ...]
+            let Some(sha1_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("evalsha")));
+            };
+            let sha1 = match parse_bulk_string(sha1_bytes) {
+                Ok(s) => s,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(numkeys_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("evalsha")));
+            };
+            let numkeys = match parse_i64_from_bulk(numkeys_bytes) {
+                Ok(n) if n >= 0 => n as usize,
+                _ => return Ok(Some(err_not_integer())),
+            };
+            let mut keys = Vec::with_capacity(numkeys);
+            for _ in 0..numkeys {
+                let Some(key_bytes) = iter.next() else {
+                    return Ok(Some(err_wrong_args("evalsha")));
+                };
+                match parse_bulk_string(key_bytes) {
+                    Ok(k) => keys.push(k),
+                    Err(e) => return Ok(Some(e)),
+                }
+            }
+            let mut args = Vec::new();
+            for b in iter {
+                match parse_bulk_string(b) {
+                    Ok(a) => args.push(a),
+                    Err(e) => return Ok(Some(e)),
+                }
+            }
+            Command::Evalsha { sha1, keys, args }
+        }
+        "SCRIPT" => {
+            // SCRIPT LOAD script | SCRIPT EXISTS sha1 [sha1 ...] | SCRIPT FLUSH
+            let Some(subcmd_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("script")));
+            };
+            let subcmd = match parse_bulk_string(subcmd_bytes) {
+                Ok(s) => s.to_uppercase(),
+                Err(e) => return Ok(Some(e)),
+            };
+            match subcmd.as_str() {
+                "LOAD" => {
+                    let Some(script_bytes) = iter.next() else {
+                        return Ok(Some(err_wrong_args("script")));
+                    };
+                    let script = match parse_bulk_string(script_bytes) {
+                        Ok(s) => s,
+                        Err(e) => return Ok(Some(e)),
+                    };
+                    if iter.next().is_some() {
+                        return Ok(Some(err_wrong_args("script")));
+                    }
+                    Command::ScriptLoad { script }
+                }
+                "EXISTS" => {
+                    let mut sha1s = Vec::new();
+                    for b in iter {
+                        match parse_bulk_string(b) {
+                            Ok(s) => sha1s.push(s),
+                            Err(e) => return Ok(Some(e)),
+                        }
+                    }
+                    if sha1s.is_empty() {
+                        return Ok(Some(err_wrong_args("script")));
+                    }
+                    Command::ScriptExists { sha1s }
+                }
+                "FLUSH" => {
+                    // 忽略可选的 ASYNC/SYNC 参数
+                    Command::ScriptFlush
+                }
+                _ => {
+                    Command::Error(format!("ERR Unknown SCRIPT subcommand or wrong number of arguments for '{}'", subcmd))
+                }
+            }
         }
         _ => Command::Unknown(std::iter::once(command_bytes).chain(iter).collect()),
     };

@@ -224,11 +224,12 @@
 ## Phase A 未完成的核心命令（优先补齐）
 
 - [x] 高级 SET 选项：`EXAT` / `PXAT`、完整 NX/XX/KEEPTTL/GET 组合与冲突校验（已实现并通过端到端测试；复杂组合和边界行为的进一步打磨见 future.md）。
-- [ ] 键扫描与模式：`SCAN`/`SSCAN`/`HSCAN`/`ZSCAN`，`KEYS` 模式兼容更丰富 glob（已实现基础 `SCAN` + `MATCH`/`COUNT` 以及 `KEYS` glob 匹配；集合/哈希/有序集合的 *SCAN 后续补齐）。
-- [ ] 有序集合：`ZADD`/`ZREM`/`ZRANGE`/`ZREVRANGE`/`ZCARD`/`ZINCRBY` 等基础子集。
+- [x] 键扫描与模式：`SCAN`/`SSCAN`/`HSCAN`/`ZSCAN`，`KEYS` 模式兼容更丰富 glob（已实现基础 `SCAN` + `MATCH`/`COUNT` 以及 `KEYS` glob 匹配；`ZSCAN` 已实现）。
+- [x] 有序集合：`ZADD`/`ZREM`/`ZRANGE`/`ZREVRANGE`/`ZCARD`/`ZINCRBY`/`ZSCORE`/`ZSCAN` 等基础子集（已实现并通过端到端测试）。
 - [ ] 流（Streams）：`XADD`/`XRANGE`/`XREAD`/`XDEL` 等基础读写。
-- [ ] 事务与脚本：`MULTI`/`EXEC`/`DISCARD`/`WATCH`，`EVAL`/`EVALSHA`。
-- [ ] 持久化控制命令：`SAVE`/`BGSAVE`/`LASTSAVE`，AOF 开关/重写子集。
+- [x] 事务：`MULTI`/`EXEC`/`DISCARD`/`WATCH`/`UNWATCH`（已实现，支持命令队列和乐观锁）。
+- [x] Lua 脚本：`EVAL`/`EVALSHA`/`SCRIPT LOAD|EXISTS|FLUSH`（基础版，暂不支持 `redis.call`/`redis.pcall`）。
+- [x] 持久化控制命令：`SAVE`/`BGSAVE`/`LASTSAVE`，RDB 快照已实现。
 - [ ] 复制命令子集（社区版）：`REPLCONF`/`PSYNC`/`SLAVEOF`/`REPLICAOF`（主从握手与增量复制）。
 - [ ] 客户端/运维：`CONFIG GET/SET` 子集、`SLOWLOG`、`CLIENT LIST`/`PAUSE`/`UNBLOCK`。
 
@@ -372,23 +373,23 @@
 
 ### Sorted Sets (ZSets)
 
-- [ ] ZADD
-- [ ] ZREM
-- [ ] ZCARD
+- [x] ZADD
+- [x] ZREM
+- [x] ZCARD
 - [ ] ZCOUNT
-- [ ] ZINCRBY
+- [x] ZINCRBY
 - [ ] ZINTER / ZINTERSTORE
 - [ ] ZUNION / ZUNIONSTORE
 - [ ] ZDIFF / ZDIFFSTORE
-- [ ] ZRANGE / ZRANGEBYSCORE / ZRANGEBYLEX
-- [ ] ZREVRANGE / ZREVRANGEBYSCORE / ZREVRANGEBYLEX
+- [x] ZRANGE / ZRANGEBYSCORE / ZRANGEBYLEX
+- [x] ZREVRANGE / ZREVRANGEBYSCORE / ZREVRANGEBYLEX
 - [ ] ZPOPMIN / ZPOPMAX
 - [ ] BZPOPMIN / BZPOPMAX
 - [ ] ZLEXCOUNT
 - [ ] ZMSCORE
 - [ ] ZRANK / ZREVRANK
-- [ ] ZSCORE
-- [ ] ZSCAN
+- [x] ZSCORE
+- [x] ZSCAN
 
 ### Streams
 
@@ -413,17 +414,17 @@
 
 ### Transactions
 
-- [ ] MULTI
-- [ ] EXEC
-- [ ] DISCARD
-- [ ] WATCH
-- [ ] UNWATCH
+- [x] MULTI
+- [x] EXEC
+- [x] DISCARD
+- [x] WATCH
+- [x] UNWATCH
 
 ### Scripting / Functions
 
-- [ ] EVAL
-- [ ] EVALSHA
-- [ ] SCRIPT *（LOAD/FLUSH/EXISTS/KILL DEBUG）*
+- [x] EVAL（基础版，暂不支持 redis.call/pcall）
+- [x] EVALSHA（基础版，暂不支持 redis.call/pcall）
+- [x] SCRIPT *（LOAD/FLUSH/EXISTS，暂不支持 KILL/DEBUG）*
 - [ ] FUNCTION *（LOAD/DELETE/FLUSH/LIST/DUMP/RESTORE/HELP）*
 
 ### Geo

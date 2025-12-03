@@ -60,9 +60,10 @@ impl TestClient {
 
 #[tokio::test]
 async fn lpush_rpush_respect_value_limit() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    let _guard = set_env("REDUST_MAXVALUE_BYTES", "4");
+    let _guard1 = set_env("REDUST_MAXVALUE_BYTES", "4");
+    let _guard2 = set_env("REDUST_DISABLE_PERSISTENCE", "1");
 
     let (addr, shutdown, handle) = spawn_server().await;
     let mut client = TestClient::connect(addr).await;
@@ -88,9 +89,10 @@ async fn lpush_rpush_respect_value_limit() {
 
 #[tokio::test]
 async fn sadd_hset_respect_value_limit() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    let _guard = set_env("REDUST_MAXVALUE_BYTES", "3");
+    let _guard1 = set_env("REDUST_MAXVALUE_BYTES", "3");
+    let _guard2 = set_env("REDUST_DISABLE_PERSISTENCE", "1");
 
     let (addr, shutdown, handle) = spawn_server().await;
     let mut client = TestClient::connect(addr).await;

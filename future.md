@@ -183,11 +183,23 @@
 ## 事务与脚本增强（V2）
 
 > 现状：`MULTI`/`EXEC`/`DISCARD`/`WATCH`/`UNWATCH` 已实现基础语义，支持命令队列和乐观锁。
+> Lua 脚本基础功能已实现（`EVAL`/`EVALSHA`/`SCRIPT LOAD|EXISTS|FLUSH`）。
 
-- [ ] **EVAL/EVALSHA Lua 脚本支持**
-  - 引入简化的 Lua 运行时（如 `mlua` crate），支持基础脚本执行。
-  - 实现 `redis.call()` / `redis.pcall()` 回调，允许脚本调用 Redis 命令。
-  - 实现 `SCRIPT LOAD` / `SCRIPT EXISTS` / `SCRIPT FLUSH` 脚本管理命令。
+- [x] **EVAL/EVALSHA Lua 脚本支持（基础版）**
+  - 已引入 `mlua` crate（Lua 5.4），支持基础脚本执行。
+  - 已实现 `EVAL script numkeys [key ...] [arg ...]` 和 `EVALSHA sha1 numkeys [key ...] [arg ...]`。
+  - 已实现 `SCRIPT LOAD` / `SCRIPT EXISTS` / `SCRIPT FLUSH` 脚本管理命令。
+  - 已支持 `KEYS` 和 `ARGV` 表访问。
+  - 已支持返回值类型转换（integer, string, array, nil, boolean）。
+
+- [ ] **redis.call() / redis.pcall() 回调实现**
+  - 当前 `redis.call()` / `redis.pcall()` 返回 stub 错误，尚未实现真正的命令调用。
+  - 后续需实现在 Lua 脚本中调用 Redis 命令的能力。
+  - 需要处理命令执行结果到 Lua 值的转换。
+
+- [ ] **事务中 Lua 脚本支持**
+  - 当前 `EVAL`/`EVALSHA` 在事务中不支持（返回错误）。
+  - 后续可考虑支持在事务中执行脚本。
 
 - [ ] **事务中更多命令支持**
   - 当前事务中部分命令（如 `TYPE`、`KEYS`、`SCAN` 等）返回错误。
@@ -197,9 +209,9 @@
   - Redis 在 EXEC 时如果队列中有语法错误命令，会中止整个事务。
   - 当前实现在命令入队时已做语法检查，但可进一步对齐 Redis 行为。
 
-- [ ] **WATCH 版本追踪优化**
-  - 当前仅在 `set`/`del` 操作中更新 key 版本，其他写操作（如 `LPUSH`、`SADD`、`HSET` 等）尚未覆盖。
-  - 后续需系统性地在所有写路径中调用 `bump_key_version`。
+- [x] **WATCH 版本追踪优化**
+  - 已在所有写路径中调用 `bump_key_version`，包括 `LPUSH`、`SADD`、`HSET`、`ZADD` 等。
+  - 已在 TTL 过期删除和 LRU 淘汰时更新 key 版本。
 
 ---
 

@@ -20,6 +20,7 @@ use crate::resp::{
     respond_bulk_bytes, respond_bulk_string, respond_error, respond_integer, respond_null_bulk,
     respond_simple_string,
 };
+use crate::scripting::{execute_script, ScriptCache, ScriptContext};
 use crate::storage::Storage;
 
 struct Metrics {
@@ -2567,6 +2568,15 @@ async fn execute_command_in_transaction(
             respond_error(writer, "ERR command not allowed in transaction").await?;
         }
 
+        // Lua 脚本命令在事务中不支持（简化实现）
+        Command::Eval { .. }
+        | Command::Evalsha { .. }
+        | Command::ScriptLoad { .. }
+        | Command::ScriptExists { .. }
+        | Command::ScriptFlush => {
+            respond_error(writer, "ERR EVAL/SCRIPT commands not supported in transaction").await?;
+        }
+
         // 其他命令返回错误
         _ => {
             respond_error(writer, "ERR command not supported in transaction").await?;
@@ -2582,6 +2592,7 @@ async fn handle_connection(
     pubsub: PubSubHub,
     overflow_strategy: PubSubOverflowStrategy,
     persistence: Arc<PersistenceState>,
+    script_cache: Arc<ScriptCache>,
 ) -> io::Result<()> {
     let peer_addr = stream.peer_addr().ok();
     info!("[conn] new connection from {:?}", peer_addr);
@@ -3282,6 +3293,68 @@ async fn handle_connection(
                 unreachable!("transaction commands should be handled earlier");
             }
 
+            // Lua 脚本命令
+            Command::Eval { script, keys, args } => {
+                // 缓存脚本
+                script_cache.load(&script);
+                
+                let ctx = ScriptContext {
+                    storage: Arc::new(storage.clone()),
+                    current_db: current_db as u32,
+                    keys,
+                    args,
+                };
+                match execute_script(&script, ctx) {
+                    Ok(result) => {
+                        let resp = result.to_resp_bytes();
+                        write_half.write_all(&resp).await?;
+                    }
+                    Err(e) => {
+                        respond_error(&mut write_half, &e).await?;
+                    }
+                }
+            }
+            Command::Evalsha { sha1, keys, args } => {
+                match script_cache.get(&sha1) {
+                    Some(script) => {
+                        let ctx = ScriptContext {
+                            storage: Arc::new(storage.clone()),
+                            current_db: current_db as u32,
+                            keys,
+                            args,
+                        };
+                        match execute_script(&script, ctx) {
+                            Ok(result) => {
+                                let resp = result.to_resp_bytes();
+                                write_half.write_all(&resp).await?;
+                            }
+                            Err(e) => {
+                                respond_error(&mut write_half, &e).await?;
+                            }
+                        }
+                    }
+                    None => {
+                        respond_error(&mut write_half, "NOSCRIPT No matching script. Please use EVAL.").await?;
+                    }
+                }
+            }
+            Command::ScriptLoad { script } => {
+                let sha1 = script_cache.load(&script);
+                respond_bulk_string(&mut write_half, &sha1).await?;
+            }
+            Command::ScriptExists { sha1s } => {
+                let results = script_cache.exists(&sha1s);
+                let mut resp = format!("*{}\r\n", results.len());
+                for exists in results {
+                    resp.push_str(&format!(":{}\r\n", if exists { 1 } else { 0 }));
+                }
+                write_half.write_all(resp.as_bytes()).await?;
+            }
+            Command::ScriptFlush => {
+                script_cache.flush();
+                respond_simple_string(&mut write_half, "OK").await?;
+            }
+
             // 解析阶段构造的错误命令
             Command::Error(msg) => {
                 respond_error(&mut write_half, &msg).await?;
@@ -3466,6 +3539,7 @@ pub async fn serve(
         pubsub_messages_dropped: AtomicU64::new(0),
     });
     let pubsub = PubSubHub::new();
+    let script_cache = Arc::new(ScriptCache::new());
 
     if let Ok(metrics_addr) = env::var("REDUST_METRICS_ADDR") {
         if !metrics_addr.is_empty() {
@@ -3498,8 +3572,9 @@ pub async fn serve(
                 };
                 info!("Accepted connection from {}", addr);
                 let persistence_clone = persistence.clone();
+                let script_cache_clone = script_cache.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_connection(stream, storage, metrics, pubsub, overflow_strategy, persistence_clone.clone()).await {
+                    if let Err(err) = handle_connection(stream, storage, metrics, pubsub, overflow_strategy, persistence_clone.clone(), script_cache_clone).await {
                         error!("Connection error: {}", err);
                     }
                 });
