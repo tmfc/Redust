@@ -11,6 +11,7 @@ async fn spawn_server() -> (
     oneshot::Sender<()>,
     tokio::task::JoinHandle<tokio::io::Result<()>>,
 ) {
+    std::env::set_var("REDUST_DISABLE_PERSISTENCE", "1");
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
     let addr = listener.local_addr().expect("local addr");
     let (tx, rx) = oneshot::channel();
@@ -387,6 +388,44 @@ async fn hscan_basic_roundtrip() {
     let expected_values: Vec<String> = (0..10).map(|i| format!("v{}", i)).collect();
     assert_eq!(fields, expected_fields);
     assert_eq!(values, expected_values);
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn zscan_wrongtype_returns_error() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    client.send_array(&["SET", "foo", "bar"]).await;
+    let _ = client.read_simple_line().await;
+
+    client.send_array(&["ZSCAN", "foo", "0"]).await;
+    let mut line = String::new();
+    client.reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("-WRONGTYPE"));
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn zscan_missing_key_returns_empty() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    client.send_array(&["ZSCAN", "missing", "0"]).await;
+
+    let mut outer = String::new();
+    client.reader.read_line(&mut outer).await.unwrap();
+    assert_eq!(outer, "*2\r\n");
+
+    let cursor = client.read_bulk_string().await.unwrap();
+    assert_eq!(cursor, "0");
+
+    let flat = client.read_array_of_bulk().await;
+    assert!(flat.is_empty());
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();

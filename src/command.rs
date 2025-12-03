@@ -358,6 +358,36 @@ pub enum Command {
         channels: Vec<String>,
     },
     PubsubHelp,
+    Save,
+    Bgsave,
+    Lastsave,
+    Zadd {
+        key: String,
+        entries: Vec<(f64, String)>,
+    },
+    Zcard {
+        key: String,
+    },
+    Zrange {
+        key: String,
+        start: isize,
+        stop: isize,
+        withscores: bool,
+        rev: bool,
+    },
+    Zscore {
+        key: String,
+        member: String,
+    },
+    Zrem {
+        key: String,
+        members: Vec<String>,
+    },
+    Zincrby {
+        key: String,
+        increment: f64,
+        member: String,
+    },
     Unknown(Vec<Binary>),
     /// Represents an error that should be sent back to the client.
     Error(String),
@@ -410,7 +440,11 @@ fn parse_isize_from_bulk(bytes: Vec<u8>) -> Result<isize, Command> {
 
 fn parse_f64_from_bulk(bytes: Vec<u8>) -> Result<f64, Command> {
     let s = parse_bulk_string(bytes)?;
-    s.parse::<f64>().map_err(|_| err_not_float())
+    let v = s.parse::<f64>().map_err(|_| err_not_float())?;
+    if !v.is_finite() {
+        return Err(err_not_float());
+    }
+    Ok(v)
 }
 
 pub async fn read_command(
@@ -1185,6 +1219,198 @@ pub async fn read_command(
                 pattern,
                 count,
             }
+        }
+        "ZADD" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zadd")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+
+            let mut entries: Vec<(f64, String)> = Vec::new();
+            while let Some(score_bytes) = iter.next() {
+                let score = match parse_f64_from_bulk(score_bytes) {
+                    Ok(v) => v,
+                    Err(e) => return Ok(Some(e)),
+                };
+                let Some(member_bytes) = iter.next() else {
+                    return Ok(Some(err_wrong_args("zadd")));
+                };
+                let member = match parse_bulk_string(member_bytes) {
+                    Ok(m) => m,
+                    Err(e) => return Ok(Some(e)),
+                };
+                entries.push((score, member));
+            }
+
+            if entries.is_empty() {
+                return Ok(Some(err_wrong_args("zadd")));
+            }
+
+            Command::Zadd { key, entries }
+        }
+        "ZCARD" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zcard")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("zcard")));
+            }
+
+            Command::Zcard { key }
+        }
+        "ZRANGE" | "ZREVRANGE" => {
+            let is_rev = upper == "ZREVRANGE";
+            let err_cmd = if is_rev { "zrevrange" } else { "zrange" };
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args(err_cmd)));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(start_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args(err_cmd)));
+            };
+            let start = match parse_isize_from_bulk(start_bytes) {
+                Ok(v) => v,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(stop_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args(err_cmd)));
+            };
+            let stop = match parse_isize_from_bulk(stop_bytes) {
+                Ok(v) => v,
+                Err(e) => return Ok(Some(e)),
+            };
+
+            let mut withscores = false;
+            if let Some(opt) = iter.next() {
+                let upper_opt = match std::str::from_utf8(&opt) {
+                    Ok(s) => s.to_ascii_uppercase(),
+                    Err(_) => return Ok(Some(err_syntax())),
+                };
+                if upper_opt == "WITHSCORES" {
+                    withscores = true;
+                } else {
+                    return Ok(Some(err_syntax()));
+                }
+                if iter.next().is_some() {
+                    return Ok(Some(err_wrong_args(err_cmd)));
+                }
+            }
+
+            Command::Zrange {
+                key,
+                start,
+                stop,
+                withscores,
+                rev: is_rev,
+            }
+        }
+        "ZSCORE" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zscore")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(member_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zscore")));
+            };
+            let member = match parse_bulk_string(member_bytes) {
+                Ok(m) => m,
+                Err(e) => return Ok(Some(e)),
+            };
+
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("zscore")));
+            }
+
+            Command::Zscore { key, member }
+        }
+        "ZREM" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zrem")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+
+            let mut members: Vec<String> = Vec::new();
+            for member_bytes in iter {
+                let m = match parse_bulk_string(member_bytes) {
+                    Ok(v) => v,
+                    Err(e) => return Ok(Some(e)),
+                };
+                members.push(m);
+            }
+
+            if members.is_empty() {
+                return Ok(Some(err_wrong_args("zrem")));
+            }
+
+            Command::Zrem { key, members }
+        }
+        "ZINCRBY" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zincrby")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(incr_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zincrby")));
+            };
+            let increment = match parse_f64_from_bulk(incr_bytes) {
+                Ok(v) => v,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(member_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zincrby")));
+            };
+            let member = match parse_bulk_string(member_bytes) {
+                Ok(m) => m,
+                Err(e) => return Ok(Some(e)),
+            };
+
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("zincrby")));
+            }
+
+            Command::Zincrby {
+                key,
+                increment,
+                member,
+            }
+        }
+        "SAVE" => {
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("save")));
+            }
+            Command::Save
+        }
+        "BGSAVE" => {
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("bgsave")));
+            }
+            Command::Bgsave
+        }
+        "LASTSAVE" => {
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("lastsave")));
+            }
+            Command::Lastsave
         }
         "KEYS" => {
             let Some(pattern_bytes) = iter.next() else {

@@ -1013,6 +1013,7 @@ impl TestClient {
 
 #[tokio::test]
 async fn basic_dbsize_behaviour() {
+    std::env::set_var("REDUST_DISABLE_PERSISTENCE", "1");
     let (addr, _shutdown, _handle) = spawn_server().await;
 
     let mut client = TestClient::connect(addr).await;
