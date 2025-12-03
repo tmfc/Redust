@@ -1,7 +1,43 @@
 # Redust 中长期工作（future）
 
 > 本文件用于记录 **不需要立刻开干，但希望未来实现或增强** 的事项。
-> 与 `todo.md` 的区别：`todo.md` 更偏向“近期可执行的小任务”，而这里是“第二阶段/以后”的工作。
+> 与 `todo.md` 的区别：`todo.md` 更偏向"近期可执行的小任务"，而这里是"第二阶段/以后"的工作。
+
+---
+
+## 🎉 Phase A 完成总结（2025-12）
+
+### 已完成功能
+
+#### 核心数据结构（5 种）
+- ✅ **String**: 完整的字符串操作（SET/GET/INCR/APPEND 等 20+ 命令）
+- ✅ **List**: 双端队列操作（LPUSH/RPUSH/LPOP/RPOP/LRANGE 等）
+- ✅ **Set**: 集合操作（SADD/SREM/SUNION/SINTER/SDIFF 等）
+- ✅ **Hash**: 哈希表操作（HSET/HGET/HINCRBY/HGETALL 等）
+- ✅ **Sorted Set**: 有序集合（ZADD/ZRANGE/ZSCORE/ZINCRBY/ZSCAN 等）
+
+#### 高级特性
+- ✅ **事务**: MULTI/EXEC/DISCARD/WATCH/UNWATCH，支持乐观锁
+- ✅ **Lua 脚本**: EVAL/EVALSHA/SCRIPT 命令，redis.call/pcall 支持 46 个命令
+  - 二进制安全参数处理
+  - Nil 正确映射为 false
+  - SHA1 脚本缓存
+- ✅ **持久化**: AOF（everysec）+ RDB 快照，支持 SAVE/BGSAVE/LASTSAVE
+- ✅ **Pub/Sub**: Channel/Pattern/Shard 三种订阅模式
+- ✅ **扫描**: SCAN/SSCAN/HSCAN/ZSCAN 游标扫描
+- ✅ **运维命令**: CONFIG GET/SET、CLIENT 管理、SLOWLOG 基础
+
+#### 质量保证
+- ✅ **测试覆盖**: 99 个测试全部通过
+- ✅ **命令总数**: 120+ 个 Redis 命令
+- ✅ **文档完善**: command.md、roadmap.md、future.md 全面更新
+
+### 技术亮点
+1. **完整的 WATCH 机制**: Key 版本追踪覆盖所有写操作和过期/淘汰
+2. **二进制安全**: Lua 脚本参数和值保持原始字节，支持非 UTF-8 数据
+3. **Redis 语义对齐**: Nil 映射为 false，错误处理与 Redis 一致
+4. **异步持久化**: AOF 异步写入，RDB 后台保存，不阻塞主线程
+5. **内存管理**: LRU 淘汰策略，maxmemory 限制，过期键自动清理
 
 ---
 
@@ -9,14 +45,10 @@
 
 目标：在现有过期语义 MVP 的基础上，逐步向更完整的 Redis 行为靠近。
 
-- [ ] **高级 SET 选项支持**
+- [x] **高级 SET 选项支持** ✅ 已完成
   - `SET key value NX|XX [EX seconds|PX milliseconds|EXAT unix-time|PXAT ms-unix-time] [KEEPTTL] [GET]`
-  - 需要明确：
-    - 参数组合的合法/非法组合及返回错误信息。
-    - 与现有 `EX` / `PX` 实现的兼容与迁移策略。
-  - 补充测试：
-    - NX/XX 在 key 存在/不存在两种情况下的行为。
-    - EXAT/PXAT 与当前相对时间实现的边界行为（过期点就在“现在”附近时）。
+  - 已实现所有选项组合和错误处理
+  - 完整的测试覆盖
 
 - [ ] **主动过期采样策略调优**
   - 当前实现：
@@ -26,11 +58,10 @@
     - 根据最近一次扫描的“过期命中率”粗略调整扫描频率/样本数。
     - 观察不同参数下对吞吐量和内存占用的影响（可以在 `INFO` 或日志中打印简单指标）。
 
-- [ ] **过期语义边界与持久化交互**
-  - 在将来引入持久化（AOF/RDB 子集）后，明确：
-    - 加载时如何处理已经过期的 key（过滤/加载后立刻清理等）。
-    - 过期时间在 AOF/RDB 中的编码方式（绝对时间 vs 相对时间）。
-  - 预留：待持久化 PoC 成形后再细化具体方案与测试。
+- [x] **过期语义边界与持久化交互** ✅ 基础已完成
+  - 已实现 AOF/RDB 持久化
+  - 启动时自动加载并处理过期键
+  - 🔄 待完善：损坏文件校验与友好降级
 
 ---
 

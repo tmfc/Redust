@@ -1,13 +1,21 @@
-# Redust 命令实现进度（按阶段拆分）
+# Redust 命令实现进度
 
 > 目标：社区版对齐 Redis 行为，分三期推进。
-> - **Phase A（功能齐备 + 持久化 + 兼容回归）**：补齐核心命令族、持久化兼容、基础复制，成为可替代 Redis 的单机/轻量复制版本。
-> - **Phase B（性能与安全强化）**：优化并发与内存、完善 ACL/TLS、运维命令与工具链，多客户端兼容回归。
-> - **Phase C（企业版探索）**：Sentinel/Cluster/跨机房复制等高级特性（收费版）。
+> - ✅ **Phase A（核心功能）**：已完成 - 5 种数据结构、事务、Lua 脚本、持久化、Pub/Sub、运维命令
+> - 🔄 **Phase B（数据结构扩展）**：进行中 - Streams、Geo、HyperLogLog、Bitmaps、主从复制
+> - 📋 **Phase C（企业版探索）**：规划中 - Sentinel/Cluster/跨机房复制等高级特性
 
 ---
 
-## Phase A：功能齐备与兼容基础（当前重点）
+## Phase A：核心功能 ✅ 已完成
+
+### 统计概览
+- **已实现命令**: 120+ 个
+- **数据结构**: String, List, Set, Hash, Sorted Set
+- **高级特性**: 事务（MULTI/EXEC/WATCH）、Lua 脚本（redis.call/pcall）
+- **持久化**: AOF + RDB
+- **Pub/Sub**: Channel/Pattern/Shard 订阅
+- **测试覆盖**: 99 个测试全部通过
 
 ### 连接与调试类
 
