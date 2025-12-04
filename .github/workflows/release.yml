@@ -11,6 +11,7 @@ on:
 jobs:
   build-and-release:
     name: Build and Release (Linux)
+    needs: build-windows
     runs-on: ubuntu-latest
 
     steps:
@@ -52,6 +53,16 @@ jobs:
           mkdir -p dist
           cp target/release/redust dist/redust-linux-x86_64
 
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: redust-windows-x86_64
+          path: dist
+
+      - name: Rename Windows binary
+        run: |
+          mv dist/redust.exe dist/redust-windows-x86_64.exe
+
       - name: Generate changelog
         run: |
           # 找到上一个 tag（不包括当前 tag）
@@ -77,6 +88,7 @@ jobs:
         with:
           files: |
             dist/redust-linux-x86_64
+            dist/redust-windows-x86_64.exe
           body_path: changelog.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
