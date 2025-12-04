@@ -11,6 +11,9 @@
 - ✅ 阻塞列表命令：BLPOP、BRPOP（轮询实现）
 - ✅ HyperLogLog 稀疏表示优化：节省 90%+ 内存（小基数场景）
 
+### 模式匹配增强
+- ✅ `[^abc]` 取反字符集支持（KEYS/SCAN 命令）
+
 ### 命令补全批次
 - ✅ Hash 命令：HSETNX、HSTRLEN、HMSET
 - ✅ List 命令：LTRIM、LSET、LINSERT、RPOPLPUSH、LPOS

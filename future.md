@@ -288,9 +288,9 @@ enum HllRepr {
 
 > 现状：`SCAN`/`KEYS`/`SSCAN`/`HSCAN`/`ZSCAN` 已实现基础功能，`pattern_match` 支持 `*`、`?`、`[abc]`、`[a-z]`、`\` 转义等 glob 语法。
 
-- [ ] **`[^abc]` 取反字符集支持**
+- [x] **`[^abc]` 取反字符集支持** ✅ 已完成（2025-12）
   - Redis 支持 `[^abc]` 表示"不匹配 a/b/c 中任一字符"。
-  - 当前 `pattern_match` 未实现取反逻辑，需在 `match_set` 中增加对 `^` 前缀的处理。
+  - 已在 `match_set` 中增加对 `^` 前缀的处理，支持取反字符集和取反范围。
 
 - [ ] **SCAN TYPE 选项**
   - Redis 6.0+ 支持 `SCAN cursor TYPE string|list|set|hash|zset` 按类型过滤。

@@ -286,10 +286,19 @@ fn pattern_match(pattern: &str, value: &str) -> bool {
     fn match_set(p: &[u8], ch: u8) -> Option<(bool, usize)> {
         let mut ranges: Vec<(u8, u8)> = Vec::new();
         let mut i = 1; // skip '['
+        
+        // 检查是否是取反字符集 [^...]
+        let negate = i < p.len() && p[i] == b'^';
+        if negate {
+            i += 1;
+        }
+        
         while i < p.len() {
             if p[i] == b']' {
                 let matched = ranges.iter().any(|(s, e)| ch >= *s && ch <= *e);
-                return Some((matched, i + 1));
+                // 如果是取反，则反转匹配结果
+                let result = if negate { !matched } else { matched };
+                return Some((result, i + 1));
             }
 
             let mut start = p[i];

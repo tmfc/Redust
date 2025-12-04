@@ -478,6 +478,13 @@ async fn keys_glob_character_set() {
     keys_sorted.sort();
     assert_eq!(keys_sorted, vec!["xa", "xb", "xc"]);
 
+    // KEYS x[^abc] 应该匹配 xd, xe（取反字符集）
+    client.send_array(&["KEYS", "x[^abc]"]).await;
+    let keys = client.read_array_of_bulk().await;
+    let mut keys_sorted = keys.clone();
+    keys_sorted.sort();
+    assert_eq!(keys_sorted, vec!["xd", "xe"]);
+
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
 }
@@ -513,6 +520,13 @@ async fn keys_glob_character_range() {
     let mut keys_sorted = keys.clone();
     keys_sorted.sort();
     assert_eq!(keys_sorted, vec!["k0", "k5"]);
+
+    // KEYS k[^0-9] 应该匹配 ka, kz, kA（取反范围：非数字）
+    client.send_array(&["KEYS", "k[^0-9]"]).await;
+    let keys = client.read_array_of_bulk().await;
+    let mut keys_sorted = keys.clone();
+    keys_sorted.sort();
+    assert_eq!(keys_sorted, vec!["kA", "ka", "kz"]);
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
