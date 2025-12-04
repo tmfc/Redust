@@ -2413,6 +2413,16 @@ async fn test_generic_commands() {
     let resp = read_line_helper(&mut reader).await;
     assert_eq!(resp, ":0\r\n");
 
+    // COPY source == destination 应返回错误
+    send_array(&mut write_half, &["COPY", "key1", "key1"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert!(resp.starts_with("-ERR"));
+
+    // COPY source == destination with REPLACE 也应返回错误
+    send_array(&mut write_half, &["COPY", "key1", "key1", "REPLACE"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert!(resp.starts_with("-ERR"));
+
     // COPY REPLACE
     send_array(&mut write_half, &["SET", "key1", "newvalue"]).await;
     let _ = read_line_helper(&mut reader).await;

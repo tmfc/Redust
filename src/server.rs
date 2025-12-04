@@ -926,7 +926,7 @@ async fn handle_string_command(
             match storage.copy(&src_physical, &dst_physical, replace) {
                 Ok(true) => respond_integer(writer, 1).await?,
                 Ok(false) => respond_integer(writer, 0).await?,
-                Err(()) => respond_error(writer, "ERR source key does not exist").await?,
+                Err(()) => respond_error(writer, "ERR source and destination objects are the same").await?,
             }
         }
         Command::Touch { keys } => {

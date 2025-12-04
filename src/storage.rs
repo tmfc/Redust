@@ -1032,7 +1032,13 @@ impl Storage {
     }
 
     /// COPY: 复制 key 到新 key
+    /// 返回 Err(()) 表示 source 和 destination 相同（非法操作）
     pub fn copy(&self, source: &str, destination: &str, replace: bool) -> Result<bool, ()> {
+        // Redis 语义：source 和 destination 相同时返回错误
+        if source == destination {
+            return Err(());
+        }
+
         let now = Instant::now();
         if self.remove_if_expired(source, now) {
             return Ok(false); // source 不存在
