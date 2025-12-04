@@ -1329,7 +1329,8 @@ async fn handle_list_command(
                 // 检查是否超时
                 if let Some(timeout_dur) = timeout_duration {
                     if start.elapsed() >= timeout_dur {
-                        respond_null_bulk(writer).await?;
+                        // BLPOP/BRPOP 超时返回 null array (*-1)，而非 null bulk ($-1)
+                        writer.write_all(b"*-1\r\n").await?;
                         return Ok(());
                     }
                 }
@@ -1404,7 +1405,8 @@ async fn handle_list_command(
             loop {
                 if let Some(timeout_dur) = timeout_duration {
                     if start.elapsed() >= timeout_dur {
-                        respond_null_bulk(writer).await?;
+                        // BLPOP/BRPOP 超时返回 null array (*-1)，而非 null bulk ($-1)
+                        writer.write_all(b"*-1\r\n").await?;
                         return Ok(());
                     }
                 }

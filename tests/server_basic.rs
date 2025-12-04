@@ -2628,7 +2628,7 @@ async fn test_blocking_list_commands() {
     
     send_array(&mut write_half, &["BLPOP", "emptylist", "0.2"]).await;
     let resp = read_line_helper(&mut reader).await;
-    assert_eq!(resp, "$-1\r\n"); // null bulk
+    assert_eq!(resp, "*-1\r\n"); // null array (Redis 协议规范)
 
     // BLPOP - 多个 key，返回第一个有数据的
     send_array(&mut write_half, &["RPUSH", "list2", "x"]).await;
