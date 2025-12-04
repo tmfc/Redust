@@ -1,217 +1,258 @@
 /// HyperLogLog 命令集成测试
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use std::net::SocketAddr;
 
-const TEST_ADDR: &str = "127.0.0.1:16379";
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
 
-async fn send_command(stream: &mut TcpStream, cmd: &str) -> String {
-    stream.write_all(cmd.as_bytes()).await.unwrap();
-    let mut buf = vec![0u8; 4096];
-    let n = stream.read(&mut buf).await.unwrap();
-    String::from_utf8_lossy(&buf[..n]).to_string()
+use redust::server::serve;
+
+async fn spawn_server() -> (
+    SocketAddr,
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<tokio::io::Result<()>>,
+) {
+    std::env::set_var("REDUST_DISABLE_PERSISTENCE", "1");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
+    let addr = listener.local_addr().expect("local addr");
+    let (tx, rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        serve(listener, async move {
+            let _ = rx.await;
+        })
+        .await
+    });
+    (addr, tx, handle)
+}
+
+async fn send_array(writer: &mut tokio::net::tcp::OwnedWriteHalf, parts: &[&str]) {
+    let mut buf = format!("*{}\r\n", parts.len());
+    for p in parts {
+        buf.push_str(&format!("${}\r\n{}\r\n", p.len(), p));
+    }
+    writer.write_all(buf.as_bytes()).await.unwrap();
+}
+
+async fn read_line(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> String {
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    line
 }
 
 #[tokio::test]
 async fn test_pfadd_basic() {
-    let mut stream = TcpStream::connect(TEST_ADDR).await.unwrap();
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
 
     // PFADD 添加元素应该返回 1（表示 HLL 被修改）
-    let resp = send_command(&mut stream, "*3\r\n$5\r\nPFADD\r\n$6\r\ntesthll\r\n$5\r\nhello\r\n").await;
-    assert!(resp.contains(":1\r\n"), "Expected :1, got: {}", resp);
+    send_array(&mut write_half, &["PFADD", "testhll", "hello"]).await;
+    let resp = read_line(&mut reader).await;
+    assert_eq!(resp, ":1\r\n");
 
-    // 再次添加相同元素可能返回 0（未修改）或 1（修改）
-    let resp = send_command(&mut stream, "*3\r\n$5\r\nPFADD\r\n$6\r\ntesthll\r\n$5\r\nhello\r\n").await;
-    assert!(resp.contains(":0\r\n") || resp.contains(":1\r\n"), "Expected :0 or :1, got: {}", resp);
+    // 再次添加相同元素应该返回 0（未修改）
+    send_array(&mut write_half, &["PFADD", "testhll", "hello"]).await;
+    let resp = read_line(&mut reader).await;
+    assert!(resp == ":0\r\n" || resp == ":1\r\n", "Expected :0 or :1, got: {}", resp);
 
-    // 清理
-    send_command(&mut stream, "*2\r\n$3\r\nDEL\r\n$7\r\ntesthll\r\n").await;
+    let _ = shutdown.send(());
 }
 
 #[tokio::test]
 async fn test_pfadd_multiple_elements() {
-    let mut stream = TcpStream::connect(TEST_ADDR).await.unwrap();
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
 
     // PFADD 添加多个元素
-    let resp = send_command(
-        &mut stream,
-        "*5\r\n$5\r\nPFADD\r\n$7\r\nmultihll\r\n$2\r\na1\r\n$2\r\na2\r\n$2\r\na3\r\n",
-    )
-    .await;
-    assert!(resp.contains(":1\r\n"), "Expected :1, got: {}", resp);
+    send_array(&mut write_half, &["PFADD", "multihll", "a1", "a2", "a3"]).await;
+    let resp = read_line(&mut reader).await;
+    assert_eq!(resp, ":1\r\n");
 
-    // 清理
-    send_command(&mut stream, "*2\r\n$3\r\nDEL\r\n$8\r\nmultihll\r\n").await;
+    let _ = shutdown.send(());
 }
 
 #[tokio::test]
 async fn test_pfcount_single_key() {
-    let mut stream = TcpStream::connect(TEST_ADDR).await.unwrap();
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
 
     // 添加 100 个不同元素
     for i in 0..100 {
-        let cmd = format!("*3\r\n$5\r\nPFADD\r\n$8\r\ncounthll\r\n$7\r\nelem_{:03}\r\n", i);
-        send_command(&mut stream, &cmd).await;
+        let elem = format!("elem_{:03}", i);
+        send_array(&mut write_half, &["PFADD", "counthll", &elem]).await;
+        let _ = read_line(&mut reader).await;
     }
 
     // PFCOUNT 应该返回接近 100 的值
-    let resp = send_command(&mut stream, "*2\r\n$7\r\nPFCOUNT\r\n$8\r\ncounthll\r\n").await;
+    send_array(&mut write_half, &["PFCOUNT", "counthll"]).await;
+    let resp = read_line(&mut reader).await;
     
     // 解析返回的整数
-    if let Some(start) = resp.find(':') {
-        if let Some(end) = resp[start..].find("\r\n") {
-            let count_str = &resp[start + 1..start + end];
-            if let Ok(count) = count_str.parse::<i64>() {
-                assert!(count >= 95 && count <= 105, "Expected count near 100, got: {}", count);
-            } else {
-                panic!("Failed to parse count: {}", count_str);
-            }
-        }
-    }
+    let count: i64 = resp.trim().trim_start_matches(':').parse().unwrap();
+    assert!(count >= 95 && count <= 105, "Expected count near 100, got: {}", count);
 
-    // 清理
-    send_command(&mut stream, "*2\r\n$3\r\nDEL\r\n$8\r\ncounthll\r\n").await;
+    let _ = shutdown.send(());
 }
 
 #[tokio::test]
 async fn test_pfcount_empty_key() {
-    let mut stream = TcpStream::connect(TEST_ADDR).await.unwrap();
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
 
     // PFCOUNT 不存在的 key 应该返回 0
-    let resp = send_command(&mut stream, "*2\r\n$7\r\nPFCOUNT\r\n$9\r\nemptyhll1\r\n").await;
-    assert!(resp.contains(":0\r\n"), "Expected :0, got: {}", resp);
+    send_array(&mut write_half, &["PFCOUNT", "emptyhll"]).await;
+    let resp = read_line(&mut reader).await;
+    assert_eq!(resp, ":0\r\n");
+
+    let _ = shutdown.send(());
 }
 
 #[tokio::test]
 async fn test_pfcount_multiple_keys() {
-    let mut stream = TcpStream::connect(TEST_ADDR).await.unwrap();
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
 
     // 创建两个 HLL，有部分重叠
     for i in 0..50 {
-        let cmd = format!("*3\r\n$5\r\nPFADD\r\n$5\r\nhll_a\r\n$7\r\nelem_{:03}\r\n", i);
-        send_command(&mut stream, &cmd).await;
+        let elem = format!("elem_{:03}", i);
+        send_array(&mut write_half, &["PFADD", "hll_a", &elem]).await;
+        let _ = read_line(&mut reader).await;
     }
 
     for i in 25..75 {
-        let cmd = format!("*3\r\n$5\r\nPFADD\r\n$5\r\nhll_b\r\n$7\r\nelem_{:03}\r\n", i);
-        send_command(&mut stream, &cmd).await;
+        let elem = format!("elem_{:03}", i);
+        send_array(&mut write_half, &["PFADD", "hll_b", &elem]).await;
+        let _ = read_line(&mut reader).await;
     }
 
     // PFCOUNT 两个 key 应该返回接近 75 的值（并集）
-    let resp = send_command(&mut stream, "*3\r\n$7\r\nPFCOUNT\r\n$5\r\nhll_a\r\n$5\r\nhll_b\r\n").await;
+    send_array(&mut write_half, &["PFCOUNT", "hll_a", "hll_b"]).await;
+    let resp = read_line(&mut reader).await;
     
-    if let Some(start) = resp.find(':') {
-        if let Some(end) = resp[start..].find("\r\n") {
-            let count_str = &resp[start + 1..start + end];
-            if let Ok(count) = count_str.parse::<i64>() {
-                assert!(count >= 70 && count <= 80, "Expected count near 75, got: {}", count);
-            }
-        }
-    }
+    let count: i64 = resp.trim().trim_start_matches(':').parse().unwrap();
+    assert!(count >= 70 && count <= 80, "Expected count near 75, got: {}", count);
 
-    // 清理
-    send_command(&mut stream, "*3\r\n$3\r\nDEL\r\n$5\r\nhll_a\r\n$5\r\nhll_b\r\n").await;
+    let _ = shutdown.send(());
 }
 
 #[tokio::test]
 async fn test_pfmerge() {
-    let mut stream = TcpStream::connect(TEST_ADDR).await.unwrap();
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
 
     // 创建两个 HLL
     for i in 0..30 {
-        let cmd = format!("*3\r\n$5\r\nPFADD\r\n$7\r\nmerge_a\r\n$7\r\nelem_{:03}\r\n", i);
-        send_command(&mut stream, &cmd).await;
+        let elem = format!("elem_{:03}", i);
+        send_array(&mut write_half, &["PFADD", "merge_a", &elem]).await;
+        let _ = read_line(&mut reader).await;
     }
 
     for i in 20..50 {
-        let cmd = format!("*3\r\n$5\r\nPFADD\r\n$7\r\nmerge_b\r\n$7\r\nelem_{:03}\r\n", i);
-        send_command(&mut stream, &cmd).await;
+        let elem = format!("elem_{:03}", i);
+        send_array(&mut write_half, &["PFADD", "merge_b", &elem]).await;
+        let _ = read_line(&mut reader).await;
     }
 
     // PFMERGE 合并到新 key
-    let resp = send_command(
-        &mut stream,
-        "*4\r\n$7\r\nPFMERGE\r\n$8\r\nmerge_ab\r\n$7\r\nmerge_a\r\n$7\r\nmerge_b\r\n",
-    )
-    .await;
-    assert!(resp.contains("+OK\r\n"), "Expected +OK, got: {}", resp);
+    send_array(&mut write_half, &["PFMERGE", "merge_ab", "merge_a", "merge_b"]).await;
+    let resp = read_line(&mut reader).await;
+    assert_eq!(resp, "+OK\r\n");
 
     // 验证合并后的基数接近 50
-    let resp = send_command(&mut stream, "*2\r\n$7\r\nPFCOUNT\r\n$8\r\nmerge_ab\r\n").await;
+    send_array(&mut write_half, &["PFCOUNT", "merge_ab"]).await;
+    let resp = read_line(&mut reader).await;
     
-    if let Some(start) = resp.find(':') {
-        if let Some(end) = resp[start..].find("\r\n") {
-            let count_str = &resp[start + 1..start + end];
-            if let Ok(count) = count_str.parse::<i64>() {
-                assert!(count >= 45 && count <= 55, "Expected count near 50, got: {}", count);
-            }
-        }
-    }
+    let count: i64 = resp.trim().trim_start_matches(':').parse().unwrap();
+    assert!(count >= 45 && count <= 55, "Expected count near 50, got: {}", count);
 
-    // 清理
-    send_command(&mut stream, "*4\r\n$3\r\nDEL\r\n$7\r\nmerge_a\r\n$7\r\nmerge_b\r\n$8\r\nmerge_ab\r\n").await;
+    let _ = shutdown.send(());
 }
 
 #[tokio::test]
 async fn test_pfadd_wrongtype() {
-    let mut stream = TcpStream::connect(TEST_ADDR).await.unwrap();
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
 
     // 先创建一个字符串 key
-    send_command(&mut stream, "*3\r\n$3\r\nSET\r\n$9\r\nstringkey\r\n$5\r\nvalue\r\n").await;
+    send_array(&mut write_half, &["SET", "stringkey", "value"]).await;
+    let _ = read_line(&mut reader).await;
 
     // 尝试对字符串 key 执行 PFADD 应该返回 WRONGTYPE 错误
-    let resp = send_command(&mut stream, "*3\r\n$5\r\nPFADD\r\n$9\r\nstringkey\r\n$4\r\nelem\r\n").await;
+    send_array(&mut write_half, &["PFADD", "stringkey", "elem"]).await;
+    let resp = read_line(&mut reader).await;
     assert!(resp.contains("WRONGTYPE"), "Expected WRONGTYPE error, got: {}", resp);
 
-    // 清理
-    send_command(&mut stream, "*2\r\n$3\r\nDEL\r\n$9\r\nstringkey\r\n").await;
+    let _ = shutdown.send(());
 }
 
 #[tokio::test]
 async fn test_pfcount_wrongtype() {
-    let mut stream = TcpStream::connect(TEST_ADDR).await.unwrap();
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
 
     // 先创建一个列表 key
-    send_command(&mut stream, "*3\r\n$5\r\nLPUSH\r\n$7\r\nlistkey\r\n$4\r\nitem\r\n").await;
+    send_array(&mut write_half, &["LPUSH", "listkey", "item"]).await;
+    let _ = read_line(&mut reader).await;
 
     // 尝试对列表 key 执行 PFCOUNT 应该返回 WRONGTYPE 错误
-    let resp = send_command(&mut stream, "*2\r\n$7\r\nPFCOUNT\r\n$7\r\nlistkey\r\n").await;
+    send_array(&mut write_half, &["PFCOUNT", "listkey"]).await;
+    let resp = read_line(&mut reader).await;
     assert!(resp.contains("WRONGTYPE"), "Expected WRONGTYPE error, got: {}", resp);
 
-    // 清理
-    send_command(&mut stream, "*2\r\n$3\r\nDEL\r\n$7\r\nlistkey\r\n").await;
+    let _ = shutdown.send(());
 }
 
 #[tokio::test]
 async fn test_pfmerge_wrongtype() {
-    let mut stream = TcpStream::connect(TEST_ADDR).await.unwrap();
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
 
     // 创建一个 HLL 和一个集合
-    send_command(&mut stream, "*3\r\n$5\r\nPFADD\r\n$8\r\nhllkey_1\r\n$4\r\nelem\r\n").await;
-    send_command(&mut stream, "*3\r\n$4\r\nSADD\r\n$6\r\nsetkey\r\n$6\r\nmember\r\n").await;
+    send_array(&mut write_half, &["PFADD", "hllkey_1", "elem"]).await;
+    let _ = read_line(&mut reader).await;
+    send_array(&mut write_half, &["SADD", "setkey", "member"]).await;
+    let _ = read_line(&mut reader).await;
 
     // 尝试合并 HLL 和集合应该返回 WRONGTYPE 错误
-    let resp = send_command(
-        &mut stream,
-        "*4\r\n$7\r\nPFMERGE\r\n$8\r\nhllkey_2\r\n$8\r\nhllkey_1\r\n$6\r\nsetkey\r\n",
-    )
-    .await;
+    send_array(&mut write_half, &["PFMERGE", "hllkey_2", "hllkey_1", "setkey"]).await;
+    let resp = read_line(&mut reader).await;
     assert!(resp.contains("WRONGTYPE"), "Expected WRONGTYPE error, got: {}", resp);
 
-    // 清理
-    send_command(&mut stream, "*3\r\n$3\r\nDEL\r\n$8\r\nhllkey_1\r\n$6\r\nsetkey\r\n").await;
+    let _ = shutdown.send(());
 }
 
 #[tokio::test]
 async fn test_type_command_for_hll() {
-    let mut stream = TcpStream::connect(TEST_ADDR).await.unwrap();
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
 
     // 创建一个 HLL
-    send_command(&mut stream, "*3\r\n$5\r\nPFADD\r\n$7\r\ntypehll\r\n$4\r\nelem\r\n").await;
+    send_array(&mut write_half, &["PFADD", "typehll", "elem"]).await;
+    let _ = read_line(&mut reader).await;
 
     // TYPE 命令应该返回 "string"（Redis 中 HLL 的类型显示为 string）
-    let resp = send_command(&mut stream, "*2\r\n$4\r\nTYPE\r\n$7\r\ntypehll\r\n").await;
-    assert!(resp.contains("+string\r\n"), "Expected +string, got: {}", resp);
+    send_array(&mut write_half, &["TYPE", "typehll"]).await;
+    let resp = read_line(&mut reader).await;
+    assert_eq!(resp, "+string\r\n");
 
-    // 清理
-    send_command(&mut stream, "*2\r\n$3\r\nDEL\r\n$7\r\ntypehll\r\n").await;
+    let _ = shutdown.send(());
 }
