@@ -109,3 +109,9 @@ jobs:
 
       - name: Build (release)
         run: cargo build --release
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: redust-windows-x86_64
+          path: target/release/redust.exe
