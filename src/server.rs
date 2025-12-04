@@ -1284,6 +1284,157 @@ async fn handle_list_command(
                 }
             }
         }
+        Command::Blpop { keys, timeout } => {
+            let physical_keys: Vec<String> = keys
+                .iter()
+                .map(|k| prefix_key(current_db, k))
+                .collect();
+            
+            // 先尝试立即获取
+            for (i, physical) in physical_keys.iter().enumerate() {
+                match storage.lpop(physical) {
+                    Ok(Some(value)) => {
+                        // 返回 [key, value] 数组
+                        let key = &keys[i];
+                        let response = format!(
+                            "*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                            key.len(), key, value.len(), value
+                        );
+                        writer.write_all(response.as_bytes()).await?;
+                        return Ok(());
+                    }
+                    Ok(None) => continue,
+                    Err(()) => {
+                        respond_error(
+                            writer,
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            }
+            
+            // 如果 timeout 为 0，无限等待；否则等待指定时间
+            let timeout_duration = if timeout == 0.0 {
+                None
+            } else {
+                Some(std::time::Duration::from_secs_f64(timeout))
+            };
+            
+            let poll_interval = std::time::Duration::from_millis(100);
+            let start = std::time::Instant::now();
+            
+            loop {
+                // 检查是否超时
+                if let Some(timeout_dur) = timeout_duration {
+                    if start.elapsed() >= timeout_dur {
+                        respond_null_bulk(writer).await?;
+                        return Ok(());
+                    }
+                }
+                
+                // 等待一小段时间后重试
+                tokio::time::sleep(poll_interval).await;
+                
+                // 再次尝试获取
+                for (i, physical) in physical_keys.iter().enumerate() {
+                    match storage.lpop(physical) {
+                        Ok(Some(value)) => {
+                            let key = &keys[i];
+                            let response = format!(
+                                "*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                                key.len(), key, value.len(), value
+                            );
+                            writer.write_all(response.as_bytes()).await?;
+                            return Ok(());
+                        }
+                        Ok(None) => continue,
+                        Err(()) => {
+                            respond_error(
+                                writer,
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+        Command::Brpop { keys, timeout } => {
+            let physical_keys: Vec<String> = keys
+                .iter()
+                .map(|k| prefix_key(current_db, k))
+                .collect();
+            
+            // 先尝试立即获取
+            for (i, physical) in physical_keys.iter().enumerate() {
+                match storage.rpop(physical) {
+                    Ok(Some(value)) => {
+                        let key = &keys[i];
+                        let response = format!(
+                            "*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                            key.len(), key, value.len(), value
+                        );
+                        writer.write_all(response.as_bytes()).await?;
+                        return Ok(());
+                    }
+                    Ok(None) => continue,
+                    Err(()) => {
+                        respond_error(
+                            writer,
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            }
+            
+            let timeout_duration = if timeout == 0.0 {
+                None
+            } else {
+                Some(std::time::Duration::from_secs_f64(timeout))
+            };
+            
+            let poll_interval = std::time::Duration::from_millis(100);
+            let start = std::time::Instant::now();
+            
+            loop {
+                if let Some(timeout_dur) = timeout_duration {
+                    if start.elapsed() >= timeout_dur {
+                        respond_null_bulk(writer).await?;
+                        return Ok(());
+                    }
+                }
+                
+                tokio::time::sleep(poll_interval).await;
+                
+                for (i, physical) in physical_keys.iter().enumerate() {
+                    match storage.rpop(physical) {
+                        Ok(Some(value)) => {
+                            let key = &keys[i];
+                            let response = format!(
+                                "*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                                key.len(), key, value.len(), value
+                            );
+                            writer.write_all(response.as_bytes()).await?;
+                            return Ok(());
+                        }
+                        Ok(None) => continue,
+                        Err(()) => {
+                            respond_error(
+                                writer,
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
         Command::Llen { key } => {
             let physical = prefix_key(current_db, &key);
             match storage.llen(&physical) {
@@ -1734,6 +1885,21 @@ async fn handle_set_command(
                 Ok(len) => {
                     respond_integer(writer, len as i64).await?;
                 }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Smove { source, destination, member } => {
+            let src_physical = prefix_key(current_db, &source);
+            let dst_physical = prefix_key(current_db, &destination);
+            match storage.smove(&src_physical, &dst_physical, &member) {
+                Ok(true) => respond_integer(writer, 1).await?,
+                Ok(false) => respond_integer(writer, 0).await?,
                 Err(()) => {
                     respond_error(
                         writer,
@@ -3010,6 +3176,11 @@ async fn execute_command_in_transaction(
             handle_list_command(cmd, storage, writer, current_db).await?;
         }
 
+        // 阻塞命令在事务中不支持
+        Command::Blpop { .. } | Command::Brpop { .. } => {
+            respond_error(writer, "ERR BLPOP/BRPOP inside MULTI is not allowed").await?;
+        }
+
         // set 命令
         Command::Sadd { .. }
         | Command::Srem { .. }
@@ -3024,6 +3195,7 @@ async fn execute_command_in_transaction(
         | Command::Sunionstore { .. }
         | Command::Sinterstore { .. }
         | Command::Sdiffstore { .. }
+        | Command::Smove { .. }
         | Command::Sscan { .. } => {
             handle_set_command(cmd, storage, writer, current_db).await?;
         }
@@ -3432,6 +3604,8 @@ async fn handle_connection(
             | Command::Lset { .. }
             | Command::Linsert { .. }
             | Command::Rpoplpush { .. }
+            | Command::Blpop { .. }
+            | Command::Brpop { .. }
             | Command::Lpos { .. } => {
                 handle_list_command(cmd, &storage, &mut write_half, current_db).await?;
             }
@@ -3450,6 +3624,7 @@ async fn handle_connection(
             | Command::Sunionstore { .. }
             | Command::Sinterstore { .. }
             | Command::Sdiffstore { .. }
+            | Command::Smove { .. }
             | Command::Sscan { .. } => {
                 handle_set_command(cmd, &storage, &mut write_half, current_db).await?;
             }

@@ -2,17 +2,22 @@
 
 > 目标：在不包含 Sentinel/Cluster 等多服务器高可用特性的前提下，提供可替代 Redis 的生产可用单实例（可选轻量复制），兼容现有 Redis 客户端与协议习惯。
 
-### 一、协议与命令覆盖 ✅ Phase A 已完成
+### 一、协议与命令覆盖 ✅ Phase A+B 命令补全完成
 
 - ✅ **核心数据结构**：Strings/Lists/Sets/Hashes/Sorted Sets 已完整实现
-  - Sorted Sets: ZADD/ZRANGE/ZREVRANGE/ZREM/ZCARD/ZINCRBY/ZSCORE/ZSCAN
+  - Sorted Sets: ZADD/ZRANGE/ZREVRANGE/ZREM/ZCARD/ZINCRBY/ZSCORE/ZSCAN/ZCOUNT/ZRANK/ZREVRANK/ZPOPMIN/ZPOPMAX/ZINTER/ZUNION/ZDIFF/ZLEXCOUNT 及 STORE 变体
+  - Lists: LPUSH/RPUSH/LPOP/RPOP/LRANGE/LLEN/LINDEX/LREM/LTRIM/LSET/LINSERT/RPOPLPUSH/LPOS
+  - Hashes: HSET/HGET/HDEL/HEXISTS/HGETALL/HKEYS/HVALS/HLEN/HMGET/HMSET/HSETNX/HSTRLEN/HINCRBY/HINCRBYFLOAT/HSCAN
 - ✅ **事务与脚本**：MULTI/EXEC/DISCARD/WATCH/UNWATCH 已实现
   - Lua 脚本：EVAL/EVALSHA/SCRIPT LOAD/EXISTS/FLUSH
   - redis.call/pcall 回调支持 46 个命令（二进制安全）
 - ✅ **Pub/Sub**：已支持 channel/pattern/shard 子集与 PUBSUB 查询
 - ✅ **扫描命令**：SCAN/SSCAN/HSCAN/ZSCAN 已实现
 - ✅ **运维命令**：CONFIG GET/SET、CLIENT LIST/ID/SETNAME/GETNAME、SLOWLOG 基础
-- 🔄 **待补齐**：Streams、Geo、HyperLogLog、Bitmaps（Phase B）
+- ✅ **Generic 命令**：COPY/UNLINK/TOUCH/OBJECT ENCODING
+- ✅ **Expire 命令**：EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT/TTL/PTTL/EXPIRETIME/PEXPIRETIME/PERSIST
+- ✅ **HyperLogLog**：PFADD/PFCOUNT/PFMERGE
+- 🔄 **待补齐**：Streams、Geo、Bitmaps（Phase C）
 
 ### 二、持久化与数据安全 ✅ 基础已完成
 
@@ -55,11 +60,13 @@
 >   - 持久化（AOF + RDB）
 >   - Pub/Sub 与扫描命令
 >   - 基础运维命令
-> - 🔄 **Phase B（数据结构扩展）**：进行中
->   - Streams、Geo、HyperLogLog、Bitmaps
->   - 主从复制基础
+> - ✅ **Phase B（命令补全与 HyperLogLog）**：已完成（2025-12）
+>   - HyperLogLog：PFADD/PFCOUNT/PFMERGE
+>   - 命令补全：Hash/List/Sorted Set/Generic/Expire 共 25+ 命令
 >   - 性能优化与内存管理增强
-> - 📋 **Phase C（企业版探索）**：规划中
+> - 🔄 **Phase C（数据结构扩展与企业版探索）**：规划中
+>   - Streams、Geo、Bitmaps
+>   - 主从复制基础
 >   - Sentinel/Cluster/多副本 HA
 >   - 审计/更丰富 ACL、跨机房复制等收费特性
 

@@ -2519,3 +2519,126 @@ async fn test_expire_commands() {
 
     let _ = shutdown.send(());
 }
+
+#[tokio::test]
+async fn test_set_commands_extended() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 创建测试集合
+    send_array(&mut write_half, &["SADD", "set1", "a", "b", "c"]).await;
+    let _ = read_line_helper(&mut reader).await;
+    send_array(&mut write_half, &["SADD", "set2", "x", "y"]).await;
+    let _ = read_line_helper(&mut reader).await;
+
+    // SMOVE - 移动元素
+    send_array(&mut write_half, &["SMOVE", "set1", "set2", "a"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":1\r\n");
+
+    // 验证 a 已从 set1 移除
+    send_array(&mut write_half, &["SISMEMBER", "set1", "a"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":0\r\n");
+
+    // 验证 a 已添加到 set2
+    send_array(&mut write_half, &["SISMEMBER", "set2", "a"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":1\r\n");
+
+    // SMOVE - 元素不存在
+    send_array(&mut write_half, &["SMOVE", "set1", "set2", "notexist"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":0\r\n");
+
+    // SMOVE - source 不存在
+    send_array(&mut write_half, &["SMOVE", "noset", "set2", "x"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":0\r\n");
+
+    // SMOVE - destination 不存在（应自动创建）
+    send_array(&mut write_half, &["SMOVE", "set1", "newset", "b"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":1\r\n");
+    send_array(&mut write_half, &["SISMEMBER", "newset", "b"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":1\r\n");
+
+    // SPOP - 随机弹出
+    send_array(&mut write_half, &["SADD", "popset", "1", "2", "3"]).await;
+    let _ = read_line_helper(&mut reader).await;
+    send_array(&mut write_half, &["SPOP", "popset"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert!(resp.starts_with("$1\r\n")); // 弹出一个元素
+    let _ = read_line_helper(&mut reader).await; // 读取元素值
+
+    // SRANDMEMBER - 随机获取（不删除）
+    send_array(&mut write_half, &["SRANDMEMBER", "popset"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert!(resp.starts_with("$1\r\n"));
+    let _ = read_line_helper(&mut reader).await;
+
+    // SRANDMEMBER 获取多个
+    send_array(&mut write_half, &["SRANDMEMBER", "popset", "2"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert!(resp.starts_with("*")); // 数组响应
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_blocking_list_commands() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 先创建有数据的列表
+    send_array(&mut write_half, &["RPUSH", "mylist", "a", "b", "c"]).await;
+    let _ = read_line_helper(&mut reader).await;
+
+    // BLPOP - 立即返回（列表有数据）
+    send_array(&mut write_half, &["BLPOP", "mylist", "1"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "*2\r\n"); // 数组响应
+    let _ = read_line_helper(&mut reader).await; // $6
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "mylist\r\n");
+    let _ = read_line_helper(&mut reader).await; // $1
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "a\r\n");
+
+    // BRPOP - 立即返回
+    send_array(&mut write_half, &["BRPOP", "mylist", "1"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "*2\r\n");
+    let _ = read_line_helper(&mut reader).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "mylist\r\n");
+    let _ = read_line_helper(&mut reader).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "c\r\n"); // 从右边弹出
+
+    // BLPOP - 超时返回 null（列表为空后）
+    send_array(&mut write_half, &["LPOP", "mylist"]).await; // 清空列表
+    let _ = read_line_helper(&mut reader).await;
+    let _ = read_line_helper(&mut reader).await;
+    
+    send_array(&mut write_half, &["BLPOP", "emptylist", "0.2"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "$-1\r\n"); // null bulk
+
+    // BLPOP - 多个 key，返回第一个有数据的
+    send_array(&mut write_half, &["RPUSH", "list2", "x"]).await;
+    let _ = read_line_helper(&mut reader).await;
+    send_array(&mut write_half, &["BLPOP", "emptylist", "list2", "1"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "*2\r\n");
+    let _ = read_line_helper(&mut reader).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "list2\r\n"); // 返回 list2 的数据
+
+    let _ = shutdown.send(());
+}

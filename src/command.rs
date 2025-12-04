@@ -234,6 +234,14 @@ pub enum Command {
         source: String,
         destination: String,
     },
+    Blpop {
+        keys: Vec<String>,
+        timeout: f64,
+    },
+    Brpop {
+        keys: Vec<String>,
+        timeout: f64,
+    },
     Lpos {
         key: String,
         element: String,
@@ -287,6 +295,11 @@ pub enum Command {
     Sdiffstore {
         dest: String,
         keys: Vec<String>,
+    },
+    Smove {
+        source: String,
+        destination: String,
+        member: String,
     },
     Hset {
         key: String,
@@ -2507,6 +2520,62 @@ pub async fn read_command(
             }
             Command::Rpoplpush { source, destination }
         }
+        "BLPOP" => {
+            // BLPOP key [key ...] timeout
+            let mut keys = Vec::new();
+            let mut last_bytes: Option<Vec<u8>> = None;
+            for b in iter.by_ref() {
+                if let Some(prev) = last_bytes.take() {
+                    match parse_bulk_string(prev) {
+                        Ok(k) => keys.push(k),
+                        Err(e) => return Ok(Some(e)),
+                    }
+                }
+                last_bytes = Some(b);
+            }
+            let Some(timeout_bytes) = last_bytes else {
+                return Ok(Some(err_wrong_args("blpop")));
+            };
+            if keys.is_empty() {
+                return Ok(Some(err_wrong_args("blpop")));
+            }
+            let timeout = match parse_bulk_string(timeout_bytes.clone()) {
+                Ok(s) => match s.parse::<f64>() {
+                    Ok(t) if t >= 0.0 => t,
+                    _ => return Ok(Some(Command::Error("ERR timeout is not a float or out of range".to_string()))),
+                },
+                Err(e) => return Ok(Some(e)),
+            };
+            Command::Blpop { keys, timeout }
+        }
+        "BRPOP" => {
+            // BRPOP key [key ...] timeout
+            let mut keys = Vec::new();
+            let mut last_bytes: Option<Vec<u8>> = None;
+            for b in iter.by_ref() {
+                if let Some(prev) = last_bytes.take() {
+                    match parse_bulk_string(prev) {
+                        Ok(k) => keys.push(k),
+                        Err(e) => return Ok(Some(e)),
+                    }
+                }
+                last_bytes = Some(b);
+            }
+            let Some(timeout_bytes) = last_bytes else {
+                return Ok(Some(err_wrong_args("brpop")));
+            };
+            if keys.is_empty() {
+                return Ok(Some(err_wrong_args("brpop")));
+            }
+            let timeout = match parse_bulk_string(timeout_bytes.clone()) {
+                Ok(s) => match s.parse::<f64>() {
+                    Ok(t) if t >= 0.0 => t,
+                    _ => return Ok(Some(Command::Error("ERR timeout is not a float or out of range".to_string()))),
+                },
+                Err(e) => return Ok(Some(e)),
+            };
+            Command::Brpop { keys, timeout }
+        }
         "LPOS" => {
             let Some(key_bytes) = iter.next() else {
                 return Ok(Some(err_wrong_args("lpos")));
@@ -2794,6 +2863,33 @@ pub async fn read_command(
                 return Ok(Some(err_wrong_args("sdiffstore")));
             }
             Command::Sdiffstore { dest, keys }
+        }
+        "SMOVE" => {
+            let Some(src_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("smove")));
+            };
+            let source = match parse_bulk_string(src_bytes) {
+                Ok(s) => s,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(dst_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("smove")));
+            };
+            let destination = match parse_bulk_string(dst_bytes) {
+                Ok(d) => d,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(member_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("smove")));
+            };
+            let member = match parse_bulk_string(member_bytes) {
+                Ok(m) => m,
+                Err(e) => return Ok(Some(e)),
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("smove")));
+            }
+            Command::Smove { source, destination, member }
         }
         "HSET" => {
             let Some(key_bytes) = iter.next() else {

@@ -2128,6 +2128,62 @@ impl Storage {
         Ok(self.set_store_result(dest, result))
     }
 
+    /// SMOVE: 将 member 从 source 移动到 destination
+    /// 返回 Ok(true) 表示移动成功，Ok(false) 表示 member 不在 source 中
+    /// 返回 Err(()) 表示类型错误
+    pub fn smove(&self, source: &str, destination: &str, member: &str) -> Result<bool, ()> {
+        let now = Instant::now();
+        self.remove_if_expired(source, now);
+        self.remove_if_expired(destination, now);
+
+        // 检查 source 是否存在且包含 member
+        let removed = {
+            let Some(mut entry) = self.data.get_mut(source) else {
+                return Ok(false);
+            };
+            match entry.value_mut() {
+                StorageValue::Set { value: set, .. } => {
+                    if !set.remove(member) {
+                        return Ok(false);
+                    }
+                    true
+                }
+                _ => return Err(()),
+            }
+        };
+
+        if !removed {
+            return Ok(false);
+        }
+
+        self.bump_key_version(source);
+
+        // 添加到 destination
+        match self.data.get_mut(destination) {
+            Some(mut entry) => match entry.value_mut() {
+                StorageValue::Set { value: set, .. } => {
+                    set.insert(member.to_string());
+                }
+                _ => return Err(()),
+            },
+            None => {
+                let mut set = HashSet::new();
+                set.insert(member.to_string());
+                self.data.insert(
+                    destination.to_string(),
+                    StorageValue::Set {
+                        value: set,
+                        expires_at: None,
+                    },
+                );
+            }
+        }
+
+        self.touch_key(destination);
+        self.bump_key_version(destination);
+        Ok(true)
+    }
+
     pub fn zadd(&self, key: &str, entries: &[(f64, String)]) -> Result<usize, ZsetError> {
         let now = Instant::now();
         self.remove_if_expired(key, now);
@@ -3004,7 +3060,7 @@ impl Storage {
                 StorageValue::HyperLogLog { value: hll, .. } => {
                     // 序列化 HyperLogLog: 直接写入 16384 个寄存器
                     let registers = hll.registers();
-                    file.write_all(registers)?;
+                    file.write_all(&registers)?;
                 }
             }
         }
