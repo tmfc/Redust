@@ -12,6 +12,7 @@ Redust 是一个使用 Rust 编写的、兼容 Redis 协议的轻量级服务。
     - Sets：`SADD`、`SREM`、`SMEMBERS`、`SCARD`、`SISMEMBER`、`SUNION`、`SINTER`、`SDIFF`，支持 `SPOP` / `SRANDMEMBER` 以及 `SUNIONSTORE` / `SINTERSTORE` / `SDIFFSTORE`。
     - Hashes：`HSET`、`HGET`、`HGETALL`、`HDEL`、`HEXISTS`、`HINCRBY` 等常用命令。
     - Sorted Sets：`ZADD`、`ZCARD`、`ZRANGE`、`ZREVRANGE`、`ZSCORE`、`ZREM`、`ZINCRBY`、`ZSCAN` 等。
+    - HyperLogLog：`PFADD`、`PFCOUNT`、`PFMERGE`（基数估计，标准误差约 0.81%）。
     - Pub/Sub：`PUBLISH`、`SUBSCRIBE`/`PSUBSCRIBE`、`UNSUBSCRIBE`/`PUNSUBSCRIBE`，分片版 `SPUBLISH`/`SSUBSCRIBE`/`SUNSUBSCRIBE`，以及 `PUBSUB CHANNELS|NUMSUB|NUMPAT|SHARDCHANNELS|SHARDNUMSUB`。
     - 事务：`MULTI`、`EXEC`、`DISCARD`、`WATCH`、`UNWATCH`。
     - Lua 脚本：`EVAL`、`EVALSHA`、`SCRIPT LOAD|EXISTS|FLUSH`（基础版，暂不支持 `redis.call`）。
@@ -112,6 +113,23 @@ redis-cli -h 127.0.0.1 -p 6379 AUTH secret
 redis-cli -h 127.0.0.1 -p 6379 SET k v
 redis-cli -h 127.0.0.1 -p 6379 GET k
 # => "v"
+
+# HyperLogLog 基数估计示例
+redis-cli -h 127.0.0.1 -p 6379 PFADD visitors user1 user2 user3
+# => (integer) 1
+redis-cli -h 127.0.0.1 -p 6379 PFCOUNT visitors
+# => (integer) 3
+redis-cli -h 127.0.0.1 -p 6379 PFADD visitors user1 user4  # user1 已存在
+# => (integer) 1
+redis-cli -h 127.0.0.1 -p 6379 PFCOUNT visitors
+# => (integer) 4
+
+# 合并多个 HyperLogLog
+redis-cli -h 127.0.0.1 -p 6379 PFADD page1 a b c
+redis-cli -h 127.0.0.1 -p 6379 PFADD page2 c d e
+redis-cli -h 127.0.0.1 -p 6379 PFMERGE all_pages page1 page2
+redis-cli -h 127.0.0.1 -p 6379 PFCOUNT all_pages
+# => (integer) 5  (a, b, c, d, e 的并集)
 ```
 
 ## 运行测试

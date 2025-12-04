@@ -912,6 +912,38 @@ async fn handle_string_command(
             let removed = storage.del(&physical);
             respond_integer(writer, removed as i64).await?;
         }
+        Command::Unlink { keys } => {
+            let physical: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
+            let removed = storage.unlink(&physical);
+            respond_integer(writer, removed as i64).await?;
+        }
+        Command::Copy { source, destination, replace } => {
+            let src_physical = prefix_key(current_db, &source);
+            let dst_physical = prefix_key(current_db, &destination);
+            match storage.copy(&src_physical, &dst_physical, replace) {
+                Ok(true) => respond_integer(writer, 1).await?,
+                Ok(false) => respond_integer(writer, 0).await?,
+                Err(()) => respond_error(writer, "ERR source key does not exist").await?,
+            }
+        }
+        Command::Touch { keys } => {
+            let physical: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
+            let count = storage.touch(&physical);
+            respond_integer(writer, count as i64).await?;
+        }
+        Command::ObjectEncoding { key } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.object_encoding(&physical) {
+                Some(encoding) => respond_bulk_string(writer, encoding).await?,
+                None => respond_null_bulk(writer).await?,
+            }
+        }
         Command::Exists { keys } => {
             let physical: Vec<String> = keys
                 .into_iter()
@@ -1305,6 +1337,90 @@ async fn handle_list_command(
             match storage.ltrim(&physical, start, stop) {
                 Ok(()) => {
                     respond_simple_string(writer, "OK").await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Lset { key, index, value } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.lset(&physical, index, value) {
+                Ok(()) => {
+                    respond_simple_string(writer, "OK").await?;
+                }
+                Err(crate::storage::LsetError::WrongType) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::LsetError::NoSuchKey) => {
+                    respond_error(writer, "ERR no such key").await?;
+                }
+                Err(crate::storage::LsetError::OutOfRange) => {
+                    respond_error(writer, "ERR index out of range").await?;
+                }
+            }
+        }
+        Command::Linsert { key, before, pivot, value } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.linsert(&physical, before, &pivot, value) {
+                Ok(len) => {
+                    respond_integer(writer, len as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Rpoplpush { source, destination } => {
+            let src_physical = prefix_key(current_db, &source);
+            let dst_physical = prefix_key(current_db, &destination);
+            match storage.rpoplpush(&src_physical, &dst_physical) {
+                Ok(Some(value)) => {
+                    respond_bulk_string(writer, &value).await?;
+                }
+                Ok(None) => {
+                    respond_null_bulk(writer).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Lpos { key, element, rank, count, maxlen } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.lpos(&physical, &element, rank, count, maxlen) {
+                Ok(positions) => {
+                    if count.is_some() {
+                        // 返回数组
+                        let mut response = format!("*{}\r\n", positions.len());
+                        for pos in positions {
+                            response.push_str(&format!(":{}\r\n", pos));
+                        }
+                        writer.write_all(response.as_bytes()).await?;
+                    } else {
+                        // 返回单个值或 null
+                        if let Some(&pos) = positions.first() {
+                            respond_integer(writer, pos as i64).await?;
+                        } else {
+                            respond_null_bulk(writer).await?;
+                        }
+                    }
                 }
                 Err(()) => {
                     respond_error(
@@ -1925,6 +2041,51 @@ async fn handle_hash_command(
                 }
             }
         }
+        Command::Hsetnx { key, field, value } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.hsetnx(&physical, &field, value) {
+                Ok(result) => {
+                    respond_integer(writer, result as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Hstrlen { key, field } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.hstrlen(&physical, &field) {
+                Ok(len) => {
+                    respond_integer(writer, len as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Hmset { key, field_values } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.hmset(&physical, &field_values) {
+                Ok(()) => {
+                    respond_simple_string(writer, "OK").await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
         Command::Hscan {
             key,
             cursor,
@@ -1976,6 +2137,28 @@ async fn handle_hash_command(
     }
 
     Ok(())
+}
+
+/// 将 ZRangeBound 转换为 (f64, exclusive) 元组
+fn zrange_bound_to_f64(bound: &crate::command::ZRangeBound) -> (f64, bool) {
+    use crate::command::ZRangeBound;
+    match bound {
+        ZRangeBound::NegInf => (f64::NEG_INFINITY, false),
+        ZRangeBound::PosInf => (f64::INFINITY, false),
+        ZRangeBound::Inclusive(v) => (*v, false),
+        ZRangeBound::Exclusive(v) => (*v, true),
+    }
+}
+
+/// 将 ZLexBound 转换为 (value, inclusive, unbounded) 元组
+fn zlex_bound_to_params(bound: &crate::command::ZLexBound) -> (String, bool, bool) {
+    use crate::command::ZLexBound;
+    match bound {
+        ZLexBound::NegInf => (String::new(), false, true),
+        ZLexBound::PosInf => (String::new(), false, true),
+        ZLexBound::Inclusive(v) => (v.clone(), true, false),
+        ZLexBound::Exclusive(v) => (v.clone(), false, false),
+    }
 }
 
 async fn handle_zset_command(
@@ -2120,6 +2303,247 @@ async fn handle_zset_command(
                 }
             }
         }
+        Command::Zcount { key, min, max } => {
+            let physical = prefix_key(current_db, &key);
+            let (min_val, min_excl) = zrange_bound_to_f64(&min);
+            let (max_val, max_excl) = zrange_bound_to_f64(&max);
+            match storage.zcount(&physical, min_val, min_excl, max_val, max_excl) {
+                Ok(count) => {
+                    respond_integer(writer, count as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Zrank { key, member } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.zrank(&physical, &member) {
+                Ok(Some(rank)) => {
+                    respond_integer(writer, rank as i64).await?;
+                }
+                Ok(None) => {
+                    respond_null_bulk(writer).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Zrevrank { key, member } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.zrevrank(&physical, &member) {
+                Ok(Some(rank)) => {
+                    respond_integer(writer, rank as i64).await?;
+                }
+                Ok(None) => {
+                    respond_null_bulk(writer).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Zpopmin { key, count } => {
+            let physical = prefix_key(current_db, &key);
+            let cnt = count.unwrap_or(1);
+            match storage.zpopmin(&physical, cnt) {
+                Ok(items) => {
+                    let mut response = format!("*{}\r\n", items.len() * 2);
+                    for (member, score) in items {
+                        let score_s = format_score(score);
+                        response.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
+                        response.push_str(&format!("${}\r\n{}\r\n", score_s.len(), score_s));
+                    }
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Zpopmax { key, count } => {
+            let physical = prefix_key(current_db, &key);
+            let cnt = count.unwrap_or(1);
+            match storage.zpopmax(&physical, cnt) {
+                Ok(items) => {
+                    let mut response = format!("*{}\r\n", items.len() * 2);
+                    for (member, score) in items {
+                        let score_s = format_score(score);
+                        response.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
+                        response.push_str(&format!("${}\r\n{}\r\n", score_s.len(), score_s));
+                    }
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Zinter { keys, weights, aggregate, withscores } => {
+            let physical_keys: Vec<String> = keys.iter().map(|k| prefix_key(current_db, k)).collect();
+            let agg = aggregate.map(|a| match a {
+                crate::command::ZAggregate::Sum => crate::storage::ZsetAggregate::Sum,
+                crate::command::ZAggregate::Min => crate::storage::ZsetAggregate::Min,
+                crate::command::ZAggregate::Max => crate::storage::ZsetAggregate::Max,
+            }).unwrap_or(crate::storage::ZsetAggregate::Sum);
+            match storage.zinter(&physical_keys, weights.as_deref(), agg) {
+                Ok(items) => {
+                    if withscores {
+                        let mut response = format!("*{}\r\n", items.len() * 2);
+                        for (member, score) in items {
+                            let score_s = format_score(score);
+                            response.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
+                            response.push_str(&format!("${}\r\n{}\r\n", score_s.len(), score_s));
+                        }
+                        writer.write_all(response.as_bytes()).await?;
+                    } else {
+                        let mut response = format!("*{}\r\n", items.len());
+                        for (member, _) in items {
+                            response.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
+                        }
+                        writer.write_all(response.as_bytes()).await?;
+                    }
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Zunion { keys, weights, aggregate, withscores } => {
+            let physical_keys: Vec<String> = keys.iter().map(|k| prefix_key(current_db, k)).collect();
+            let agg = aggregate.map(|a| match a {
+                crate::command::ZAggregate::Sum => crate::storage::ZsetAggregate::Sum,
+                crate::command::ZAggregate::Min => crate::storage::ZsetAggregate::Min,
+                crate::command::ZAggregate::Max => crate::storage::ZsetAggregate::Max,
+            }).unwrap_or(crate::storage::ZsetAggregate::Sum);
+            match storage.zunion(&physical_keys, weights.as_deref(), agg) {
+                Ok(items) => {
+                    if withscores {
+                        let mut response = format!("*{}\r\n", items.len() * 2);
+                        for (member, score) in items {
+                            let score_s = format_score(score);
+                            response.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
+                            response.push_str(&format!("${}\r\n{}\r\n", score_s.len(), score_s));
+                        }
+                        writer.write_all(response.as_bytes()).await?;
+                    } else {
+                        let mut response = format!("*{}\r\n", items.len());
+                        for (member, _) in items {
+                            response.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
+                        }
+                        writer.write_all(response.as_bytes()).await?;
+                    }
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Zdiff { keys, withscores } => {
+            let physical_keys: Vec<String> = keys.iter().map(|k| prefix_key(current_db, k)).collect();
+            match storage.zdiff(&physical_keys) {
+                Ok(items) => {
+                    if withscores {
+                        let mut response = format!("*{}\r\n", items.len() * 2);
+                        for (member, score) in items {
+                            let score_s = format_score(score);
+                            response.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
+                            response.push_str(&format!("${}\r\n{}\r\n", score_s.len(), score_s));
+                        }
+                        writer.write_all(response.as_bytes()).await?;
+                    } else {
+                        let mut response = format!("*{}\r\n", items.len());
+                        for (member, _) in items {
+                            response.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
+                        }
+                        writer.write_all(response.as_bytes()).await?;
+                    }
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Zinterstore { destination, keys, weights, aggregate } => {
+            let dest_physical = prefix_key(current_db, &destination);
+            let physical_keys: Vec<String> = keys.iter().map(|k| prefix_key(current_db, k)).collect();
+            let agg = aggregate.map(|a| match a {
+                crate::command::ZAggregate::Sum => crate::storage::ZsetAggregate::Sum,
+                crate::command::ZAggregate::Min => crate::storage::ZsetAggregate::Min,
+                crate::command::ZAggregate::Max => crate::storage::ZsetAggregate::Max,
+            }).unwrap_or(crate::storage::ZsetAggregate::Sum);
+            match storage.zinterstore(&dest_physical, &physical_keys, weights.as_deref(), agg) {
+                Ok(count) => {
+                    respond_integer(writer, count as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Zunionstore { destination, keys, weights, aggregate } => {
+            let dest_physical = prefix_key(current_db, &destination);
+            let physical_keys: Vec<String> = keys.iter().map(|k| prefix_key(current_db, k)).collect();
+            let agg = aggregate.map(|a| match a {
+                crate::command::ZAggregate::Sum => crate::storage::ZsetAggregate::Sum,
+                crate::command::ZAggregate::Min => crate::storage::ZsetAggregate::Min,
+                crate::command::ZAggregate::Max => crate::storage::ZsetAggregate::Max,
+            }).unwrap_or(crate::storage::ZsetAggregate::Sum);
+            match storage.zunionstore(&dest_physical, &physical_keys, weights.as_deref(), agg) {
+                Ok(count) => {
+                    respond_integer(writer, count as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Zdiffstore { destination, keys } => {
+            let dest_physical = prefix_key(current_db, &destination);
+            let physical_keys: Vec<String> = keys.iter().map(|k| prefix_key(current_db, k)).collect();
+            match storage.zdiffstore(&dest_physical, &physical_keys) {
+                Ok(count) => {
+                    respond_integer(writer, count as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Zlexcount { key, min, max } => {
+            let physical = prefix_key(current_db, &key);
+            let (min_val, min_incl, min_unbounded) = zlex_bound_to_params(&min);
+            let (max_val, max_incl, max_unbounded) = zlex_bound_to_params(&max);
+            match storage.zlexcount(&physical, &min_val, min_incl, &max_val, max_incl, min_unbounded, max_unbounded) {
+                Ok(count) => {
+                    respond_integer(writer, count as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
         Command::Zscan {
             key,
             cursor,
@@ -2246,6 +2670,18 @@ async fn handle_key_meta_command(
             let v = if res { 1 } else { 0 };
             respond_integer(writer, v).await?;
         }
+        Command::Expireat { key, timestamp } => {
+            let physical = prefix_key(current_db, &key);
+            let res = storage.expireat(&physical, timestamp);
+            let v = if res { 1 } else { 0 };
+            respond_integer(writer, v).await?;
+        }
+        Command::Pexpireat { key, timestamp_ms } => {
+            let physical = prefix_key(current_db, &key);
+            let res = storage.pexpireat(&physical, timestamp_ms);
+            let v = if res { 1 } else { 0 };
+            respond_integer(writer, v).await?;
+        }
         Command::Ttl { key } => {
             let physical = prefix_key(current_db, &key);
             let ttl = storage.ttl_seconds(&physical);
@@ -2255,6 +2691,16 @@ async fn handle_key_meta_command(
             let physical = prefix_key(current_db, &key);
             let ttl = storage.pttl_millis(&physical);
             respond_integer(writer, ttl).await?;
+        }
+        Command::Expiretime { key } => {
+            let physical = prefix_key(current_db, &key);
+            let ts = storage.expiretime(&physical);
+            respond_integer(writer, ts).await?;
+        }
+        Command::Pexpiretime { key } => {
+            let physical = prefix_key(current_db, &key);
+            let ts = storage.pexpiretime(&physical);
+            respond_integer(writer, ts).await?;
         }
         Command::Persist { key } => {
             let physical = prefix_key(current_db, &key);
@@ -2532,6 +2978,10 @@ async fn execute_command_in_transaction(
         | Command::Decrby { .. }
         | Command::Incrbyfloat { .. }
         | Command::Del { .. }
+        | Command::Unlink { .. }
+        | Command::Copy { .. }
+        | Command::Touch { .. }
+        | Command::ObjectEncoding { .. }
         | Command::Exists { .. }
         | Command::Mget { .. }
         | Command::Mset { .. }
@@ -2552,7 +3002,11 @@ async fn execute_command_in_transaction(
         | Command::Llen { .. }
         | Command::Lindex { .. }
         | Command::Lrem { .. }
-        | Command::Ltrim { .. } => {
+        | Command::Ltrim { .. }
+        | Command::Lset { .. }
+        | Command::Linsert { .. }
+        | Command::Rpoplpush { .. }
+        | Command::Lpos { .. } => {
             handle_list_command(cmd, storage, writer, current_db).await?;
         }
 
@@ -2586,6 +3040,9 @@ async fn execute_command_in_transaction(
         | Command::Hincrby { .. }
         | Command::Hincrbyfloat { .. }
         | Command::Hlen { .. }
+        | Command::Hsetnx { .. }
+        | Command::Hstrlen { .. }
+        | Command::Hmset { .. }
         | Command::Hscan { .. } => {
             handle_hash_command(cmd, storage, writer, current_db).await?;
         }
@@ -2596,7 +3053,19 @@ async fn execute_command_in_transaction(
         | Command::Zrange { .. }
         | Command::Zscore { .. }
         | Command::Zrem { .. }
-        | Command::Zincrby { .. } => {
+        | Command::Zincrby { .. }
+        | Command::Zcount { .. }
+        | Command::Zrank { .. }
+        | Command::Zrevrank { .. }
+        | Command::Zpopmin { .. }
+        | Command::Zpopmax { .. }
+        | Command::Zinter { .. }
+        | Command::Zunion { .. }
+        | Command::Zdiff { .. }
+        | Command::Zinterstore { .. }
+        | Command::Zunionstore { .. }
+        | Command::Zdiffstore { .. }
+        | Command::Zlexcount { .. } => {
             handle_zset_command(cmd, storage, writer, current_db).await?;
         }
 
@@ -2611,8 +3080,12 @@ async fn execute_command_in_transaction(
         | Command::Dbsize
         | Command::Expire { .. }
         | Command::Pexpire { .. }
+        | Command::Expireat { .. }
+        | Command::Pexpireat { .. }
         | Command::Ttl { .. }
         | Command::Pttl { .. }
+        | Command::Expiretime { .. }
+        | Command::Pexpiretime { .. }
         | Command::Persist { .. }
         | Command::Rename { .. }
         | Command::Renamenx { .. }
@@ -2927,6 +3400,10 @@ async fn handle_connection(
             | Command::Decrby { .. }
             | Command::Incrbyfloat { .. }
             | Command::Del { .. }
+            | Command::Unlink { .. }
+            | Command::Copy { .. }
+            | Command::Touch { .. }
+            | Command::ObjectEncoding { .. }
             | Command::Exists { .. }
             | Command::Mget { .. }
             | Command::Mset { .. }
@@ -2951,7 +3428,11 @@ async fn handle_connection(
             | Command::Llen { .. }
             | Command::Lindex { .. }
             | Command::Lrem { .. }
-            | Command::Ltrim { .. } => {
+            | Command::Ltrim { .. }
+            | Command::Lset { .. }
+            | Command::Linsert { .. }
+            | Command::Rpoplpush { .. }
+            | Command::Lpos { .. } => {
                 handle_list_command(cmd, &storage, &mut write_half, current_db).await?;
             }
 
@@ -2985,6 +3466,9 @@ async fn handle_connection(
             | Command::Hincrby { .. }
             | Command::Hincrbyfloat { .. }
             | Command::Hlen { .. }
+            | Command::Hsetnx { .. }
+            | Command::Hstrlen { .. }
+            | Command::Hmset { .. }
             | Command::Hscan { .. } => {
                 handle_hash_command(cmd, &storage, &mut write_half, current_db).await?;
             }
@@ -2996,6 +3480,18 @@ async fn handle_connection(
             | Command::Zscore { .. }
             | Command::Zrem { .. }
             | Command::Zincrby { .. }
+            | Command::Zcount { .. }
+            | Command::Zrank { .. }
+            | Command::Zrevrank { .. }
+            | Command::Zpopmin { .. }
+            | Command::Zpopmax { .. }
+            | Command::Zinter { .. }
+            | Command::Zunion { .. }
+            | Command::Zdiff { .. }
+            | Command::Zinterstore { .. }
+            | Command::Zunionstore { .. }
+            | Command::Zdiffstore { .. }
+            | Command::Zlexcount { .. }
             | Command::Zscan { .. } => {
                 handle_zset_command(cmd, &storage, &mut write_half, current_db).await?;
             }
@@ -3014,8 +3510,12 @@ async fn handle_connection(
             // key 元信息、过期相关命令
             Command::Expire { .. }
             | Command::Pexpire { .. }
+            | Command::Expireat { .. }
+            | Command::Pexpireat { .. }
             | Command::Ttl { .. }
             | Command::Pttl { .. }
+            | Command::Expiretime { .. }
+            | Command::Pexpiretime { .. }
             | Command::Persist { .. }
             | Command::Type { .. }
             | Command::Keys { .. }

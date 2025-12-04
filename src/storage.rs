@@ -80,6 +80,20 @@ pub enum ZsetError {
     NotFloat,
 }
 
+pub enum LsetError {
+    WrongType,
+    NoSuchKey,
+    OutOfRange,
+}
+
+/// ZINTER/ZUNION 的聚合方式
+#[derive(Debug, Clone, Copy)]
+pub enum ZsetAggregate {
+    Sum,
+    Min,
+    Max,
+}
+
 impl Default for Storage {
     fn default() -> Self {
         Storage::new(None)
@@ -436,6 +450,101 @@ impl Storage {
         }
 
         Ok(removed)
+    }
+
+    /// HSETNX: 仅当字段不存在时设置值
+    /// 返回 Ok(1) 如果字段被设置，Ok(0) 如果字段已存在
+    pub fn hsetnx(&self, key: &str, field: &str, value: String) -> Result<usize, ()> {
+        let now = Instant::now();
+        self.remove_if_expired(key, now);
+
+        if let Some(mut entry) = self.data.get_mut(key) {
+            match entry.value_mut() {
+                StorageValue::Hash { value: map, .. } => {
+                    if map.contains_key(field) {
+                        return Ok(0); // 字段已存在，不设置
+                    }
+                    map.insert(field.to_string(), value);
+                    self.touch_key(key);
+                    self.bump_key_version(key);
+                    self.maybe_evict_for_write();
+                    Ok(1)
+                }
+                _ => Err(()), // WRONGTYPE
+            }
+        } else {
+            // key 不存在，创建新的 Hash
+            let mut map = HashMap::new();
+            map.insert(field.to_string(), value);
+            self.data.insert(
+                key.to_string(),
+                StorageValue::Hash {
+                    value: map,
+                    expires_at: None,
+                },
+            );
+            self.touch_key(key);
+            self.bump_key_version(key);
+            self.maybe_evict_for_write();
+            Ok(1)
+        }
+    }
+
+    /// HSTRLEN: 获取字段值的字符串长度
+    pub fn hstrlen(&self, key: &str, field: &str) -> Result<usize, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(0);
+        }
+
+        let Some(entry) = self.data.get(key) else {
+            return Ok(0);
+        };
+
+        match entry.value() {
+            StorageValue::Hash { value: map, .. } => {
+                let len = map.get(field).map(|v| v.len()).unwrap_or(0);
+                if len > 0 {
+                    self.touch_key(key);
+                }
+                Ok(len)
+            }
+            _ => Err(()), // WRONGTYPE
+        }
+    }
+
+    /// HMSET: 批量设置多个字段
+    pub fn hmset(&self, key: &str, field_values: &[(String, String)]) -> Result<(), ()> {
+        let now = Instant::now();
+        self.remove_if_expired(key, now);
+
+        if let Some(mut entry) = self.data.get_mut(key) {
+            match entry.value_mut() {
+                StorageValue::Hash { value: map, .. } => {
+                    for (field, value) in field_values {
+                        map.insert(field.clone(), value.clone());
+                    }
+                }
+                _ => return Err(()), // WRONGTYPE
+            }
+        } else {
+            let mut map = HashMap::new();
+            for (field, value) in field_values {
+                map.insert(field.clone(), value.clone());
+            }
+            self.data.insert(
+                key.to_string(),
+                StorageValue::Hash {
+                    value: map,
+                    expires_at: None,
+                },
+            );
+        }
+
+        self.touch_key(key);
+        self.bump_key_version(key);
+        self.maybe_evict_for_write();
+        Ok(())
     }
 
     pub fn spop(&self, key: &str, count: Option<i64>) -> Result<Vec<String>, ()> {
@@ -915,6 +1024,76 @@ impl Storage {
             }
         }
         removed
+    }
+
+    /// UNLINK: 与 DEL 相同（简化实现，实际 Redis 中是异步删除）
+    pub fn unlink(&self, keys: &[String]) -> usize {
+        self.del(keys)
+    }
+
+    /// COPY: 复制 key 到新 key
+    pub fn copy(&self, source: &str, destination: &str, replace: bool) -> Result<bool, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(source, now) {
+            return Ok(false); // source 不存在
+        }
+
+        let entry = match self.data.get(source) {
+            Some(e) => e,
+            None => return Ok(false),
+        };
+
+        // 检查 destination 是否存在
+        self.remove_if_expired(destination, now);
+        if self.data.contains_key(destination) && !replace {
+            return Ok(false);
+        }
+
+        // 克隆值
+        let cloned_value = entry.value().clone();
+        drop(entry);
+
+        // 如果 replace，先删除
+        if replace {
+            self.data.remove(destination);
+        }
+
+        self.data.insert(destination.to_string(), cloned_value);
+        self.touch_key(destination);
+        self.bump_key_version(destination);
+        Ok(true)
+    }
+
+    /// TOUCH: 更新 key 的访问时间，返回存在的 key 数量
+    pub fn touch(&self, keys: &[String]) -> usize {
+        let now = Instant::now();
+        let mut count = 0;
+        for key in keys {
+            if !self.remove_if_expired(key, now) && self.data.contains_key(key) {
+                self.touch_key(key);
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// OBJECT ENCODING: 返回 key 的编码类型
+    pub fn object_encoding(&self, key: &str) -> Option<&'static str> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return None;
+        }
+
+        let entry = self.data.get(key)?;
+        let encoding = match entry.value() {
+            StorageValue::String { .. } => "embstr",
+            StorageValue::List { .. } => "quicklist",
+            StorageValue::Set { .. } => "hashtable",
+            StorageValue::Hash { .. } => "hashtable",
+            StorageValue::Zset { .. } => "skiplist",
+            StorageValue::HyperLogLog { .. } => "raw",
+        };
+        Some(encoding)
     }
 
     pub fn exists(&self, keys: &[String]) -> usize {
@@ -1454,6 +1633,202 @@ impl Storage {
         // ltrim 只会收缩列表，不会增加内存，这里不触发淘汰
 
         Ok(())
+    }
+
+    /// LSET: 设置指定索引位置的元素
+    /// 返回 Ok(()) 成功，Err(LsetError) 失败
+    pub fn lset(&self, key: &str, index: isize, value: String) -> Result<(), LsetError> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Err(LsetError::NoSuchKey);
+        }
+
+        let Some(mut entry) = self.data.get_mut(key) else {
+            return Err(LsetError::NoSuchKey);
+        };
+
+        let list = match entry.value_mut() {
+            StorageValue::List { value: list, .. } => list,
+            _ => return Err(LsetError::WrongType),
+        };
+
+        if list.is_empty() {
+            return Err(LsetError::OutOfRange);
+        }
+
+        let len = list.len() as isize;
+        let idx = if index < 0 { len + index } else { index };
+
+        if idx < 0 || idx >= len {
+            return Err(LsetError::OutOfRange);
+        }
+
+        list[idx as usize] = value;
+        self.touch_key(key);
+        self.bump_key_version(key);
+        Ok(())
+    }
+
+    /// LINSERT: 在 pivot 元素前/后插入新元素
+    /// 返回插入后列表长度，-1 表示 pivot 未找到，Err 表示类型错误
+    pub fn linsert(&self, key: &str, before: bool, pivot: &str, value: String) -> Result<isize, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(0); // key 不存在返回 0
+        }
+
+        let Some(mut entry) = self.data.get_mut(key) else {
+            return Ok(0);
+        };
+
+        let list = match entry.value_mut() {
+            StorageValue::List { value: list, .. } => list,
+            _ => return Err(()),
+        };
+
+        // 查找 pivot 位置
+        let pos = list.iter().position(|v| v == pivot);
+        match pos {
+            Some(idx) => {
+                let insert_idx = if before { idx } else { idx + 1 };
+                list.insert(insert_idx, value);
+                self.touch_key(key);
+                self.bump_key_version(key);
+                self.maybe_evict_for_write();
+                Ok(list.len() as isize)
+            }
+            None => Ok(-1), // pivot 未找到
+        }
+    }
+
+    /// RPOPLPUSH: 从 source 右侧弹出并推入 destination 左侧
+    pub fn rpoplpush(&self, source: &str, destination: &str) -> Result<Option<String>, ()> {
+        let now = Instant::now();
+        self.remove_if_expired(source, now);
+        self.remove_if_expired(destination, now);
+
+        // 先从 source 弹出
+        let popped = {
+            let Some(mut entry) = self.data.get_mut(source) else {
+                return Ok(None);
+            };
+            let list = match entry.value_mut() {
+                StorageValue::List { value: list, .. } => list,
+                _ => return Err(()),
+            };
+            list.pop_back()
+        };
+
+        let Some(value) = popped else {
+            return Ok(None);
+        };
+
+        self.touch_key(source);
+        self.bump_key_version(source);
+
+        // 推入 destination 左侧
+        if let Some(mut entry) = self.data.get_mut(destination) {
+            match entry.value_mut() {
+                StorageValue::List { value: list, .. } => {
+                    list.push_front(value.clone());
+                }
+                _ => return Err(()),
+            }
+        } else {
+            let mut list = VecDeque::new();
+            list.push_front(value.clone());
+            self.data.insert(
+                destination.to_string(),
+                StorageValue::List {
+                    value: list,
+                    expires_at: None,
+                },
+            );
+        }
+
+        self.touch_key(destination);
+        self.bump_key_version(destination);
+        self.maybe_evict_for_write();
+
+        Ok(Some(value))
+    }
+
+    /// LPOS: 查找元素位置
+    /// 返回匹配的索引列表（如果 count 为 None 则返回第一个匹配）
+    pub fn lpos(
+        &self,
+        key: &str,
+        element: &str,
+        rank: Option<isize>,
+        count: Option<isize>,
+        maxlen: Option<isize>,
+    ) -> Result<Vec<isize>, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(Vec::new());
+        }
+
+        let Some(entry) = self.data.get(key) else {
+            return Ok(Vec::new());
+        };
+
+        let list = match entry.value() {
+            StorageValue::List { value: list, .. } => list,
+            _ => return Err(()),
+        };
+
+        if list.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let len = list.len();
+        let max = maxlen.map(|m| m as usize).unwrap_or(len).min(len);
+        let rank_val = rank.unwrap_or(1);
+        let want_count = count.map(|c| c as usize).unwrap_or(1);
+
+        let mut results = Vec::new();
+        let mut matches_found = 0isize;
+
+        if rank_val > 0 {
+            // 从头到尾搜索
+            for (i, v) in list.iter().enumerate().take(max) {
+                if v == element {
+                    matches_found += 1;
+                    if matches_found >= rank_val {
+                        results.push(i as isize);
+                        if count.is_some() && results.len() >= want_count {
+                            break;
+                        }
+                        if count.is_none() {
+                            break; // 只返回第一个
+                        }
+                    }
+                }
+            }
+        } else {
+            // 从尾到头搜索
+            let skip = if max < len { len - max } else { 0 };
+            for i in (skip..len).rev() {
+                if list[i] == element {
+                    matches_found += 1;
+                    if matches_found >= -rank_val {
+                        results.push(i as isize);
+                        if count.is_some() && results.len() >= want_count {
+                            break;
+                        }
+                        if count.is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !results.is_empty() {
+            self.touch_key(key);
+        }
+
+        Ok(results)
     }
 
     pub fn sadd(&self, key: &str, members: &[String]) -> Result<usize, ()> {
@@ -2028,6 +2403,498 @@ impl Storage {
         Ok(items)
     }
 
+    /// ZCOUNT: 统计分数在 [min, max] 范围内的成员数量
+    pub fn zcount(&self, key: &str, min: f64, min_exclusive: bool, max: f64, max_exclusive: bool) -> Result<usize, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(0);
+        }
+
+        let entry = match self.data.get(key) {
+            Some(e) => e,
+            None => return Ok(0),
+        };
+
+        let zset = match entry.value() {
+            StorageValue::Zset { value, .. } => value,
+            _ => return Err(()),
+        };
+
+        let count = zset.by_score.iter().filter(|(score, _)| {
+            let s = score.0;
+            let min_ok = if min_exclusive { s > min } else { s >= min };
+            let max_ok = if max_exclusive { s < max } else { s <= max };
+            min_ok && max_ok
+        }).count();
+
+        Ok(count)
+    }
+
+    /// ZRANK: 获取成员的排名（从 0 开始，按分数升序）
+    pub fn zrank(&self, key: &str, member: &str) -> Result<Option<usize>, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(None);
+        }
+
+        let entry = match self.data.get(key) {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+
+        let zset = match entry.value() {
+            StorageValue::Zset { value, .. } => value,
+            _ => return Err(()),
+        };
+
+        // 获取成员的分数
+        let score = match zset.by_member.get(member) {
+            Some(s) => *s,
+            None => return Ok(None),
+        };
+
+        // 计算排名
+        let rank = zset.by_score.iter()
+            .position(|(s, m)| s.0 == score && m == member);
+
+        Ok(rank)
+    }
+
+    /// ZREVRANK: 获取成员的排名（从 0 开始，按分数降序）
+    pub fn zrevrank(&self, key: &str, member: &str) -> Result<Option<usize>, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(None);
+        }
+
+        let entry = match self.data.get(key) {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+
+        let zset = match entry.value() {
+            StorageValue::Zset { value, .. } => value,
+            _ => return Err(()),
+        };
+
+        // 获取成员的分数
+        let score = match zset.by_member.get(member) {
+            Some(s) => *s,
+            None => return Ok(None),
+        };
+
+        // 计算逆序排名
+        let total = zset.by_score.len();
+        let rank = zset.by_score.iter()
+            .position(|(s, m)| s.0 == score && m == member);
+
+        Ok(rank.map(|r| total - 1 - r))
+    }
+
+    /// ZPOPMIN: 弹出分数最小的成员
+    pub fn zpopmin(&self, key: &str, count: usize) -> Result<Vec<(String, f64)>, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(Vec::new());
+        }
+
+        let Some(mut entry) = self.data.get_mut(key) else {
+            return Ok(Vec::new());
+        };
+
+        let zset = match entry.value_mut() {
+            StorageValue::Zset { value, .. } => value,
+            _ => return Err(()),
+        };
+
+        let mut result = Vec::new();
+        for _ in 0..count {
+            if let Some((score, member)) = zset.by_score.pop_first() {
+                zset.by_member.remove(&member);
+                result.push((member, score.0));
+            } else {
+                break;
+            }
+        }
+
+        if !result.is_empty() {
+            self.touch_key(key);
+            self.bump_key_version(key);
+        }
+
+        Ok(result)
+    }
+
+    /// ZPOPMAX: 弹出分数最大的成员
+    pub fn zpopmax(&self, key: &str, count: usize) -> Result<Vec<(String, f64)>, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(Vec::new());
+        }
+
+        let Some(mut entry) = self.data.get_mut(key) else {
+            return Ok(Vec::new());
+        };
+
+        let zset = match entry.value_mut() {
+            StorageValue::Zset { value, .. } => value,
+            _ => return Err(()),
+        };
+
+        let mut result = Vec::new();
+        for _ in 0..count {
+            if let Some((score, member)) = zset.by_score.pop_last() {
+                zset.by_member.remove(&member);
+                result.push((member, score.0));
+            } else {
+                break;
+            }
+        }
+
+        if !result.is_empty() {
+            self.touch_key(key);
+            self.bump_key_version(key);
+        }
+
+        Ok(result)
+    }
+
+    /// ZINTER: 计算多个 sorted set 的交集
+    pub fn zinter(
+        &self,
+        keys: &[String],
+        weights: Option<&[f64]>,
+        aggregate: ZsetAggregate,
+    ) -> Result<Vec<(String, f64)>, ()> {
+        let now = Instant::now();
+        
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        // 获取第一个 set 作为基础
+        for key in keys {
+            self.remove_if_expired(key, now);
+        }
+        
+        let first_key = &keys[0];
+        let first_entry = match self.data.get(first_key) {
+            Some(e) => e,
+            None => return Ok(Vec::new()), // 任一 key 不存在，交集为空
+        };
+        
+        let first_zset = match first_entry.value() {
+            StorageValue::Zset { value, .. } => value,
+            _ => return Err(()),
+        };
+        
+        // 收集第一个 set 的所有成员
+        let mut result: HashMap<String, f64> = HashMap::new();
+        let w0 = weights.map(|w| w[0]).unwrap_or(1.0);
+        for (member, score) in &first_zset.by_member {
+            result.insert(member.clone(), *score * w0);
+        }
+        drop(first_entry);
+        
+        // 与其他 set 求交集
+        for (i, key) in keys.iter().enumerate().skip(1) {
+            let entry = match self.data.get(key) {
+                Some(e) => e,
+                None => return Ok(Vec::new()),
+            };
+            
+            let zset = match entry.value() {
+                StorageValue::Zset { value, .. } => value,
+                _ => return Err(()),
+            };
+            
+            let weight = weights.map(|w| w[i]).unwrap_or(1.0);
+            
+            // 保留交集
+            result.retain(|member, score| {
+                if let Some(&other_score) = zset.by_member.get(member) {
+                    let weighted = other_score * weight;
+                    *score = match aggregate {
+                        ZsetAggregate::Sum => *score + weighted,
+                        ZsetAggregate::Min => score.min(weighted),
+                        ZsetAggregate::Max => score.max(weighted),
+                    };
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+        
+        // 按分数排序
+        let mut items: Vec<(String, f64)> = result.into_iter().collect();
+        items.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        
+        Ok(items)
+    }
+
+    /// ZUNION: 计算多个 sorted set 的并集
+    pub fn zunion(
+        &self,
+        keys: &[String],
+        weights: Option<&[f64]>,
+        aggregate: ZsetAggregate,
+    ) -> Result<Vec<(String, f64)>, ()> {
+        let now = Instant::now();
+        
+        let mut result: HashMap<String, f64> = HashMap::new();
+        
+        for (i, key) in keys.iter().enumerate() {
+            self.remove_if_expired(key, now);
+            
+            let entry = match self.data.get(key) {
+                Some(e) => e,
+                None => continue,
+            };
+            
+            let zset = match entry.value() {
+                StorageValue::Zset { value, .. } => value,
+                _ => return Err(()),
+            };
+            
+            let weight = weights.map(|w| w[i]).unwrap_or(1.0);
+            
+            for (member, score) in &zset.by_member {
+                let weighted = *score * weight;
+                result.entry(member.clone())
+                    .and_modify(|s| {
+                        *s = match aggregate {
+                            ZsetAggregate::Sum => *s + weighted,
+                            ZsetAggregate::Min => s.min(weighted),
+                            ZsetAggregate::Max => s.max(weighted),
+                        };
+                    })
+                    .or_insert(weighted);
+            }
+        }
+        
+        // 按分数排序
+        let mut items: Vec<(String, f64)> = result.into_iter().collect();
+        items.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        
+        Ok(items)
+    }
+
+    /// ZDIFF: 计算第一个 sorted set 与其他 set 的差集
+    pub fn zdiff(&self, keys: &[String]) -> Result<Vec<(String, f64)>, ()> {
+        let now = Instant::now();
+        
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        for key in keys {
+            self.remove_if_expired(key, now);
+        }
+        
+        let first_key = &keys[0];
+        let first_entry = match self.data.get(first_key) {
+            Some(e) => e,
+            None => return Ok(Vec::new()),
+        };
+        
+        let first_zset = match first_entry.value() {
+            StorageValue::Zset { value, .. } => value,
+            _ => return Err(()),
+        };
+        
+        // 收集第一个 set 的所有成员
+        let mut result: HashMap<String, f64> = first_zset.by_member.clone();
+        drop(first_entry);
+        
+        // 移除在其他 set 中出现的成员
+        for key in keys.iter().skip(1) {
+            let entry = match self.data.get(key) {
+                Some(e) => e,
+                None => continue,
+            };
+            
+            let zset = match entry.value() {
+                StorageValue::Zset { value, .. } => value,
+                _ => return Err(()),
+            };
+            
+            for member in zset.by_member.keys() {
+                result.remove(member);
+            }
+        }
+        
+        // 按分数排序
+        let mut items: Vec<(String, f64)> = result.into_iter().collect();
+        items.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        
+        Ok(items)
+    }
+
+    /// ZINTERSTORE: 计算交集并存储到目标 key
+    pub fn zinterstore(
+        &self,
+        destination: &str,
+        keys: &[String],
+        weights: Option<&[f64]>,
+        aggregate: ZsetAggregate,
+    ) -> Result<usize, ()> {
+        let items = self.zinter(keys, weights, aggregate)?;
+        let count = items.len();
+        
+        // 删除旧的目标 key
+        self.data.remove(destination);
+        
+        if !items.is_empty() {
+            let mut inner = ZSetInner {
+                by_member: HashMap::new(),
+                by_score: BTreeSet::new(),
+            };
+            for (member, score) in items {
+                inner.by_member.insert(member.clone(), score);
+                inner.by_score.insert((OrderedFloat(score), member));
+            }
+            self.data.insert(
+                destination.to_string(),
+                StorageValue::Zset {
+                    value: inner,
+                    expires_at: None,
+                },
+            );
+            self.touch_key(destination);
+            self.bump_key_version(destination);
+        }
+        
+        Ok(count)
+    }
+
+    /// ZUNIONSTORE: 计算并集并存储到目标 key
+    pub fn zunionstore(
+        &self,
+        destination: &str,
+        keys: &[String],
+        weights: Option<&[f64]>,
+        aggregate: ZsetAggregate,
+    ) -> Result<usize, ()> {
+        let items = self.zunion(keys, weights, aggregate)?;
+        let count = items.len();
+        
+        // 删除旧的目标 key
+        self.data.remove(destination);
+        
+        if !items.is_empty() {
+            let mut inner = ZSetInner {
+                by_member: HashMap::new(),
+                by_score: BTreeSet::new(),
+            };
+            for (member, score) in items {
+                inner.by_member.insert(member.clone(), score);
+                inner.by_score.insert((OrderedFloat(score), member));
+            }
+            self.data.insert(
+                destination.to_string(),
+                StorageValue::Zset {
+                    value: inner,
+                    expires_at: None,
+                },
+            );
+            self.touch_key(destination);
+            self.bump_key_version(destination);
+        }
+        
+        Ok(count)
+    }
+
+    /// ZDIFFSTORE: 计算差集并存储到目标 key
+    pub fn zdiffstore(&self, destination: &str, keys: &[String]) -> Result<usize, ()> {
+        let items = self.zdiff(keys)?;
+        let count = items.len();
+        
+        // 删除旧的目标 key
+        self.data.remove(destination);
+        
+        if !items.is_empty() {
+            let mut inner = ZSetInner {
+                by_member: HashMap::new(),
+                by_score: BTreeSet::new(),
+            };
+            for (member, score) in items {
+                inner.by_member.insert(member.clone(), score);
+                inner.by_score.insert((OrderedFloat(score), member));
+            }
+            self.data.insert(
+                destination.to_string(),
+                StorageValue::Zset {
+                    value: inner,
+                    expires_at: None,
+                },
+            );
+            self.touch_key(destination);
+            self.bump_key_version(destination);
+        }
+        
+        Ok(count)
+    }
+
+    /// ZLEXCOUNT: 统计字典序在 [min, max] 范围内的成员数量
+    /// 注意：ZLEXCOUNT 要求所有成员的分数相同，但这里我们简化实现，只按字典序比较
+    pub fn zlexcount(
+        &self,
+        key: &str,
+        min: &str,
+        min_inclusive: bool,
+        max: &str,
+        max_inclusive: bool,
+        min_unbounded: bool,
+        max_unbounded: bool,
+    ) -> Result<usize, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(0);
+        }
+
+        let entry = match self.data.get(key) {
+            Some(e) => e,
+            None => return Ok(0),
+        };
+
+        let zset = match entry.value() {
+            StorageValue::Zset { value, .. } => value,
+            _ => return Err(()),
+        };
+
+        let count = zset.by_member.keys().filter(|member| {
+            let min_ok = if min_unbounded {
+                true
+            } else if min_inclusive {
+                member.as_str() >= min
+            } else {
+                member.as_str() > min
+            };
+            
+            let max_ok = if max_unbounded {
+                true
+            } else if max_inclusive {
+                member.as_str() <= max
+            } else {
+                member.as_str() < max
+            };
+            
+            min_ok && max_ok
+        }).count();
+
+        Ok(count)
+    }
+
     pub fn save_rdb<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let mut file = File::create(path)?;
 
@@ -2578,6 +3445,167 @@ impl Storage {
                 }
             }
         }
+    }
+
+    /// EXPIREAT: 设置绝对过期时间（Unix 秒）
+    pub fn expireat(&self, key: &str, timestamp: i64) -> bool {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return false;
+        }
+
+        let Some(mut entry) = self.data.get_mut(key) else {
+            return false;
+        };
+
+        // 计算从现在到目标时间的 Duration
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        
+        let diff_secs = timestamp - now_unix;
+        if diff_secs <= 0 {
+            // 已过期，删除 key
+            drop(entry);
+            self.data.remove(key);
+            self.last_access.remove(key);
+            self.bump_key_version(key);
+            return true;
+        }
+
+        let deadline = now + Duration::from_secs(diff_secs as u64);
+
+        match entry.value_mut() {
+            StorageValue::String { expires_at, .. }
+            | StorageValue::List { expires_at, .. }
+            | StorageValue::Set { expires_at, .. }
+            | StorageValue::Hash { expires_at, .. }
+            | StorageValue::Zset { expires_at, .. }
+            | StorageValue::HyperLogLog { expires_at, .. } => {
+                *expires_at = Some(deadline);
+                self.bump_key_version(key);
+                true
+            }
+        }
+    }
+
+    /// PEXPIREAT: 设置绝对过期时间（Unix 毫秒）
+    pub fn pexpireat(&self, key: &str, timestamp_ms: i64) -> bool {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return false;
+        }
+
+        let Some(mut entry) = self.data.get_mut(key) else {
+            return false;
+        };
+
+        let now_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        
+        let diff_ms = timestamp_ms - now_unix_ms;
+        if diff_ms <= 0 {
+            drop(entry);
+            self.data.remove(key);
+            self.last_access.remove(key);
+            self.bump_key_version(key);
+            return true;
+        }
+
+        let deadline = now + Duration::from_millis(diff_ms as u64);
+
+        match entry.value_mut() {
+            StorageValue::String { expires_at, .. }
+            | StorageValue::List { expires_at, .. }
+            | StorageValue::Set { expires_at, .. }
+            | StorageValue::Hash { expires_at, .. }
+            | StorageValue::Zset { expires_at, .. }
+            | StorageValue::HyperLogLog { expires_at, .. } => {
+                *expires_at = Some(deadline);
+                self.bump_key_version(key);
+                true
+            }
+        }
+    }
+
+    /// EXPIRETIME: 返回 key 的绝对过期时间（Unix 秒）
+    /// -2: key 不存在, -1: 无过期时间
+    pub fn expiretime(&self, key: &str) -> i64 {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return -2;
+        }
+
+        let Some(entry) = self.data.get(key) else {
+            return -2;
+        };
+
+        let expires_at = match entry.value() {
+            StorageValue::String { expires_at, .. }
+            | StorageValue::List { expires_at, .. }
+            | StorageValue::Set { expires_at, .. }
+            | StorageValue::Hash { expires_at, .. }
+            | StorageValue::Zset { expires_at, .. }
+            | StorageValue::HyperLogLog { expires_at, .. } => expires_at,
+        };
+
+        let Some(deadline) = expires_at else {
+            return -1;
+        };
+
+        // 计算绝对时间戳
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        
+        if *deadline <= now {
+            return -2;
+        }
+
+        let remaining = deadline.duration_since(now);
+        now_unix + remaining.as_secs() as i64
+    }
+
+    /// PEXPIRETIME: 返回 key 的绝对过期时间（Unix 毫秒）
+    /// -2: key 不存在, -1: 无过期时间
+    pub fn pexpiretime(&self, key: &str) -> i64 {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return -2;
+        }
+
+        let Some(entry) = self.data.get(key) else {
+            return -2;
+        };
+
+        let expires_at = match entry.value() {
+            StorageValue::String { expires_at, .. }
+            | StorageValue::List { expires_at, .. }
+            | StorageValue::Set { expires_at, .. }
+            | StorageValue::Hash { expires_at, .. }
+            | StorageValue::Zset { expires_at, .. }
+            | StorageValue::HyperLogLog { expires_at, .. } => expires_at,
+        };
+
+        let Some(deadline) = expires_at else {
+            return -1;
+        };
+
+        let now_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        
+        if *deadline <= now {
+            return -2;
+        }
+
+        let remaining = deadline.duration_since(now);
+        now_unix_ms + remaining.as_millis() as i64
     }
 
     pub fn sinter(&self, keys: &[String]) -> Result<Vec<String>, ()> {
