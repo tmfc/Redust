@@ -1018,6 +1018,62 @@ async fn handle_string_command(
             storage.set_with_expire_millis(physical, value, millis);
             respond_simple_string(writer, "OK").await?;
         }
+        // HyperLogLog 命令
+        Command::Pfadd { key, elements } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.pfadd(&physical, &elements) {
+                Ok(changed) => {
+                    respond_integer(writer, changed).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Pfcount { keys } => {
+            let physical_keys: Vec<String> = keys
+                .iter()
+                .map(|k| prefix_key(current_db, k))
+                .collect();
+            match storage.pfcount(&physical_keys) {
+                Ok(count) => {
+                    respond_integer(writer, count as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Pfmerge {
+            destkey,
+            sourcekeys,
+        } => {
+            let physical_dest = prefix_key(current_db, &destkey);
+            let physical_sources: Vec<String> = sourcekeys
+                .iter()
+                .map(|k| prefix_key(current_db, k))
+                .collect();
+            match storage.pfmerge(&physical_dest, &physical_sources) {
+                Ok(()) => {
+                    respond_simple_string(writer, "OK").await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
         _ => {}
     }
 
@@ -2544,6 +2600,11 @@ async fn execute_command_in_transaction(
             handle_zset_command(cmd, storage, writer, current_db).await?;
         }
 
+        // HyperLogLog 命令
+        Command::Pfadd { .. } | Command::Pfcount { .. } | Command::Pfmerge { .. } => {
+            handle_string_command(cmd, storage, writer, current_db).await?;
+        }
+
         // key meta 命令
         Command::Type { .. }
         | Command::Keys { .. }
@@ -2937,6 +2998,11 @@ async fn handle_connection(
             | Command::Zincrby { .. }
             | Command::Zscan { .. } => {
                 handle_zset_command(cmd, &storage, &mut write_half, current_db).await?;
+            }
+
+            // HyperLogLog 命令
+            Command::Pfadd { .. } | Command::Pfcount { .. } | Command::Pfmerge { .. } => {
+                handle_string_command(cmd, &storage, &mut write_half, current_db).await?;
             }
 
             // 持久化控制

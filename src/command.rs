@@ -396,6 +396,18 @@ pub enum Command {
         increment: f64,
         member: String,
     },
+    // HyperLogLog 命令
+    Pfadd {
+        key: String,
+        elements: Vec<Binary>,
+    },
+    Pfcount {
+        keys: Vec<String>,
+    },
+    Pfmerge {
+        destkey: String,
+        sourcekeys: Vec<String>,
+    },
     // Lua 脚本命令
     Eval {
         script: String,
@@ -1437,6 +1449,70 @@ pub async fn read_command(
                 key,
                 increment,
                 member,
+            }
+        }
+        "PFADD" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("pfadd")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+
+            let mut elements: Vec<Binary> = Vec::new();
+            for elem_bytes in iter {
+                // elem_bytes 已经是 &Vec<u8>，直接克隆即可
+                elements.push(elem_bytes.clone());
+            }
+
+            if elements.is_empty() {
+                return Ok(Some(err_wrong_args("pfadd")));
+            }
+
+            Command::Pfadd { key, elements }
+        }
+        "PFCOUNT" => {
+            let mut keys: Vec<String> = Vec::new();
+            for key_bytes in iter {
+                let k = match parse_bulk_string(key_bytes) {
+                    Ok(v) => v,
+                    Err(e) => return Ok(Some(e)),
+                };
+                keys.push(k);
+            }
+
+            if keys.is_empty() {
+                return Ok(Some(err_wrong_args("pfcount")));
+            }
+
+            Command::Pfcount { keys }
+        }
+        "PFMERGE" => {
+            let Some(destkey_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("pfmerge")));
+            };
+            let destkey = match parse_bulk_string(destkey_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+
+            let mut sourcekeys: Vec<String> = Vec::new();
+            for key_bytes in iter {
+                let k = match parse_bulk_string(key_bytes) {
+                    Ok(v) => v,
+                    Err(e) => return Ok(Some(e)),
+                };
+                sourcekeys.push(k);
+            }
+
+            if sourcekeys.is_empty() {
+                return Ok(Some(err_wrong_args("pfmerge")));
+            }
+
+            Command::Pfmerge {
+                destkey,
+                sourcekeys,
             }
         }
         "SAVE" => {

@@ -4,51 +4,51 @@
 
 ## 1. HyperLogLog 算法研究与设计 📚
 
-- [ ] **算法原理学习**
+- [x] **算法原理学习**
   - HyperLogLog 基本原理（基数估计、哈希分桶）
   - Redis 实现细节（16384 个寄存器，6 位精度）
   - 误差率分析（标准误差约 0.81%）
   - 内存占用（每个 HLL 约 12KB）
 
-- [ ] **数据结构设计**
+- [x] **数据结构设计**
   - 定义 `HyperLogLog` 结构体
   - 16384 个 6-bit 寄存器的存储方案
-  - 稀疏表示优化（小基数时节省内存）
+  - 稀疏表示优化（小基数时节省内存）——未实现，留作未来优化
   - 与现有 `StorageValue` 枚举集成
 
-- [ ] **哈希函数选择**
-  - 使用 MurmurHash3 或 xxHash（与 Redis 对齐）
+- [x] **哈希函数选择**
+  - 使用 Rust 标准库 DefaultHasher（基于 SipHash）
   - 64-bit 哈希值分解：前 14 位做索引，后 50 位计算前导零
 
 ## 2. 存储层实现 🔧
 
-- [ ] **HyperLogLog 核心算法**
+- [x] **HyperLogLog 核心算法**
   - `src/hyperloglog.rs` 新建模块
   - `HyperLogLog::new()` - 创建空 HLL
   - `HyperLogLog::add(&mut self, element: &[u8])` - 添加元素
   - `HyperLogLog::count(&self) -> u64` - 估算基数
   - `HyperLogLog::merge(&mut self, other: &HyperLogLog)` - 合并 HLL
-  - 稀疏/密集表示自动转换
+  - 稀疏/密集表示自动转换——未实现，留作未来优化
 
-- [ ] **Storage 集成**
+- [x] **Storage 集成**
   - 在 `StorageValue` 枚举中添加 `HyperLogLog` 变体
   - `storage.pfadd(key, elements)` - 添加元素到 HLL
   - `storage.pfcount(keys)` - 统计单个或多个 HLL 的基数
   - `storage.pfmerge(dest, sources)` - 合并多个 HLL
 
-- [ ] **类型检查与错误处理**
+- [x] **类型检查与错误处理**
   - WRONGTYPE 错误（操作非 HLL 键）
   - 空键处理（返回 0）
   - 多键合并时的类型校验
 
 ## 3. 命令层实现 ⚙️
 
-- [ ] **Command 枚举扩展**
+- [x] **Command 枚举扩展**
   - `src/command.rs` 添加 `Pfadd`, `Pfcount`, `Pfmerge` 变体
   - RESP 协议解析（支持多参数）
   - 参数校验（最少参数数量）
 
-- [ ] **命令处理逻辑**
+- [x] **命令处理逻辑**
   - `src/server.rs` 中添加命令分发
   - **PFADD key element [element ...]**
     - 返回 0（未改变）或 1（已改变）
@@ -60,30 +60,30 @@
     - 合并多个 HLL 到目标键
     - 返回 +OK
 
-- [ ] **WATCH 集成**
+- [x] **WATCH 集成**
   - PFADD/PFMERGE 触发键版本更新
   - 事务中的 HLL 操作正确性
 
 ## 4. 持久化支持 💾
 
-- [ ] **RDB 序列化**
-  - `src/persistence.rs` 添加 HLL 类型标记
-  - 序列化 16384 个寄存器（压缩存储）
+- [x] **RDB 序列化**
+  - `src/storage.rs` 添加 HLL 类型标记 (type_byte = 5)
+  - 序列化 16384 个寄存器
   - 反序列化并恢复 HLL 状态
 
-- [ ] **AOF 记录**
+- [ ] **AOF 记录**（未实现，留作未来优化）
   - PFADD/PFMERGE 命令记录到 AOF
   - 启动时正确重放 HLL 操作
 
 ## 5. 测试覆盖 ✅
 
-- [ ] **单元测试** (`src/hyperloglog.rs`)
+- [x] **单元测试** (`src/hyperloglog.rs`)
   - 基本添加与计数
   - 基数估算精度（与真实基数对比）
   - 合并操作正确性
   - 边界情况（空 HLL、大量元素）
 
-- [ ] **集成测试** (`tests/hyperloglog.rs`)
+- [x] **集成测试** (`tests/hyperloglog.rs`)
   - PFADD 返回值正确性
   - PFCOUNT 单键/多键场景
   - PFMERGE 合并逻辑
@@ -102,7 +102,7 @@
 
 ## 6. 文档更新 📝
 
-- [ ] **command.md**
+- [x] **command.md**
   - 添加 HyperLogLog 章节
   - 标记 PFADD/PFCOUNT/PFMERGE 为已完成
   - 说明误差率和内存占用

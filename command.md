@@ -455,9 +455,9 @@
 
 ### HyperLogLog
 
-- [ ] PFADD
-- [ ] PFCOUNT
-- [ ] PFMERGE
+- [x] PFADD
+- [x] PFCOUNT
+- [x] PFMERGE
 
 ### Bitmaps
 

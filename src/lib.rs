@@ -1,4 +1,5 @@
 pub mod command;
+pub mod hyperloglog;
 pub mod resp;
 pub mod scripting;
 pub mod server;
