@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'  # 只在推送 v1.2.3 这样的 tag 时触发
+
+jobs:
+  build-and-release:
+    name: Build and Release (Linux)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 需要完整历史来生成 changelog 和检查 main
+
+      - name: Ensure tag is on main
+        run: |
+          # 当前 ref 是 tag，对应的 commit 就是 HEAD
+          TAG_COMMIT=$(git rev-parse HEAD)
+
+          # 拉取远程 main，获取 main 最新 commit
+          git fetch origin main
+          MAIN_COMMIT=$(git rev-parse origin/main)
+
+          echo "TAG_COMMIT=$TAG_COMMIT"
+          echo "MAIN_COMMIT=$MAIN_COMMIT"
+
+          # 要求：当前 tag 所在 commit 必须等于 main 最新 commit
+          if [ "$TAG_COMMIT" != "$MAIN_COMMIT" ]; then
+            echo "ERROR: 只允许在 main 最新提交上打 tag 进行发布。"
+            exit 1
+          fi
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Build (release)
+        run: cargo build --release
+
+      # 如果你的可执行文件名字不是 redust，这里改成对应名字
+      - name: Prepare Linux binary
+        run: |
+          mkdir -p dist
+          cp target/release/redust dist/redust-linux-x86_64
+
+      - name: Generate changelog
+        run: |
+          # 找到上一个 tag（不包括当前 tag）
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ || echo "")
+
+          echo "## $(git describe --tags --abbrev=0 HEAD) Changelog" > changelog.md
+          echo >> changelog.md
+
+          if [ -z "$PREV_TAG" ]; then
+            echo "_这是第一个版本，列出当前所有提交：_" >> changelog.md
+            echo >> changelog.md
+            git log --pretty=format:"- %s (%h)" >> changelog.md
+          else
+            echo "_从 $PREV_TAG 到当前版本的变更：_" >> changelog.md
+            echo >> changelog.md
+            git log "$PREV_TAG"..HEAD --pretty=format:"- %s (%h)" >> changelog.md
+          fi
+
+          echo >> changelog.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/redust-linux-x86_64
+          body_path: changelog.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
