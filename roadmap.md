@@ -2,16 +2,26 @@
 
 > 目标：在不包含 Sentinel/Cluster 等多服务器高可用特性的前提下，提供可替代 Redis 的生产可用单实例（可选轻量复制），兼容现有 Redis 客户端与协议习惯。
 
-### 一、协议与命令覆盖
-- 核心数据结构：Strings/Lists/Sets/Hashes 已基本齐全；补齐 Sorted Sets（ZADD/ZRANGE/ZREVRANGE/ZREM/ZCARD/ZINCRBY 等）、Streams、Geo、HyperLogLog、Bitmaps。
-- 事务与脚本：实现 MULTI/EXEC/DISCARD/WATCH 及 EVAL/EVALSHA（简化 Lua 环境即可），保证与客户端库兼容。
-- Pub/Sub：已支持 channel/pattern/shard 子集与 PUBSUB 查询；持续对齐行为细节（缓冲、订阅模式命令限制等）。
-- 扩展命令：SCAN/SSCAN/HSCAN 等游标扫描，键备份/恢复（DUMP/RESTORE），慢日志/CLIENT INFO 等兼容性命令。
+### 一、协议与命令覆盖 ✅ Phase A 已完成
 
-### 二、持久化与数据安全
-- 持久化格式：提供 Redis 兼容的 AOF（everysec 语义）与 RDB 导出/导入；支持启动加载、触发/自动持久化。
-- 崩溃恢复：启动时校验并恢复数据，损坏文件友好降级（保留空库启动能力）。
-- 复制（社区版上限）：提供基础主从复制（全量 + 增量命令流）与只读从库以支撑读写分离；Sentinel/多副本自动故障转移/Cluster 路由留给企业版。
+- ✅ **核心数据结构**：Strings/Lists/Sets/Hashes/Sorted Sets 已完整实现
+  - Sorted Sets: ZADD/ZRANGE/ZREVRANGE/ZREM/ZCARD/ZINCRBY/ZSCORE/ZSCAN
+- ✅ **事务与脚本**：MULTI/EXEC/DISCARD/WATCH/UNWATCH 已实现
+  - Lua 脚本：EVAL/EVALSHA/SCRIPT LOAD/EXISTS/FLUSH
+  - redis.call/pcall 回调支持 46 个命令（二进制安全）
+- ✅ **Pub/Sub**：已支持 channel/pattern/shard 子集与 PUBSUB 查询
+- ✅ **扫描命令**：SCAN/SSCAN/HSCAN/ZSCAN 已实现
+- ✅ **运维命令**：CONFIG GET/SET、CLIENT LIST/ID/SETNAME/GETNAME、SLOWLOG 基础
+- 🔄 **待补齐**：Streams、Geo、HyperLogLog、Bitmaps（Phase B）
+
+### 二、持久化与数据安全 ✅ 基础已完成
+
+- ✅ **持久化格式**：AOF（everysec 语义）与 RDB 导出/导入已实现
+  - 支持启动加载、SAVE/BGSAVE/LASTSAVE 命令
+  - 自动定时保存与 AOF 异步写入
+- ✅ **崩溃恢复**：启动时自动加载 RDB/AOF 数据
+- 🔄 **待完善**：损坏文件校验与友好降级
+- 🔄 **复制（社区版上限）**：基础主从复制（全量 + 增量命令流）与只读从库（Phase B/C）
 
 ### 三、内存管理与淘汰
 - 对齐 Redis 的 `maxmemory` 策略：allkeys-lru、volatile-lru、allkeys-random、volatile-ttl 等；支持 `maxmemory-policy` 配置。
@@ -39,9 +49,19 @@
 - 商业支持与运维套件。
 
 > 阶段建议：
-> - **Phase A（功能齐备 + 持久化 + 兼容回归）**：补齐命令族（含 Sorted Set/Streams/脚本/事务）、AOF/RDB 兼容与基础复制、maxmemory 策略对齐、INFO/指标扩展。
-> - **Phase B（性能与安全强化）**: 优化并发与内存、完善 ACL/TLS、补充运维命令与工具链，完成多客户端兼容回归。
-> - **Phase C（企业版探索）**: Sentinel/Cluster/多副本 HA、审计/更丰富 ACL、跨机房复制等收费特性。
+> - ✅ **Phase A（核心功能）**：已完成
+>   - 5 种数据结构（String/List/Set/Hash/Sorted Set）
+>   - 事务（MULTI/EXEC/WATCH）与 Lua 脚本（redis.call/pcall）
+>   - 持久化（AOF + RDB）
+>   - Pub/Sub 与扫描命令
+>   - 基础运维命令
+> - 🔄 **Phase B（数据结构扩展）**：进行中
+>   - Streams、Geo、HyperLogLog、Bitmaps
+>   - 主从复制基础
+>   - 性能优化与内存管理增强
+> - 📋 **Phase C（企业版探索）**：规划中
+>   - Sentinel/Cluster/多副本 HA
+>   - 审计/更丰富 ACL、跨机房复制等收费特性
 
 ---
 

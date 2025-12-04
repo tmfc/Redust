@@ -11,6 +11,9 @@ rand = "0.8"
 log = "0.4"
 env_logger = "0.11"
 ordered-float = "3.9"
+mlua = { version = "0.9", features = ["lua54", "vendored"] }
+sha1 = "0.10"
+hex = "0.4"
 
 [dev-dependencies]
 redis = { version = "0.25", features = ["tokio-comp"] }

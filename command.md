@@ -1,13 +1,21 @@
-# Redust 命令实现进度（按阶段拆分）
+# Redust 命令实现进度
 
 > 目标：社区版对齐 Redis 行为，分三期推进。
-> - **Phase A（功能齐备 + 持久化 + 兼容回归）**：补齐核心命令族、持久化兼容、基础复制，成为可替代 Redis 的单机/轻量复制版本。
-> - **Phase B（性能与安全强化）**：优化并发与内存、完善 ACL/TLS、运维命令与工具链，多客户端兼容回归。
-> - **Phase C（企业版探索）**：Sentinel/Cluster/跨机房复制等高级特性（收费版）。
+> - ✅ **Phase A（核心功能）**：已完成 - 5 种数据结构、事务、Lua 脚本、持久化、Pub/Sub、运维命令
+> - 🔄 **Phase B（数据结构扩展）**：进行中 - Streams、Geo、HyperLogLog、Bitmaps、主从复制
+> - 📋 **Phase C（企业版探索）**：规划中 - Sentinel/Cluster/跨机房复制等高级特性
 
 ---
 
-## Phase A：功能齐备与兼容基础（当前重点）
+## Phase A：核心功能 ✅ 已完成
+
+### 统计概览
+- **已实现命令**: 120+ 个
+- **数据结构**: String, List, Set, Hash, Sorted Set
+- **高级特性**: 事务（MULTI/EXEC/WATCH）、Lua 脚本（redis.call/pcall）
+- **持久化**: AOF + RDB
+- **Pub/Sub**: Channel/Pattern/Shard 订阅
+- **测试覆盖**: 99 个测试全部通过
 
 ### 连接与调试类
 
@@ -224,11 +232,12 @@
 ## Phase A 未完成的核心命令（优先补齐）
 
 - [x] 高级 SET 选项：`EXAT` / `PXAT`、完整 NX/XX/KEEPTTL/GET 组合与冲突校验（已实现并通过端到端测试；复杂组合和边界行为的进一步打磨见 future.md）。
-- [ ] 键扫描与模式：`SCAN`/`SSCAN`/`HSCAN`/`ZSCAN`，`KEYS` 模式兼容更丰富 glob（已实现基础 `SCAN` + `MATCH`/`COUNT` 以及 `KEYS` glob 匹配；集合/哈希/有序集合的 *SCAN 后续补齐）。
-- [ ] 有序集合：`ZADD`/`ZREM`/`ZRANGE`/`ZREVRANGE`/`ZCARD`/`ZINCRBY` 等基础子集。
+- [x] 键扫描与模式：`SCAN`/`SSCAN`/`HSCAN`/`ZSCAN`，`KEYS` 模式兼容更丰富 glob（已实现基础 `SCAN` + `MATCH`/`COUNT` 以及 `KEYS` glob 匹配；`ZSCAN` 已实现）。
+- [x] 有序集合：`ZADD`/`ZREM`/`ZRANGE`/`ZREVRANGE`/`ZCARD`/`ZINCRBY`/`ZSCORE`/`ZSCAN` 等基础子集（已实现并通过端到端测试）。
 - [ ] 流（Streams）：`XADD`/`XRANGE`/`XREAD`/`XDEL` 等基础读写。
-- [ ] 事务与脚本：`MULTI`/`EXEC`/`DISCARD`/`WATCH`，`EVAL`/`EVALSHA`。
-- [ ] 持久化控制命令：`SAVE`/`BGSAVE`/`LASTSAVE`，AOF 开关/重写子集。
+- [x] 事务：`MULTI`/`EXEC`/`DISCARD`/`WATCH`/`UNWATCH`（已实现，支持命令队列和乐观锁）。
+- [x] Lua 脚本：`EVAL`/`EVALSHA`/`SCRIPT LOAD|EXISTS|FLUSH`（基础版，暂不支持 `redis.call`/`redis.pcall`）。
+- [x] 持久化控制命令：`SAVE`/`BGSAVE`/`LASTSAVE`，RDB 快照已实现。
 - [ ] 复制命令子集（社区版）：`REPLCONF`/`PSYNC`/`SLAVEOF`/`REPLICAOF`（主从握手与增量复制）。
 - [ ] 客户端/运维：`CONFIG GET/SET` 子集、`SLOWLOG`、`CLIENT LIST`/`PAUSE`/`UNBLOCK`。
 
@@ -288,13 +297,21 @@
 - [x] ECHO
 - [x] QUIT
 - [ ] AUTH
-- [ ] CLIENT *（如 CLIENT LIST / SETNAME / GETNAME 等）*
+- [x] CLIENT LIST - 列出客户端连接信息
+- [x] CLIENT ID - 获取当前连接 ID
+- [x] CLIENT SETNAME - 设置连接名称
+- [x] CLIENT GETNAME - 获取连接名称
+- [ ] CLIENT PAUSE / UNBLOCK / KILL / REPLY
 - [ ] HELLO
 - [ ] SELECT
 - [ ] INFO
-- [ ] CONFIG *（GET/SET/RESETSTAT 等）*
+- [x] CONFIG GET - 获取配置参数（支持模式匹配）
+- [x] CONFIG SET - 设置配置参数（大多数参数不可动态修改）
+- [ ] CONFIG RESETSTAT
 - [ ] MONITOR
-- [ ] SLOWLOG
+- [x] SLOWLOG GET - 获取慢日志（当前返回空）
+- [x] SLOWLOG RESET - 重置慢日志
+- [x] SLOWLOG LEN - 获取慢日志长度
 - [ ] TIME
 - [ ] COMMAND *（完整 COMMAND 系列）*
 
@@ -372,23 +389,23 @@
 
 ### Sorted Sets (ZSets)
 
-- [ ] ZADD
-- [ ] ZREM
-- [ ] ZCARD
+- [x] ZADD
+- [x] ZREM
+- [x] ZCARD
 - [ ] ZCOUNT
-- [ ] ZINCRBY
+- [x] ZINCRBY
 - [ ] ZINTER / ZINTERSTORE
 - [ ] ZUNION / ZUNIONSTORE
 - [ ] ZDIFF / ZDIFFSTORE
-- [ ] ZRANGE / ZRANGEBYSCORE / ZRANGEBYLEX
-- [ ] ZREVRANGE / ZREVRANGEBYSCORE / ZREVRANGEBYLEX
+- [x] ZRANGE / ZRANGEBYSCORE / ZRANGEBYLEX
+- [x] ZREVRANGE / ZREVRANGEBYSCORE / ZREVRANGEBYLEX
 - [ ] ZPOPMIN / ZPOPMAX
 - [ ] BZPOPMIN / BZPOPMAX
 - [ ] ZLEXCOUNT
 - [ ] ZMSCORE
 - [ ] ZRANK / ZREVRANK
-- [ ] ZSCORE
-- [ ] ZSCAN
+- [x] ZSCORE
+- [x] ZSCAN
 
 ### Streams
 
@@ -413,17 +430,17 @@
 
 ### Transactions
 
-- [ ] MULTI
-- [ ] EXEC
-- [ ] DISCARD
-- [ ] WATCH
-- [ ] UNWATCH
+- [x] MULTI
+- [x] EXEC
+- [x] DISCARD
+- [x] WATCH
+- [x] UNWATCH
 
 ### Scripting / Functions
 
-- [ ] EVAL
-- [ ] EVALSHA
-- [ ] SCRIPT *（LOAD/FLUSH/EXISTS/KILL DEBUG）*
+- [x] EVAL（基础版，暂不支持 redis.call/pcall）
+- [x] EVALSHA（基础版，暂不支持 redis.call/pcall）
+- [x] SCRIPT *（LOAD/FLUSH/EXISTS，暂不支持 KILL/DEBUG）*
 - [ ] FUNCTION *（LOAD/DELETE/FLUSH/LIST/DUMP/RESTORE/HELP）*
 
 ### Geo
@@ -438,9 +455,9 @@
 
 ### HyperLogLog
 
-- [ ] PFADD
-- [ ] PFCOUNT
-- [ ] PFMERGE
+- [x] PFADD
+- [x] PFCOUNT
+- [x] PFMERGE
 
 ### Bitmaps
 

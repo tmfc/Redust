@@ -20,7 +20,11 @@ use crate::resp::{
     respond_bulk_bytes, respond_bulk_string, respond_error, respond_integer, respond_null_bulk,
     respond_simple_string,
 };
+use crate::scripting::{execute_script, ScriptCache, ScriptContext};
 use crate::storage::Storage;
+
+// 全局客户端 ID 计数器
+static CLIENT_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 struct Metrics {
     start_time: Instant,
@@ -1013,6 +1017,62 @@ async fn handle_string_command(
             }
             storage.set_with_expire_millis(physical, value, millis);
             respond_simple_string(writer, "OK").await?;
+        }
+        // HyperLogLog 命令
+        Command::Pfadd { key, elements } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.pfadd(&physical, &elements) {
+                Ok(changed) => {
+                    respond_integer(writer, changed).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Pfcount { keys } => {
+            let physical_keys: Vec<String> = keys
+                .iter()
+                .map(|k| prefix_key(current_db, k))
+                .collect();
+            match storage.pfcount(&physical_keys) {
+                Ok(count) => {
+                    respond_integer(writer, count as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Pfmerge {
+            destkey,
+            sourcekeys,
+        } => {
+            let physical_dest = prefix_key(current_db, &destkey);
+            let physical_sources: Vec<String> = sourcekeys
+                .iter()
+                .map(|k| prefix_key(current_db, k))
+                .collect();
+            match storage.pfmerge(&physical_dest, &physical_sources) {
+                Ok(()) => {
+                    respond_simple_string(writer, "OK").await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
         }
         _ => {}
     }
@@ -2540,6 +2600,11 @@ async fn execute_command_in_transaction(
             handle_zset_command(cmd, storage, writer, current_db).await?;
         }
 
+        // HyperLogLog 命令
+        Command::Pfadd { .. } | Command::Pfcount { .. } | Command::Pfmerge { .. } => {
+            handle_string_command(cmd, storage, writer, current_db).await?;
+        }
+
         // key meta 命令
         Command::Type { .. }
         | Command::Keys { .. }
@@ -2567,6 +2632,15 @@ async fn execute_command_in_transaction(
             respond_error(writer, "ERR command not allowed in transaction").await?;
         }
 
+        // Lua 脚本命令在事务中不支持（简化实现）
+        Command::Eval { .. }
+        | Command::Evalsha { .. }
+        | Command::ScriptLoad { .. }
+        | Command::ScriptExists { .. }
+        | Command::ScriptFlush => {
+            respond_error(writer, "ERR EVAL/SCRIPT commands not supported in transaction").await?;
+        }
+
         // 其他命令返回错误
         _ => {
             respond_error(writer, "ERR command not supported in transaction").await?;
@@ -2582,6 +2656,7 @@ async fn handle_connection(
     pubsub: PubSubHub,
     overflow_strategy: PubSubOverflowStrategy,
     persistence: Arc<PersistenceState>,
+    script_cache: Arc<ScriptCache>,
 ) -> io::Result<()> {
     let peer_addr = stream.peer_addr().ok();
     info!("[conn] new connection from {:?}", peer_addr);
@@ -2591,6 +2666,10 @@ async fn handle_connection(
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut current_db: u8 = 0;
+    
+    // 客户端标识
+    let client_id = CLIENT_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut client_name = String::new();
 
     let auth_password = env::var("REDUST_AUTH_PASSWORD")
         .ok()
@@ -2919,6 +2998,11 @@ async fn handle_connection(
             | Command::Zincrby { .. }
             | Command::Zscan { .. } => {
                 handle_zset_command(cmd, &storage, &mut write_half, current_db).await?;
+            }
+
+            // HyperLogLog 命令
+            Command::Pfadd { .. } | Command::Pfcount { .. } | Command::Pfmerge { .. } => {
+                handle_string_command(cmd, &storage, &mut write_half, current_db).await?;
             }
 
             // 持久化控制
@@ -3282,6 +3366,125 @@ async fn handle_connection(
                 unreachable!("transaction commands should be handled earlier");
             }
 
+            // Lua 脚本命令
+            Command::Eval { script, keys, args } => {
+                // 缓存脚本
+                script_cache.load(&script);
+                
+                let ctx = ScriptContext {
+                    storage: Arc::new(storage.clone()),
+                    current_db: current_db as u32,
+                    keys,
+                    args,
+                };
+                match execute_script(&script, ctx) {
+                    Ok(result) => {
+                        let resp = result.to_resp_bytes();
+                        write_half.write_all(&resp).await?;
+                    }
+                    Err(e) => {
+                        respond_error(&mut write_half, &e).await?;
+                    }
+                }
+            }
+            Command::Evalsha { sha1, keys, args } => {
+                match script_cache.get(&sha1) {
+                    Some(script) => {
+                        let ctx = ScriptContext {
+                            storage: Arc::new(storage.clone()),
+                            current_db: current_db as u32,
+                            keys,
+                            args,
+                        };
+                        match execute_script(&script, ctx) {
+                            Ok(result) => {
+                                let resp = result.to_resp_bytes();
+                                write_half.write_all(&resp).await?;
+                            }
+                            Err(e) => {
+                                respond_error(&mut write_half, &e).await?;
+                            }
+                        }
+                    }
+                    None => {
+                        respond_error(&mut write_half, "NOSCRIPT No matching script. Please use EVAL.").await?;
+                    }
+                }
+            }
+            Command::ScriptLoad { script } => {
+                let sha1 = script_cache.load(&script);
+                respond_bulk_string(&mut write_half, &sha1).await?;
+            }
+            Command::ScriptExists { sha1s } => {
+                let results = script_cache.exists(&sha1s);
+                let mut resp = format!("*{}\r\n", results.len());
+                for exists in results {
+                    resp.push_str(&format!(":{}\r\n", if exists { 1 } else { 0 }));
+                }
+                write_half.write_all(resp.as_bytes()).await?;
+            }
+            Command::ScriptFlush => {
+                script_cache.flush();
+                respond_simple_string(&mut write_half, "OK").await?;
+            }
+
+            // 运维命令
+            Command::ConfigGet { pattern } => {
+                // 返回匹配的配置参数
+                let configs = get_config_values(&pattern);
+                let mut resp = format!("*{}\r\n", configs.len() * 2);
+                for (key, value) in configs {
+                    resp.push_str(&format!("${}\r\n{}\r\n", key.len(), key));
+                    resp.push_str(&format!("${}\r\n{}\r\n", value.len(), value));
+                }
+                write_half.write_all(resp.as_bytes()).await?;
+            }
+            Command::ConfigSet { parameter, value } => {
+                // 尝试设置配置参数
+                match set_config_value(&parameter, &value) {
+                    Ok(()) => respond_simple_string(&mut write_half, "OK").await?,
+                    Err(e) => respond_error(&mut write_half, &e).await?,
+                }
+            }
+            Command::ClientList => {
+                // 返回当前连接信息（简化版）
+                let info = format!(
+                    "id={} addr={} name={} db={}\n",
+                    client_id,
+                    peer_addr.map(|a| a.to_string()).unwrap_or_else(|| "unknown".to_string()),
+                    client_name,
+                    current_db
+                );
+                let resp = format!("${}\r\n{}\r\n", info.len(), info);
+                write_half.write_all(resp.as_bytes()).await?;
+            }
+            Command::ClientId => {
+                respond_integer(&mut write_half, client_id as i64).await?;
+            }
+            Command::ClientSetname { name } => {
+                client_name = name;
+                respond_simple_string(&mut write_half, "OK").await?;
+            }
+            Command::ClientGetname => {
+                if client_name.is_empty() {
+                    write_half.write_all(b"$-1\r\n").await?;
+                } else {
+                    let resp = format!("${}\r\n{}\r\n", client_name.len(), client_name);
+                    write_half.write_all(resp.as_bytes()).await?;
+                }
+            }
+            Command::SlowlogGet { count } => {
+                // 简化实现：返回空数组
+                let _ = count;
+                write_half.write_all(b"*0\r\n").await?;
+            }
+            Command::SlowlogReset => {
+                respond_simple_string(&mut write_half, "OK").await?;
+            }
+            Command::SlowlogLen => {
+                respond_integer(&mut write_half, 0).await?;
+            }
+
             // 解析阶段构造的错误命令
             Command::Error(msg) => {
                 respond_error(&mut write_half, &msg).await?;
@@ -3466,6 +3669,7 @@ pub async fn serve(
         pubsub_messages_dropped: AtomicU64::new(0),
     });
     let pubsub = PubSubHub::new();
+    let script_cache = Arc::new(ScriptCache::new());
 
     if let Ok(metrics_addr) = env::var("REDUST_METRICS_ADDR") {
         if !metrics_addr.is_empty() {
@@ -3498,8 +3702,9 @@ pub async fn serve(
                 };
                 info!("Accepted connection from {}", addr);
                 let persistence_clone = persistence.clone();
+                let script_cache_clone = script_cache.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_connection(stream, storage, metrics, pubsub, overflow_strategy, persistence_clone.clone()).await {
+                    if let Err(err) = handle_connection(stream, storage, metrics, pubsub, overflow_strategy, persistence_clone.clone(), script_cache_clone).await {
                         error!("Connection error: {}", err);
                     }
                 });
@@ -3538,4 +3743,70 @@ pub async fn run_server(
     info!("Redust listening on {}", local_addr);
 
     serve(listener, shutdown).await
+}
+
+// ============================================================================
+// CONFIG GET/SET 辅助函数
+// ============================================================================
+
+/// 获取匹配模式的配置值
+fn get_config_values(pattern: &str) -> Vec<(String, String)> {
+    let mut results = Vec::new();
+    
+    // 支持的配置参数
+    let configs = [
+        ("maxmemory", env::var("REDUST_MAXMEMORY_BYTES").unwrap_or_else(|_| "0".to_string())),
+        ("maxmemory-policy", "noeviction".to_string()),
+        ("timeout", "0".to_string()),
+        ("tcp-keepalive", "300".to_string()),
+        ("databases", "16".to_string()),
+        ("save", "".to_string()),
+        ("appendonly", env::var("REDUST_AOF_ENABLED").unwrap_or_else(|_| "no".to_string())),
+        ("appendfsync", "everysec".to_string()),
+        ("dir", ".".to_string()),
+        ("dbfilename", env::var("REDUST_RDB_PATH").unwrap_or_else(|_| "redust.rdb".to_string())),
+        ("appendfilename", env::var("REDUST_AOF_PATH").unwrap_or_else(|_| "redust.aof".to_string())),
+        ("requirepass", if env::var("REDUST_AUTH_PASSWORD").is_ok() { "yes".to_string() } else { "".to_string() }),
+        ("loglevel", "notice".to_string()),
+        ("slowlog-log-slower-than", "10000".to_string()),
+        ("slowlog-max-len", "128".to_string()),
+    ];
+    
+    for (key, value) in configs {
+        if pattern_match_config(pattern, key) {
+            results.push((key.to_string(), value));
+        }
+    }
+    
+    results
+}
+
+/// 设置配置值（大多数配置在运行时不可修改）
+fn set_config_value(parameter: &str, _value: &str) -> Result<(), String> {
+    // 大多数配置在运行时不可修改，返回错误
+    match parameter.to_lowercase().as_str() {
+        "maxmemory" | "timeout" | "tcp-keepalive" | "slowlog-log-slower-than" | "slowlog-max-len" => {
+            // 这些配置理论上可以动态修改，但我们简化实现，暂不支持
+            Err(format!("ERR Unsupported CONFIG parameter: {}", parameter))
+        }
+        _ => {
+            Err(format!("ERR Unsupported CONFIG parameter: {}", parameter))
+        }
+    }
+}
+
+/// 简单的配置模式匹配（支持 * 通配符）
+fn pattern_match_config(pattern: &str, key: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if pattern.ends_with('*') {
+        let prefix = &pattern[..pattern.len() - 1];
+        return key.starts_with(prefix);
+    }
+    if pattern.starts_with('*') {
+        let suffix = &pattern[1..];
+        return key.ends_with(suffix);
+    }
+    pattern.eq_ignore_ascii_case(key)
 }

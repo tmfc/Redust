@@ -1,3 +1,4 @@
+use crate::hyperloglog::HyperLogLog;
 use dashmap::DashMap;
 use ordered_float::OrderedFloat;
 use rand::prelude::SliceRandom;
@@ -40,6 +41,10 @@ enum StorageValue {
     },
     Zset {
         value: ZSetInner,
+        expires_at: Option<Instant>,
+    },
+    HyperLogLog {
+        value: HyperLogLog,
         expires_at: Option<Instant>,
     },
 }
@@ -1097,6 +1102,7 @@ impl Storage {
                 StorageValue::Set { .. } => "set".to_string(),
                 StorageValue::Hash { .. } => "hash".to_string(),
                 StorageValue::Zset { .. } => "zset".to_string(),
+                StorageValue::HyperLogLog { .. } => "string".to_string(), // Redis 中 HLL 的类型显示为 string
             },
         )
     }
@@ -2054,6 +2060,9 @@ impl Storage {
                 StorageValue::Zset { expires_at, .. } => {
                     (4u8, Self::remaining_millis(*expires_at, now))
                 }
+                StorageValue::HyperLogLog { expires_at, .. } => {
+                    (5u8, Self::remaining_millis(*expires_at, now))
+                }
             };
 
             file.write_all(&[type_byte])?;
@@ -2118,6 +2127,11 @@ impl Storage {
                         file.write_all(&m_len.to_le_bytes())?;
                         file.write_all(m_bytes)?;
                     }
+                }
+                StorageValue::HyperLogLog { value: hll, .. } => {
+                    // 序列化 HyperLogLog: 直接写入 16384 个寄存器
+                    let registers = hll.registers();
+                    file.write_all(registers)?;
                 }
             }
         }
@@ -2363,6 +2377,23 @@ impl Storage {
                         expires_at,
                     }
                 }
+                5 => {
+                    // 反序列化 HyperLogLog: 读取 16384 个寄存器
+                    let mut registers = vec![0u8; 16384];
+                    if file.read_exact(&mut registers).is_err() {
+                        break;
+                    }
+                    let hll = match HyperLogLog::from_registers(registers) {
+                        Some(h) => h,
+                        None => {
+                            return Ok(());
+                        }
+                    };
+                    StorageValue::HyperLogLog {
+                        value: hll,
+                        expires_at,
+                    }
+                }
                 _ => {
                     return Ok(());
                 }
@@ -2401,7 +2432,8 @@ impl Storage {
             | StorageValue::List { expires_at, .. }
             | StorageValue::Set { expires_at, .. }
             | StorageValue::Hash { expires_at, .. }
-            | StorageValue::Zset { expires_at, .. } => {
+            | StorageValue::Zset { expires_at, .. }
+            | StorageValue::HyperLogLog { expires_at, .. } => {
                 *expires_at = Some(deadline);
                 self.bump_key_version(key);
                 true
@@ -2435,7 +2467,8 @@ impl Storage {
             | StorageValue::List { expires_at, .. }
             | StorageValue::Set { expires_at, .. }
             | StorageValue::Hash { expires_at, .. }
-            | StorageValue::Zset { expires_at, .. } => {
+            | StorageValue::Zset { expires_at, .. }
+            | StorageValue::HyperLogLog { expires_at, .. } => {
                 *expires_at = Some(deadline);
                 self.bump_key_version(key);
                 true
@@ -2462,7 +2495,8 @@ impl Storage {
             | StorageValue::List { expires_at, .. }
             | StorageValue::Set { expires_at, .. }
             | StorageValue::Hash { expires_at, .. }
-            | StorageValue::Zset { expires_at, .. } => expires_at,
+            | StorageValue::Zset { expires_at, .. }
+            | StorageValue::HyperLogLog { expires_at, .. } => expires_at,
         };
 
         let Some(deadline) = expires_at else {
@@ -2499,7 +2533,8 @@ impl Storage {
             | StorageValue::List { expires_at, .. }
             | StorageValue::Set { expires_at, .. }
             | StorageValue::Hash { expires_at, .. }
-            | StorageValue::Zset { expires_at, .. } => expires_at,
+            | StorageValue::Zset { expires_at, .. }
+            | StorageValue::HyperLogLog { expires_at, .. } => expires_at,
         };
 
         let Some(deadline) = expires_at else {
@@ -2532,7 +2567,8 @@ impl Storage {
             | StorageValue::List { expires_at, .. }
             | StorageValue::Set { expires_at, .. }
             | StorageValue::Hash { expires_at, .. }
-            | StorageValue::Zset { expires_at, .. } => {
+            | StorageValue::Zset { expires_at, .. }
+            | StorageValue::HyperLogLog { expires_at, .. } => {
                 if expires_at.is_some() {
                     *expires_at = None;
                     self.bump_key_version(key);
@@ -2683,6 +2719,7 @@ impl Storage {
             StorageValue::Set { expires_at, .. } => expires_at,
             StorageValue::Hash { expires_at, .. } => expires_at,
             StorageValue::Zset { expires_at, .. } => expires_at,
+            StorageValue::HyperLogLog { expires_at, .. } => expires_at,
         };
 
         match expires_at {
@@ -2835,6 +2872,10 @@ impl Storage {
                         .map(|(member, _)| member.len() as u64 + std::mem::size_of::<f64>() as u64)
                         .sum()
                 }
+                StorageValue::HyperLogLog { .. } => {
+                    // HyperLogLog 固定占用约 12KB (16384 个 6-bit 寄存器)
+                    12288
+                }
             };
 
             total = total.saturating_add(key_size.saturating_add(value_size));
@@ -2845,5 +2886,151 @@ impl Storage {
 
     pub fn maxmemory_bytes(&self) -> Option<u64> {
         self.maxmemory_bytes
+    }
+
+    // ========== HyperLogLog 操作 ==========
+
+    /// PFADD: 添加元素到 HyperLogLog
+    ///
+    /// 返回 1 如果 HLL 被修改（基数可能改变）
+    /// 返回 0 如果 HLL 未被修改
+    /// 返回 Err 如果 key 存在但不是 HyperLogLog 类型
+    pub fn pfadd(&self, key: &str, elements: &[Vec<u8>]) -> Result<i64, ()> {
+        let now = Instant::now();
+        self.remove_if_expired(key, now);
+        self.touch_key(key);
+
+        let mut modified = false;
+
+        if let Some(mut entry) = self.data.get_mut(key) {
+            match entry.value_mut() {
+                StorageValue::HyperLogLog { value: hll, .. } => {
+                    for element in elements {
+                        if hll.add(element) {
+                            modified = true;
+                        }
+                    }
+                }
+                _ => return Err(()), // WRONGTYPE
+            }
+        } else {
+            // 创建新的 HyperLogLog
+            let mut hll = HyperLogLog::new();
+            for element in elements {
+                if hll.add(element) {
+                    modified = true;
+                }
+            }
+            self.data.insert(
+                key.to_string(),
+                StorageValue::HyperLogLog {
+                    value: hll,
+                    expires_at: None,
+                },
+            );
+        }
+
+        if modified {
+            self.bump_key_version(key);
+        }
+
+        Ok(if modified { 1 } else { 0 })
+    }
+
+    /// PFCOUNT: 估算一个或多个 HyperLogLog 的基数
+    ///
+    /// 如果提供多个 key，会临时合并它们并返回并集的基数
+    /// 返回 Err 如果任何 key 存在但不是 HyperLogLog 类型
+    pub fn pfcount(&self, keys: &[String]) -> Result<u64, ()> {
+        let now = Instant::now();
+
+        if keys.is_empty() {
+            return Ok(0);
+        }
+
+        if keys.len() == 1 {
+            // 单个 key 的情况
+            let key = &keys[0];
+            self.remove_if_expired(key, now);
+
+            if let Some(entry) = self.data.get(key) {
+                match entry.value() {
+                    StorageValue::HyperLogLog { value: hll, .. } => Ok(hll.count()),
+                    _ => Err(()), // WRONGTYPE
+                }
+            } else {
+                Ok(0) // key 不存在，返回 0
+            }
+        } else {
+            // 多个 key 的情况：临时合并
+            let mut merged = HyperLogLog::new();
+
+            for key in keys {
+                self.remove_if_expired(key, now);
+
+                if let Some(entry) = self.data.get(key) {
+                    match entry.value() {
+                        StorageValue::HyperLogLog { value: hll, .. } => {
+                            merged.merge(hll);
+                        }
+                        _ => return Err(()), // WRONGTYPE
+                    }
+                }
+                // key 不存在时跳过
+            }
+
+            Ok(merged.count())
+        }
+    }
+
+    /// PFMERGE: 合并多个 HyperLogLog 到目标 key
+    ///
+    /// 如果目标 key 已存在，必须是 HyperLogLog 类型
+    /// 源 key 不存在时会被跳过
+    /// 返回 Err 如果任何涉及的 key 类型不匹配
+    pub fn pfmerge(&self, destkey: &str, sourcekeys: &[String]) -> Result<(), ()> {
+        let now = Instant::now();
+
+        // 收集所有源 HLL
+        let mut merged = HyperLogLog::new();
+
+        for key in sourcekeys {
+            self.remove_if_expired(key, now);
+
+            if let Some(entry) = self.data.get(key) {
+                match entry.value() {
+                    StorageValue::HyperLogLog { value: hll, .. } => {
+                        merged.merge(hll);
+                    }
+                    _ => return Err(()), // WRONGTYPE
+                }
+            }
+            // key 不存在时跳过
+        }
+
+        // 检查目标 key
+        self.remove_if_expired(destkey, now);
+
+        if let Some(mut entry) = self.data.get_mut(destkey) {
+            match entry.value_mut() {
+                StorageValue::HyperLogLog { value: dest_hll, .. } => {
+                    // 合并到现有 HLL
+                    dest_hll.merge(&merged);
+                }
+                _ => return Err(()), // WRONGTYPE
+            }
+        } else {
+            // 创建新的 HLL
+            self.data.insert(
+                destkey.to_string(),
+                StorageValue::HyperLogLog {
+                    value: merged,
+                    expires_at: None,
+                },
+            );
+        }
+
+        self.bump_key_version(destkey);
+        Ok(())
     }
 }

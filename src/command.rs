@@ -396,6 +396,55 @@ pub enum Command {
         increment: f64,
         member: String,
     },
+    // HyperLogLog 命令
+    Pfadd {
+        key: String,
+        elements: Vec<Binary>,
+    },
+    Pfcount {
+        keys: Vec<String>,
+    },
+    Pfmerge {
+        destkey: String,
+        sourcekeys: Vec<String>,
+    },
+    // Lua 脚本命令
+    Eval {
+        script: String,
+        keys: Vec<String>,
+        args: Vec<String>,
+    },
+    Evalsha {
+        sha1: String,
+        keys: Vec<String>,
+        args: Vec<String>,
+    },
+    ScriptLoad {
+        script: String,
+    },
+    ScriptExists {
+        sha1s: Vec<String>,
+    },
+    ScriptFlush,
+    // 运维命令
+    ConfigGet {
+        pattern: String,
+    },
+    ConfigSet {
+        parameter: String,
+        value: String,
+    },
+    ClientList,
+    ClientId,
+    ClientSetname {
+        name: String,
+    },
+    ClientGetname,
+    SlowlogGet {
+        count: Option<usize>,
+    },
+    SlowlogReset,
+    SlowlogLen,
     Unknown(Vec<Binary>),
     /// Represents an error that should be sent back to the client.
     Error(String),
@@ -1400,6 +1449,70 @@ pub async fn read_command(
                 key,
                 increment,
                 member,
+            }
+        }
+        "PFADD" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("pfadd")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+
+            let mut elements: Vec<Binary> = Vec::new();
+            for elem_bytes in iter {
+                // elem_bytes 已经是 &Vec<u8>，直接克隆即可
+                elements.push(elem_bytes.clone());
+            }
+
+            if elements.is_empty() {
+                return Ok(Some(err_wrong_args("pfadd")));
+            }
+
+            Command::Pfadd { key, elements }
+        }
+        "PFCOUNT" => {
+            let mut keys: Vec<String> = Vec::new();
+            for key_bytes in iter {
+                let k = match parse_bulk_string(key_bytes) {
+                    Ok(v) => v,
+                    Err(e) => return Ok(Some(e)),
+                };
+                keys.push(k);
+            }
+
+            if keys.is_empty() {
+                return Ok(Some(err_wrong_args("pfcount")));
+            }
+
+            Command::Pfcount { keys }
+        }
+        "PFMERGE" => {
+            let Some(destkey_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("pfmerge")));
+            };
+            let destkey = match parse_bulk_string(destkey_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+
+            let mut sourcekeys: Vec<String> = Vec::new();
+            for key_bytes in iter {
+                let k = match parse_bulk_string(key_bytes) {
+                    Ok(v) => v,
+                    Err(e) => return Ok(Some(e)),
+                };
+                sourcekeys.push(k);
+            }
+
+            if sourcekeys.is_empty() {
+                return Ok(Some(err_wrong_args("pfmerge")));
+            }
+
+            Command::Pfmerge {
+                destkey,
+                sourcekeys,
             }
         }
         "SAVE" => {
@@ -2586,6 +2699,237 @@ pub async fn read_command(
                 return Ok(Some(err_not_integer()));
             }
             Command::Psetex { key, millis, value }
+        }
+        "EVAL" => {
+            // EVAL script numkeys [key ...] [arg ...]
+            let Some(script_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("eval")));
+            };
+            let script = match parse_bulk_string(script_bytes) {
+                Ok(s) => s,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(numkeys_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("eval")));
+            };
+            let numkeys = match parse_i64_from_bulk(numkeys_bytes) {
+                Ok(n) if n >= 0 => n as usize,
+                _ => return Ok(Some(err_not_integer())),
+            };
+            let mut keys = Vec::with_capacity(numkeys);
+            for _ in 0..numkeys {
+                let Some(key_bytes) = iter.next() else {
+                    return Ok(Some(err_wrong_args("eval")));
+                };
+                match parse_bulk_string(key_bytes) {
+                    Ok(k) => keys.push(k),
+                    Err(e) => return Ok(Some(e)),
+                }
+            }
+            let mut args = Vec::new();
+            for b in iter {
+                match parse_bulk_string(b) {
+                    Ok(a) => args.push(a),
+                    Err(e) => return Ok(Some(e)),
+                }
+            }
+            Command::Eval { script, keys, args }
+        }
+        "EVALSHA" => {
+            // EVALSHA sha1 numkeys [key ...] [arg ...]
+            let Some(sha1_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("evalsha")));
+            };
+            let sha1 = match parse_bulk_string(sha1_bytes) {
+                Ok(s) => s,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(numkeys_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("evalsha")));
+            };
+            let numkeys = match parse_i64_from_bulk(numkeys_bytes) {
+                Ok(n) if n >= 0 => n as usize,
+                _ => return Ok(Some(err_not_integer())),
+            };
+            let mut keys = Vec::with_capacity(numkeys);
+            for _ in 0..numkeys {
+                let Some(key_bytes) = iter.next() else {
+                    return Ok(Some(err_wrong_args("evalsha")));
+                };
+                match parse_bulk_string(key_bytes) {
+                    Ok(k) => keys.push(k),
+                    Err(e) => return Ok(Some(e)),
+                }
+            }
+            let mut args = Vec::new();
+            for b in iter {
+                match parse_bulk_string(b) {
+                    Ok(a) => args.push(a),
+                    Err(e) => return Ok(Some(e)),
+                }
+            }
+            Command::Evalsha { sha1, keys, args }
+        }
+        "SCRIPT" => {
+            // SCRIPT LOAD script | SCRIPT EXISTS sha1 [sha1 ...] | SCRIPT FLUSH
+            let Some(subcmd_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("script")));
+            };
+            let subcmd = match parse_bulk_string(subcmd_bytes) {
+                Ok(s) => s.to_uppercase(),
+                Err(e) => return Ok(Some(e)),
+            };
+            match subcmd.as_str() {
+                "LOAD" => {
+                    let Some(script_bytes) = iter.next() else {
+                        return Ok(Some(err_wrong_args("script")));
+                    };
+                    let script = match parse_bulk_string(script_bytes) {
+                        Ok(s) => s,
+                        Err(e) => return Ok(Some(e)),
+                    };
+                    if iter.next().is_some() {
+                        return Ok(Some(err_wrong_args("script")));
+                    }
+                    Command::ScriptLoad { script }
+                }
+                "EXISTS" => {
+                    let mut sha1s = Vec::new();
+                    for b in iter {
+                        match parse_bulk_string(b) {
+                            Ok(s) => sha1s.push(s),
+                            Err(e) => return Ok(Some(e)),
+                        }
+                    }
+                    if sha1s.is_empty() {
+                        return Ok(Some(err_wrong_args("script")));
+                    }
+                    Command::ScriptExists { sha1s }
+                }
+                "FLUSH" => {
+                    // 忽略可选的 ASYNC/SYNC 参数
+                    Command::ScriptFlush
+                }
+                _ => {
+                    Command::Error(format!("ERR Unknown SCRIPT subcommand or wrong number of arguments for '{}'", subcmd))
+                }
+            }
+        }
+        "CONFIG" => {
+            let Some(subcmd_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("config")));
+            };
+            let subcmd = match parse_bulk_string(subcmd_bytes) {
+                Ok(s) => s.to_uppercase(),
+                Err(e) => return Ok(Some(e)),
+            };
+            match subcmd.as_str() {
+                "GET" => {
+                    let Some(pattern_bytes) = iter.next() else {
+                        return Ok(Some(err_wrong_args("config|get")));
+                    };
+                    let pattern = match parse_bulk_string(pattern_bytes) {
+                        Ok(s) => s,
+                        Err(e) => return Ok(Some(e)),
+                    };
+                    if iter.next().is_some() {
+                        return Ok(Some(err_wrong_args("config|get")));
+                    }
+                    Command::ConfigGet { pattern }
+                }
+                "SET" => {
+                    let Some(param_bytes) = iter.next() else {
+                        return Ok(Some(err_wrong_args("config|set")));
+                    };
+                    let parameter = match parse_bulk_string(param_bytes) {
+                        Ok(s) => s,
+                        Err(e) => return Ok(Some(e)),
+                    };
+                    let Some(value_bytes) = iter.next() else {
+                        return Ok(Some(err_wrong_args("config|set")));
+                    };
+                    let value = match parse_bulk_string(value_bytes) {
+                        Ok(s) => s,
+                        Err(e) => return Ok(Some(e)),
+                    };
+                    if iter.next().is_some() {
+                        return Ok(Some(err_wrong_args("config|set")));
+                    }
+                    Command::ConfigSet { parameter, value }
+                }
+                _ => {
+                    Command::Error(format!("ERR Unknown subcommand or wrong number of arguments for 'config|{}'", subcmd.to_lowercase()))
+                }
+            }
+        }
+        "CLIENT" => {
+            let Some(subcmd_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("client")));
+            };
+            let subcmd = match parse_bulk_string(subcmd_bytes) {
+                Ok(s) => s.to_uppercase(),
+                Err(e) => return Ok(Some(e)),
+            };
+            match subcmd.as_str() {
+                "LIST" => {
+                    // CLIENT LIST 可能有可选参数，但我们简化处理
+                    Command::ClientList
+                }
+                "ID" => {
+                    Command::ClientId
+                }
+                "SETNAME" => {
+                    let Some(name_bytes) = iter.next() else {
+                        return Ok(Some(err_wrong_args("client|setname")));
+                    };
+                    let name = match parse_bulk_string(name_bytes) {
+                        Ok(s) => s,
+                        Err(e) => return Ok(Some(e)),
+                    };
+                    Command::ClientSetname { name }
+                }
+                "GETNAME" => {
+                    Command::ClientGetname
+                }
+                _ => {
+                    Command::Error(format!("ERR Unknown subcommand or wrong number of arguments for 'client|{}'", subcmd.to_lowercase()))
+                }
+            }
+        }
+        "SLOWLOG" => {
+            let Some(subcmd_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("slowlog")));
+            };
+            let subcmd = match parse_bulk_string(subcmd_bytes) {
+                Ok(s) => s.to_uppercase(),
+                Err(e) => return Ok(Some(e)),
+            };
+            match subcmd.as_str() {
+                "GET" => {
+                    let count = if let Some(count_bytes) = iter.next() {
+                        let count_str = match parse_bulk_string(count_bytes) {
+                            Ok(s) => s,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        match count_str.parse::<usize>() {
+                            Ok(n) => Some(n),
+                            Err(_) => return Ok(Some(err_not_integer())),
+                        }
+                    } else {
+                        None
+                    };
+                    Command::SlowlogGet { count }
+                }
+                "RESET" => {
+                    Command::SlowlogReset
+                }
+                "LEN" => {
+                    Command::SlowlogLen
+                }
+                _ => {
+                    Command::Error(format!("ERR Unknown subcommand or wrong number of arguments for 'slowlog|{}'", subcmd.to_lowercase()))
+                }
+            }
         }
         _ => Command::Unknown(std::iter::once(command_bytes).chain(iter).collect()),
     };

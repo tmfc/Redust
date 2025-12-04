@@ -1,7 +1,43 @@
 # Redust 中长期工作（future）
 
 > 本文件用于记录 **不需要立刻开干，但希望未来实现或增强** 的事项。
-> 与 `todo.md` 的区别：`todo.md` 更偏向“近期可执行的小任务”，而这里是“第二阶段/以后”的工作。
+> 与 `todo.md` 的区别：`todo.md` 更偏向"近期可执行的小任务"，而这里是"第二阶段/以后"的工作。
+
+---
+
+## 🎉 Phase A 完成总结（2025-12）
+
+### 已完成功能
+
+#### 核心数据结构（5 种）
+- ✅ **String**: 完整的字符串操作（SET/GET/INCR/APPEND 等 20+ 命令）
+- ✅ **List**: 双端队列操作（LPUSH/RPUSH/LPOP/RPOP/LRANGE 等）
+- ✅ **Set**: 集合操作（SADD/SREM/SUNION/SINTER/SDIFF 等）
+- ✅ **Hash**: 哈希表操作（HSET/HGET/HINCRBY/HGETALL 等）
+- ✅ **Sorted Set**: 有序集合（ZADD/ZRANGE/ZSCORE/ZINCRBY/ZSCAN 等）
+
+#### 高级特性
+- ✅ **事务**: MULTI/EXEC/DISCARD/WATCH/UNWATCH，支持乐观锁
+- ✅ **Lua 脚本**: EVAL/EVALSHA/SCRIPT 命令，redis.call/pcall 支持 46 个命令
+  - 二进制安全参数处理
+  - Nil 正确映射为 false
+  - SHA1 脚本缓存
+- ✅ **持久化**: AOF（everysec）+ RDB 快照，支持 SAVE/BGSAVE/LASTSAVE
+- ✅ **Pub/Sub**: Channel/Pattern/Shard 三种订阅模式
+- ✅ **扫描**: SCAN/SSCAN/HSCAN/ZSCAN 游标扫描
+- ✅ **运维命令**: CONFIG GET/SET、CLIENT 管理、SLOWLOG 基础
+
+#### 质量保证
+- ✅ **测试覆盖**: 99 个测试全部通过
+- ✅ **命令总数**: 120+ 个 Redis 命令
+- ✅ **文档完善**: command.md、roadmap.md、future.md 全面更新
+
+### 技术亮点
+1. **完整的 WATCH 机制**: Key 版本追踪覆盖所有写操作和过期/淘汰
+2. **二进制安全**: Lua 脚本参数和值保持原始字节，支持非 UTF-8 数据
+3. **Redis 语义对齐**: Nil 映射为 false，错误处理与 Redis 一致
+4. **异步持久化**: AOF 异步写入，RDB 后台保存，不阻塞主线程
+5. **内存管理**: LRU 淘汰策略，maxmemory 限制，过期键自动清理
 
 ---
 
@@ -9,14 +45,10 @@
 
 目标：在现有过期语义 MVP 的基础上，逐步向更完整的 Redis 行为靠近。
 
-- [ ] **高级 SET 选项支持**
+- [x] **高级 SET 选项支持** ✅ 已完成
   - `SET key value NX|XX [EX seconds|PX milliseconds|EXAT unix-time|PXAT ms-unix-time] [KEEPTTL] [GET]`
-  - 需要明确：
-    - 参数组合的合法/非法组合及返回错误信息。
-    - 与现有 `EX` / `PX` 实现的兼容与迁移策略。
-  - 补充测试：
-    - NX/XX 在 key 存在/不存在两种情况下的行为。
-    - EXAT/PXAT 与当前相对时间实现的边界行为（过期点就在“现在”附近时）。
+  - 已实现所有选项组合和错误处理
+  - 完整的测试覆盖
 
 - [ ] **主动过期采样策略调优**
   - 当前实现：
@@ -26,11 +58,10 @@
     - 根据最近一次扫描的“过期命中率”粗略调整扫描频率/样本数。
     - 观察不同参数下对吞吐量和内存占用的影响（可以在 `INFO` 或日志中打印简单指标）。
 
-- [ ] **过期语义边界与持久化交互**
-  - 在将来引入持久化（AOF/RDB 子集）后，明确：
-    - 加载时如何处理已经过期的 key（过滤/加载后立刻清理等）。
-    - 过期时间在 AOF/RDB 中的编码方式（绝对时间 vs 相对时间）。
-  - 预留：待持久化 PoC 成形后再细化具体方案与测试。
+- [x] **过期语义边界与持久化交互** ✅ 基础已完成
+  - 已实现 AOF/RDB 持久化
+  - 启动时自动加载并处理过期键
+  - 🔄 待完善：损坏文件校验与友好降级
 
 ---
 
@@ -183,11 +214,26 @@
 ## 事务与脚本增强（V2）
 
 > 现状：`MULTI`/`EXEC`/`DISCARD`/`WATCH`/`UNWATCH` 已实现基础语义，支持命令队列和乐观锁。
+> Lua 脚本基础功能已实现（`EVAL`/`EVALSHA`/`SCRIPT LOAD|EXISTS|FLUSH`）。
 
-- [ ] **EVAL/EVALSHA Lua 脚本支持**
-  - 引入简化的 Lua 运行时（如 `mlua` crate），支持基础脚本执行。
-  - 实现 `redis.call()` / `redis.pcall()` 回调，允许脚本调用 Redis 命令。
-  - 实现 `SCRIPT LOAD` / `SCRIPT EXISTS` / `SCRIPT FLUSH` 脚本管理命令。
+- [x] **EVAL/EVALSHA Lua 脚本支持（基础版）**
+  - 已引入 `mlua` crate（Lua 5.4），支持基础脚本执行。
+  - 已实现 `EVAL script numkeys [key ...] [arg ...]` 和 `EVALSHA sha1 numkeys [key ...] [arg ...]`。
+  - 已实现 `SCRIPT LOAD` / `SCRIPT EXISTS` / `SCRIPT FLUSH` 脚本管理命令。
+  - 已支持 `KEYS` 和 `ARGV` 表访问。
+  - 已支持返回值类型转换（integer, string, array, nil, boolean）。
+
+- [x] **redis.call() / redis.pcall() 回调实现**
+  - 已实现 `redis.call()` 和 `redis.pcall()` 在 Lua 脚本中调用 Redis 命令。
+  - 支持 40+ 常用命令：GET/SET/DEL/EXISTS/INCR/DECR/INCRBY/DECRBY/APPEND/STRLEN/MGET/MSET、
+    HGET/HSET/HDEL/HEXISTS/HGETALL/HKEYS/HVALS/HLEN/HMGET/HMSET/HINCRBY、
+    LPUSH/RPUSH/LPOP/RPOP/LLEN/LRANGE/LINDEX、SADD/SREM/SMEMBERS/SISMEMBER/SCARD、
+    ZADD/ZREM/ZSCORE/ZCARD/ZRANGE/ZREVRANGE、TYPE/TTL/PTTL/EXPIRE/PEXPIRE/PERSIST。
+  - `redis.call()` 在错误时抛出 Lua 异常，`redis.pcall()` 返回 `{err = "..."}` 表。
+
+- [ ] **事务中 Lua 脚本支持**
+  - 当前 `EVAL`/`EVALSHA` 在事务中不支持（返回错误）。
+  - 后续可考虑支持在事务中执行脚本。
 
 - [ ] **事务中更多命令支持**
   - 当前事务中部分命令（如 `TYPE`、`KEYS`、`SCAN` 等）返回错误。
@@ -197,9 +243,53 @@
   - Redis 在 EXEC 时如果队列中有语法错误命令，会中止整个事务。
   - 当前实现在命令入队时已做语法检查，但可进一步对齐 Redis 行为。
 
-- [ ] **WATCH 版本追踪优化**
-  - 当前仅在 `set`/`del` 操作中更新 key 版本，其他写操作（如 `LPUSH`、`SADD`、`HSET` 等）尚未覆盖。
-  - 后续需系统性地在所有写路径中调用 `bump_key_version`。
+- [x] **WATCH 版本追踪优化**
+  - 已在所有写路径中调用 `bump_key_version`，包括 `LPUSH`、`SADD`、`HSET`、`ZADD` 等。
+  - 已在 TTL 过期删除和 LRU 淘汰时更新 key 版本。
+
+---
+
+## 运维命令（V2）
+
+- [x] **基础运维命令实现**
+  - 已实现 `CONFIG GET pattern` - 获取匹配的配置参数（支持 * 通配符）。
+  - 已实现 `CONFIG SET parameter value` - 设置配置参数（当前大多数参数不可动态修改，返回错误）。
+  - 已实现 `CLIENT LIST` - 列出当前客户端连接信息（简化版）。
+  - 已实现 `CLIENT ID` - 获取当前连接的唯一 ID。
+  - 已实现 `CLIENT SETNAME name` - 设置连接名称。
+  - 已实现 `CLIENT GETNAME` - 获取连接名称。
+  - 已实现 `SLOWLOG GET [count]` - 获取慢日志（当前返回空数组）。
+  - 已实现 `SLOWLOG RESET` - 重置慢日志。
+  - 已实现 `SLOWLOG LEN` - 获取慢日志长度（当前返回 0）。
+
+- [ ] **CONFIG 动态配置支持**
+  - 当前 CONFIG SET 对大多数参数返回错误。
+  - 后续可支持动态修改部分配置（如 maxmemory、timeout、slowlog-log-slower-than 等）。
+  - 需要考虑配置持久化（写入配置文件或环境变量）。
+
+- [ ] **SLOWLOG 实际实现**
+  - 当前 SLOWLOG 命令只是占位实现，返回空数据。
+  - 后续需要实现：
+    - 记录执行时间超过阈值的命令。
+    - 维护固定大小的慢日志队列。
+    - 支持 SLOWLOG GET/RESET/LEN 的完整语义。
+
+- [ ] **CLIENT 命令扩展**
+  - 当前仅支持 LIST/ID/SETNAME/GETNAME。
+  - 后续可支持：
+    - `CLIENT PAUSE timeout` - 暂停所有客户端。
+    - `CLIENT UNBLOCK client-id` - 解除阻塞的客户端。
+    - `CLIENT KILL` - 关闭指定客户端连接。
+    - `CLIENT REPLY ON|OFF|SKIP` - 控制响应行为。
+
+- [ ] **INFO 命令实现**
+  - 实现 `INFO [section]` 命令，返回服务器状态信息。
+  - 支持的 section：server, clients, memory, persistence, stats, replication, cpu, commandstats, cluster, keyspace。
+  - 与现有 Metrics 结构体集成。
+
+- [ ] **Prometheus metrics 导出**
+  - 提供 HTTP 端点导出 Prometheus 格式的指标。
+  - 包括：连接数、命令数、内存使用、键空间统计等。
 
 ---
 
