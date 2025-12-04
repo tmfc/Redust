@@ -695,7 +695,7 @@ fn cmd_hmset(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Script
         let field = bytes_to_string(&args[i])?;
         let value_bytes = &args[i + 1];
         let value = String::from_utf8_lossy(value_bytes).to_string();
-        storage.hset(&key, &field, value);
+        let _ = storage.hset(&key, &field, value);
     }
     Ok(ScriptResult::Status("OK".to_string()))
 }

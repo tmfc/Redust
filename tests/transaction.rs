@@ -75,6 +75,7 @@ impl TestClient {
         Some(String::from_utf8(buf).unwrap())
     }
 
+    #[allow(dead_code)]
     async fn read_array_of_bulk(&mut self) -> Vec<String> {
         let mut header = String::new();
         self.reader.read_line(&mut header).await.unwrap();

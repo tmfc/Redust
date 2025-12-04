@@ -1,69 +1,62 @@
 //! Integration tests for Lua scripting (EVAL, EVALSHA, SCRIPT commands)
 
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
-use std::process::{Child, Command};
-use std::thread;
-use std::time::Duration;
+use std::net::SocketAddr;
 
-use std::sync::atomic::{AtomicU16, Ordering};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
 
-// Use a higher base port and add process ID to avoid conflicts
-static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
+use redust::server::serve;
 
-fn get_unique_port() -> u16 {
-    let base = 17000 + (std::process::id() % 1000) as u16;
-    let offset = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
-    base + offset
-}
-
-fn spawn_server() -> (Child, String) {
-    let port = get_unique_port();
-    let addr = format!("127.0.0.1:{}", port);
-    
-    let child = Command::new("cargo")
-        .args(["run", "--bin", "redust"])
-        .env("REDUST_ADDR", &addr)
-        .env("REDUST_AUTH_PASSWORD", "")
-        .env("REDUST_DISABLE_PERSISTENCE", "1")
-        .spawn()
-        .expect("Failed to start server");
-    
-    // Wait for server to start
-    thread::sleep(Duration::from_millis(1500));
-    
-    (child, addr)
+async fn spawn_server() -> (
+    SocketAddr,
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<tokio::io::Result<()>>,
+) {
+    std::env::set_var("REDUST_DISABLE_PERSISTENCE", "1");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
+    let addr = listener.local_addr().expect("local addr");
+    let (tx, rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        serve(listener, async move {
+            let _ = rx.await;
+        })
+        .await
+    });
+    (addr, tx, handle)
 }
 
 struct TestClient {
-    stream: BufReader<TcpStream>,
+    reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
+    writer: tokio::net::tcp::OwnedWriteHalf,
 }
 
 impl TestClient {
-    fn connect(addr: &str) -> Self {
-        let stream = TcpStream::connect(addr).expect("Failed to connect");
-        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    async fn connect(addr: SocketAddr) -> Self {
+        let stream = TcpStream::connect(addr).await.expect("Failed to connect");
+        let (read_half, write_half) = stream.into_split();
         Self {
-            stream: BufReader::new(stream),
+            reader: BufReader::new(read_half),
+            writer: write_half,
         }
     }
 
-    fn send_command(&mut self, args: &[&str]) {
+    async fn send_command(&mut self, args: &[&str]) {
         let mut cmd = format!("*{}\r\n", args.len());
         for arg in args {
             cmd.push_str(&format!("${}\r\n{}\r\n", arg.len(), arg));
         }
-        self.stream.get_mut().write_all(cmd.as_bytes()).unwrap();
+        self.writer.write_all(cmd.as_bytes()).await.unwrap();
     }
 
-    fn read_line(&mut self) -> String {
+    async fn read_line(&mut self) -> String {
         let mut line = String::new();
-        self.stream.read_line(&mut line).unwrap();
+        self.reader.read_line(&mut line).await.unwrap();
         line
     }
 
-    fn read_bulk_string(&mut self) -> Option<String> {
-        let line = self.read_line();
+    async fn read_bulk_string(&mut self) -> Option<String> {
+        let line = self.read_line().await;
         if line.starts_with("$-1") {
             return None;
         }
@@ -71,37 +64,40 @@ impl TestClient {
             panic!("Expected bulk string, got: {}", line);
         }
         let len: usize = line[1..].trim().parse().unwrap();
-        let mut buf = vec![0u8; len + 2]; // +2 for \r\n
-        std::io::Read::read_exact(&mut self.stream, &mut buf).unwrap();
-        Some(String::from_utf8_lossy(&buf[..len]).to_string())
+        let mut buf = vec![0u8; len];
+        self.reader.read_exact(&mut buf).await.unwrap();
+        // Read trailing \r\n
+        let mut crlf = [0u8; 2];
+        self.reader.read_exact(&mut crlf).await.unwrap();
+        Some(String::from_utf8_lossy(&buf).to_string())
     }
 
-    fn read_integer(&mut self) -> i64 {
-        let line = self.read_line();
+    async fn read_integer(&mut self) -> i64 {
+        let line = self.read_line().await;
         if !line.starts_with(':') {
             panic!("Expected integer, got: {}", line);
         }
         line[1..].trim().parse().unwrap()
     }
 
-    fn read_error(&mut self) -> String {
-        let line = self.read_line();
+    async fn read_error(&mut self) -> String {
+        let line = self.read_line().await;
         if !line.starts_with('-') {
             panic!("Expected error, got: {}", line);
         }
         line[1..].trim().to_string()
     }
 
-    fn read_simple_string(&mut self) -> String {
-        let line = self.read_line();
+    async fn read_simple_string(&mut self) -> String {
+        let line = self.read_line().await;
         if !line.starts_with('+') {
             panic!("Expected simple string, got: {}", line);
         }
         line[1..].trim().to_string()
     }
 
-    fn read_array_len(&mut self) -> i64 {
-        let line = self.read_line();
+    async fn read_array_len(&mut self) -> i64 {
+        let line = self.read_line().await;
         if !line.starts_with('*') {
             panic!("Expected array, got: {}", line);
         }
@@ -109,191 +105,191 @@ impl TestClient {
     }
 }
 
-#[test]
-fn test_eval_return_integer() {
-    let (mut child, addr) = spawn_server();
-    let mut client = TestClient::connect(&addr);
+#[tokio::test]
+async fn test_eval_return_integer() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
 
     // EVAL "return 42" 0
-    client.send_command(&["EVAL", "return 42", "0"]);
-    let result = client.read_integer();
+    client.send_command(&["EVAL", "return 42", "0"]).await;
+    let result = client.read_integer().await;
     assert_eq!(result, 42);
 
-    child.kill().unwrap();
+    let _ = shutdown.send(());
 }
 
-#[test]
-fn test_eval_return_string() {
-    let (mut child, addr) = spawn_server();
-    let mut client = TestClient::connect(&addr);
+#[tokio::test]
+async fn test_eval_return_string() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
 
     // EVAL "return 'hello'" 0
-    client.send_command(&["EVAL", "return 'hello'", "0"]);
-    let result = client.read_bulk_string();
+    client.send_command(&["EVAL", "return 'hello'", "0"]).await;
+    let result = client.read_bulk_string().await;
     assert_eq!(result, Some("hello".to_string()));
 
-    child.kill().unwrap();
+    let _ = shutdown.send(());
 }
 
-#[test]
-fn test_eval_return_nil() {
-    let (mut child, addr) = spawn_server();
-    let mut client = TestClient::connect(&addr);
+#[tokio::test]
+async fn test_eval_return_nil() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
 
     // EVAL "return nil" 0
-    client.send_command(&["EVAL", "return nil", "0"]);
-    let result = client.read_bulk_string();
+    client.send_command(&["EVAL", "return nil", "0"]).await;
+    let result = client.read_bulk_string().await;
     assert_eq!(result, None);
 
-    child.kill().unwrap();
+    let _ = shutdown.send(());
 }
 
-#[test]
-fn test_eval_with_keys() {
-    let (mut child, addr) = spawn_server();
-    let mut client = TestClient::connect(&addr);
+#[tokio::test]
+async fn test_eval_with_keys() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
 
     // EVAL "return KEYS[1]" 1 mykey
-    client.send_command(&["EVAL", "return KEYS[1]", "1", "mykey"]);
-    let result = client.read_bulk_string();
+    client.send_command(&["EVAL", "return KEYS[1]", "1", "mykey"]).await;
+    let result = client.read_bulk_string().await;
     assert_eq!(result, Some("mykey".to_string()));
 
-    child.kill().unwrap();
+    let _ = shutdown.send(());
 }
 
-#[test]
-fn test_eval_with_argv() {
-    let (mut child, addr) = spawn_server();
-    let mut client = TestClient::connect(&addr);
+#[tokio::test]
+async fn test_eval_with_argv() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
 
     // EVAL "return ARGV[1]" 0 myarg
-    client.send_command(&["EVAL", "return ARGV[1]", "0", "myarg"]);
-    let result = client.read_bulk_string();
+    client.send_command(&["EVAL", "return ARGV[1]", "0", "myarg"]).await;
+    let result = client.read_bulk_string().await;
     assert_eq!(result, Some("myarg".to_string()));
 
-    child.kill().unwrap();
+    let _ = shutdown.send(());
 }
 
-#[test]
-fn test_eval_return_array() {
-    let (mut child, addr) = spawn_server();
-    let mut client = TestClient::connect(&addr);
+#[tokio::test]
+async fn test_eval_return_array() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
 
     // EVAL "return {1, 2, 3}" 0
-    client.send_command(&["EVAL", "return {1, 2, 3}", "0"]);
-    let len = client.read_array_len();
+    client.send_command(&["EVAL", "return {1, 2, 3}", "0"]).await;
+    let len = client.read_array_len().await;
     assert_eq!(len, 3);
-    assert_eq!(client.read_integer(), 1);
-    assert_eq!(client.read_integer(), 2);
-    assert_eq!(client.read_integer(), 3);
+    assert_eq!(client.read_integer().await, 1);
+    assert_eq!(client.read_integer().await, 2);
+    assert_eq!(client.read_integer().await, 3);
 
-    child.kill().unwrap();
+    let _ = shutdown.send(());
 }
 
-#[test]
-fn test_eval_syntax_error() {
-    let (mut child, addr) = spawn_server();
-    let mut client = TestClient::connect(&addr);
+#[tokio::test]
+async fn test_eval_syntax_error() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
 
     // EVAL with syntax error
-    client.send_command(&["EVAL", "return invalid syntax here", "0"]);
-    let err = client.read_error();
+    client.send_command(&["EVAL", "return invalid syntax here", "0"]).await;
+    let err = client.read_error().await;
     assert!(err.contains("ERR"));
 
-    child.kill().unwrap();
+    let _ = shutdown.send(());
 }
 
-#[test]
-fn test_script_load_and_evalsha() {
-    let (mut child, addr) = spawn_server();
-    let mut client = TestClient::connect(&addr);
+#[tokio::test]
+async fn test_script_load_and_evalsha() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
 
     // SCRIPT LOAD "return 123"
-    client.send_command(&["SCRIPT", "LOAD", "return 123"]);
-    let sha1 = client.read_bulk_string().unwrap();
+    client.send_command(&["SCRIPT", "LOAD", "return 123"]).await;
+    let sha1 = client.read_bulk_string().await.unwrap();
     assert_eq!(sha1.len(), 40); // SHA1 is 40 hex chars
 
     // EVALSHA <sha1> 0
-    client.send_command(&["EVALSHA", &sha1, "0"]);
-    let result = client.read_integer();
+    client.send_command(&["EVALSHA", &sha1, "0"]).await;
+    let result = client.read_integer().await;
     assert_eq!(result, 123);
 
-    child.kill().unwrap();
+    let _ = shutdown.send(());
 }
 
-#[test]
-fn test_evalsha_noscript() {
-    let (mut child, addr) = spawn_server();
-    let mut client = TestClient::connect(&addr);
+#[tokio::test]
+async fn test_evalsha_noscript() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
 
     // EVALSHA with non-existent script
-    client.send_command(&["EVALSHA", "0000000000000000000000000000000000000000", "0"]);
-    let err = client.read_error();
+    client.send_command(&["EVALSHA", "0000000000000000000000000000000000000000", "0"]).await;
+    let err = client.read_error().await;
     assert!(err.contains("NOSCRIPT"));
 
-    child.kill().unwrap();
+    let _ = shutdown.send(());
 }
 
-#[test]
-fn test_script_exists() {
-    let (mut child, addr) = spawn_server();
-    let mut client = TestClient::connect(&addr);
+#[tokio::test]
+async fn test_script_exists() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
 
     // Load a script
-    client.send_command(&["SCRIPT", "LOAD", "return 1"]);
-    let sha1 = client.read_bulk_string().unwrap();
+    client.send_command(&["SCRIPT", "LOAD", "return 1"]).await;
+    let sha1 = client.read_bulk_string().await.unwrap();
 
     // SCRIPT EXISTS <sha1> <nonexistent>
-    client.send_command(&["SCRIPT", "EXISTS", &sha1, "0000000000000000000000000000000000000000"]);
-    let len = client.read_array_len();
+    client.send_command(&["SCRIPT", "EXISTS", &sha1, "0000000000000000000000000000000000000000"]).await;
+    let len = client.read_array_len().await;
     assert_eq!(len, 2);
-    assert_eq!(client.read_integer(), 1); // exists
-    assert_eq!(client.read_integer(), 0); // doesn't exist
+    assert_eq!(client.read_integer().await, 1); // exists
+    assert_eq!(client.read_integer().await, 0); // doesn't exist
 
-    child.kill().unwrap();
+    let _ = shutdown.send(());
 }
 
-#[test]
-fn test_script_flush() {
-    let (mut child, addr) = spawn_server();
-    let mut client = TestClient::connect(&addr);
+#[tokio::test]
+async fn test_script_flush() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
 
     // Load a script
-    client.send_command(&["SCRIPT", "LOAD", "return 1"]);
-    let sha1 = client.read_bulk_string().unwrap();
+    client.send_command(&["SCRIPT", "LOAD", "return 1"]).await;
+    let sha1 = client.read_bulk_string().await.unwrap();
 
     // Verify it exists
-    client.send_command(&["SCRIPT", "EXISTS", &sha1]);
-    let _ = client.read_array_len();
-    assert_eq!(client.read_integer(), 1);
+    client.send_command(&["SCRIPT", "EXISTS", &sha1]).await;
+    let _ = client.read_array_len().await;
+    assert_eq!(client.read_integer().await, 1);
 
     // SCRIPT FLUSH
-    client.send_command(&["SCRIPT", "FLUSH"]);
-    let ok = client.read_simple_string();
+    client.send_command(&["SCRIPT", "FLUSH"]).await;
+    let ok = client.read_simple_string().await;
     assert_eq!(ok, "OK");
 
     // Verify it no longer exists
-    client.send_command(&["SCRIPT", "EXISTS", &sha1]);
-    let _ = client.read_array_len();
-    assert_eq!(client.read_integer(), 0);
+    client.send_command(&["SCRIPT", "EXISTS", &sha1]).await;
+    let _ = client.read_array_len().await;
+    assert_eq!(client.read_integer().await, 0);
 
-    child.kill().unwrap();
+    let _ = shutdown.send(());
 }
 
-#[test]
-fn test_eval_boolean_conversion() {
-    let (mut child, addr) = spawn_server();
-    let mut client = TestClient::connect(&addr);
+#[tokio::test]
+async fn test_eval_boolean_conversion() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
 
     // Redis Lua: true -> 1
-    client.send_command(&["EVAL", "return true", "0"]);
-    let result = client.read_integer();
+    client.send_command(&["EVAL", "return true", "0"]).await;
+    let result = client.read_integer().await;
     assert_eq!(result, 1);
 
     // Redis Lua: false -> nil
-    client.send_command(&["EVAL", "return false", "0"]);
-    let result = client.read_bulk_string();
+    client.send_command(&["EVAL", "return false", "0"]).await;
+    let result = client.read_bulk_string().await;
     assert_eq!(result, None);
 
-    child.kill().unwrap();
+    let _ = shutdown.send(());
 }
