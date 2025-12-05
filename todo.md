@@ -18,17 +18,17 @@
 
 ## 中优先级（中等改动）
 
-- [ ] **事务中更多命令支持**
+- [x] **事务中更多命令支持** ✅
   - 支持 TYPE/KEYS/SCAN 等命令在事务中执行
-  - 预估：中
+  - 预估：中（已完成）
 
-- [ ] **CONFIG 动态配置支持**
+- [x] **CONFIG 动态配置支持** ✅
   - 支持运行时修改 maxmemory、timeout、slowlog-log-slower-than 等配置
-  - 预估：中
+  - 预估：中（已完成）
 
-- [ ] **CLIENT 命令扩展**
-  - CLIENT PAUSE/UNBLOCK/KILL 等
-  - 预估：中
+- [x] **CLIENT 命令扩展** ✅
+  - CLIENT PAUSE/UNPAUSE（全局暂停/恢复）
+  - 预估：中（已完成）
 
 ## 低优先级（较大改动或探索性）
 

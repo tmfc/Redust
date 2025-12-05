@@ -52,7 +52,8 @@ enum StorageValue {
 #[derive(Clone)]
 pub struct Storage {
     data: Arc<DashMap<String, StorageValue>>,
-    maxmemory_bytes: Option<u64>,
+    // 0 表示不限制
+    maxmemory_bytes: Arc<AtomicU64>,
     last_access: Arc<DashMap<String, u64>>,
     access_counter: Arc<AtomicU64>,
     /// 全局版本计数器，每次写操作递增
@@ -102,9 +103,10 @@ impl Default for Storage {
 
 impl Storage {
     pub fn new(maxmemory_bytes: Option<u64>) -> Self {
+        let mm = maxmemory_bytes.unwrap_or(0);
         Storage {
             data: Arc::new(DashMap::new()),
-            maxmemory_bytes,
+            maxmemory_bytes: Arc::new(AtomicU64::new(mm)),
             last_access: Arc::new(DashMap::new()),
             access_counter: Arc::new(AtomicU64::new(0)),
             global_version: Arc::new(AtomicU64::new(0)),
@@ -3924,9 +3926,10 @@ impl Storage {
     }
 
     pub fn maybe_evict_for_write(&self) {
-        let Some(limit) = self.maxmemory_bytes else {
+        let limit = self.maxmemory_bytes.load(Ordering::Relaxed);
+        if limit == 0 {
             return;
-        };
+        }
 
         // 简单实现：反复检查 approximate_used_memory，直到不再超限或没有可淘汰的键
         loop {
@@ -3975,7 +3978,17 @@ impl Storage {
     }
 
     pub fn maxmemory_bytes(&self) -> Option<u64> {
-        self.maxmemory_bytes
+        let v = self.maxmemory_bytes.load(Ordering::Relaxed);
+        if v == 0 {
+            None
+        } else {
+            Some(v)
+        }
+    }
+
+    pub fn set_maxmemory_bytes(&self, value: Option<u64>) {
+        let v = value.unwrap_or(0);
+        self.maxmemory_bytes.store(v, Ordering::Relaxed);
     }
 
     // ========== HyperLogLog 操作 ==========

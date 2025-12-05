@@ -611,6 +611,10 @@ pub enum Command {
         name: String,
     },
     ClientGetname,
+    ClientPause {
+        timeout_ms: u64,
+    },
+    ClientUnpause,
     SlowlogGet {
         count: Option<usize>,
     },
@@ -3955,6 +3959,19 @@ pub async fn read_command(
                 }
                 "GETNAME" => {
                     Command::ClientGetname
+                }
+                "PAUSE" => {
+                    let Some(timeout_bytes) = iter.next() else {
+                        return Ok(Some(err_wrong_args("client|pause")));
+                    };
+                    let timeout_ms = match parse_i64_from_bulk(timeout_bytes) {
+                        Ok(v) if v >= 0 => v as u64,
+                        _ => return Ok(Some(Command::Error("ERR timeout is not an integer or out of range".to_string()))),
+                    };
+                    Command::ClientPause { timeout_ms }
+                }
+                "UNPAUSE" => {
+                    Command::ClientUnpause
                 }
                 _ => {
                     Command::Error(format!("ERR Unknown subcommand or wrong number of arguments for 'client|{}'", subcmd.to_lowercase()))

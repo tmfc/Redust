@@ -357,23 +357,27 @@ enum HllRepr {
   - 已实现 `SLOWLOG RESET` - 重置慢日志。
   - 已实现 `SLOWLOG LEN` - 获取慢日志长度（当前返回 0）。
 
-- [ ] **CONFIG 动态配置支持**
-  - 当前 CONFIG SET 对大多数参数返回错误。
-  - 后续可支持动态修改部分配置（如 maxmemory、timeout、slowlog-log-slower-than 等）。
-  - 需要考虑配置持久化（写入配置文件或环境变量）。
+- [x] **CONFIG 动态配置支持** ✅（部分完成）
+  - 已支持运行时修改：`maxmemory`、`slowlog-log-slower-than`、`slowlog-max-len`、`timeout`、`tcp-keepalive`（timeout/keepalive 当前仅存值，尚未作用于连接行为）。
+  - 待办：
+    - 使 `timeout`/`tcp-keepalive` 实际生效：在连接处理层应用超时和 keepalive 参数。
+    - 考虑配置持久化（写入配置文件或环境变量）。
+    - 评估是否开放更多动态参数（如 maxmemory-policy）。
 
 - [x] **SLOWLOG 实际实现** ✅ 已完成（2025-12）
   - 已实现完整的慢日志功能：记录超过阈值的命令、维护固定大小队列。
   - 支持 SLOWLOG GET/RESET/LEN 完整语义。
   - 环境变量配置：REDUST_SLOWLOG_SLOWER_THAN（微秒）、REDUST_SLOWLOG_MAX_LEN。
 
-- [ ] **CLIENT 命令扩展**
-  - 当前仅支持 LIST/ID/SETNAME/GETNAME。
-  - 后续可支持：
-    - `CLIENT PAUSE timeout` - 暂停所有客户端。
-    - `CLIENT UNBLOCK client-id` - 解除阻塞的客户端。
-    - `CLIENT KILL` - 关闭指定客户端连接。
+- [x] **CLIENT 命令扩展**（部分完成）
+  - 已支持：LIST/ID/SETNAME/GETNAME/PAUSE/UNPAUSE。
+  - 待实现：
+    - `CLIENT UNBLOCK client-id [TIMEOUT|ERROR]` - 解除阻塞的客户端（需要阻塞命令支持，如 BLPOP）。
+    - `CLIENT KILL [ID client-id] [ADDR ip:port] [TYPE normal|master|slave|pubsub]` - 关闭指定客户端连接。
     - `CLIENT REPLY ON|OFF|SKIP` - 控制响应行为。
+    - `CLIENT NO-EVICT ON|OFF` - 标记客户端不被驱逐。
+    - `CLIENT CACHING YES|NO` - 客户端缓存控制。
+    - `CLIENT TRACKINGINFO` - 获取客户端追踪信息。
 
 - [ ] **INFO 命令实现**
   - 实现 `INFO [section]` 命令，返回服务器状态信息。

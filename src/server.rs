@@ -25,6 +25,10 @@ use crate::storage::Storage;
 
 // 全局客户端 ID 计数器
 static CLIENT_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+static CLIENT_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(0);
+static TCP_KEEPALIVE_SECS: AtomicU64 = AtomicU64::new(300);
+// CLIENT PAUSE 截止时间（毫秒 Unix 时间戳），0 表示未暂停
+static CLIENT_PAUSE_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 
 struct Metrics {
     start_time: Instant,
@@ -136,6 +140,27 @@ impl SlowLog {
     /// 获取慢日志长度
     fn len(&self) -> usize {
         self.entries.lock().unwrap().len()
+    }
+
+    fn set_threshold_us(&self, threshold: u64) {
+        self.threshold_us.store(threshold, Ordering::Relaxed);
+    }
+
+    fn set_max_len(&self, len: usize) {
+        self.max_len.store(len, Ordering::Relaxed);
+        // 立即裁剪队列以匹配新限制
+        let mut entries = self.entries.lock().unwrap();
+        while entries.len() > len {
+            entries.pop_back();
+        }
+    }
+
+    fn threshold_us(&self) -> u64 {
+        self.threshold_us.load(Ordering::Relaxed)
+    }
+
+    fn max_len(&self) -> usize {
+        self.max_len.load(Ordering::Relaxed)
     }
 }
 
@@ -3568,6 +3593,29 @@ async fn handle_connection(
         };
 
         metrics.total_commands.fetch_add(1, Ordering::Relaxed);
+
+        // 检查 CLIENT PAUSE：如果处于暂停状态，等待直到超时或被 UNPAUSE
+        // 注意：CLIENT PAUSE/UNPAUSE 命令本身不受暂停影响
+        let skip_pause = matches!(cmd, Command::ClientPause { .. } | Command::ClientUnpause);
+        if !skip_pause {
+            loop {
+                let pause_until = CLIENT_PAUSE_UNTIL_MS.load(Ordering::Relaxed);
+                if pause_until == 0 {
+                    break;
+                }
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                if now_ms >= pause_until {
+                    // 超时自动解除
+                    CLIENT_PAUSE_UNTIL_MS.store(0, Ordering::Relaxed);
+                    break;
+                }
+                // 等待一小段时间后重试
+                sleep(Duration::from_millis(10)).await;
+            }
+        }
         
         // 记录命令开始时间用于慢日志
         let cmd_start = Instant::now();
@@ -4309,7 +4357,7 @@ async fn handle_connection(
             // 运维命令
             Command::ConfigGet { pattern } => {
                 // 返回匹配的配置参数
-                let configs = get_config_values(&pattern);
+                let configs = get_config_values(&pattern, &storage, &slowlog);
                 let mut resp = format!("*{}\r\n", configs.len() * 2);
                 for (key, value) in configs {
                     resp.push_str(&format!("${}\r\n{}\r\n", key.len(), key));
@@ -4319,7 +4367,7 @@ async fn handle_connection(
             }
             Command::ConfigSet { parameter, value } => {
                 // 尝试设置配置参数
-                match set_config_value(&parameter, &value) {
+                match set_config_value(&parameter, &value, &storage, &slowlog) {
                     Ok(()) => respond_simple_string(&mut write_half, "OK").await?,
                     Err(e) => respond_error(&mut write_half, &e).await?,
                 }
@@ -4350,6 +4398,19 @@ async fn handle_connection(
                     let resp = format!("${}\r\n{}\r\n", client_name.len(), client_name);
                     write_half.write_all(resp.as_bytes()).await?;
                 }
+            }
+            Command::ClientPause { timeout_ms } => {
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let until = now_ms.saturating_add(timeout_ms);
+                CLIENT_PAUSE_UNTIL_MS.store(until, Ordering::Relaxed);
+                respond_simple_string(&mut write_half, "OK").await?;
+            }
+            Command::ClientUnpause => {
+                CLIENT_PAUSE_UNTIL_MS.store(0, Ordering::Relaxed);
+                respond_simple_string(&mut write_half, "OK").await?;
             }
             Command::SlowlogGet { count } => {
                 let entries = slowlog.get(count);
@@ -4656,15 +4717,16 @@ pub async fn run_server(
 // ============================================================================
 
 /// 获取匹配模式的配置值
-fn get_config_values(pattern: &str) -> Vec<(String, String)> {
+fn get_config_values(pattern: &str, storage: &Storage, slowlog: &SlowLog) -> Vec<(String, String)> {
     let mut results = Vec::new();
     
     // 支持的配置参数
+    let maxmemory = storage.maxmemory_bytes().unwrap_or(0);
     let configs = [
-        ("maxmemory", env::var("REDUST_MAXMEMORY_BYTES").unwrap_or_else(|_| "0".to_string())),
+        ("maxmemory", maxmemory.to_string()),
         ("maxmemory-policy", "noeviction".to_string()),
-        ("timeout", "0".to_string()),
-        ("tcp-keepalive", "300".to_string()),
+        ("timeout", CLIENT_TIMEOUT_SECS.load(Ordering::Relaxed).to_string()),
+        ("tcp-keepalive", TCP_KEEPALIVE_SECS.load(Ordering::Relaxed).to_string()),
         ("databases", "16".to_string()),
         ("save", "".to_string()),
         ("appendonly", env::var("REDUST_AOF_ENABLED").unwrap_or_else(|_| "no".to_string())),
@@ -4674,8 +4736,8 @@ fn get_config_values(pattern: &str) -> Vec<(String, String)> {
         ("appendfilename", env::var("REDUST_AOF_PATH").unwrap_or_else(|_| "redust.aof".to_string())),
         ("requirepass", if env::var("REDUST_AUTH_PASSWORD").is_ok() { "yes".to_string() } else { "".to_string() }),
         ("loglevel", "notice".to_string()),
-        ("slowlog-log-slower-than", "10000".to_string()),
-        ("slowlog-max-len", "128".to_string()),
+        ("slowlog-log-slower-than", slowlog.threshold_us().to_string()),
+        ("slowlog-max-len", slowlog.max_len().to_string()),
     ];
     
     for (key, value) in configs {
@@ -4688,16 +4750,51 @@ fn get_config_values(pattern: &str) -> Vec<(String, String)> {
 }
 
 /// 设置配置值（大多数配置在运行时不可修改）
-fn set_config_value(parameter: &str, _value: &str) -> Result<(), String> {
-    // 大多数配置在运行时不可修改，返回错误
+fn set_config_value(
+    parameter: &str,
+    value: &str,
+    storage: &Storage,
+    slowlog: &SlowLog,
+) -> Result<(), String> {
     match parameter.to_lowercase().as_str() {
-        "maxmemory" | "timeout" | "tcp-keepalive" | "slowlog-log-slower-than" | "slowlog-max-len" => {
-            // 这些配置理论上可以动态修改，但我们简化实现，暂不支持
-            Err(format!("ERR Unsupported CONFIG parameter: {}", parameter))
+        "maxmemory" => {
+            let bytes = parse_maxmemory_bytes(value)
+                .ok_or_else(|| "ERR invalid maxmemory value".to_string())?;
+            storage.set_maxmemory_bytes(Some(bytes));
+            Ok(())
         }
-        _ => {
-            Err(format!("ERR Unsupported CONFIG parameter: {}", parameter))
+        "timeout" => {
+            let secs: u64 = value
+                .parse()
+                .map_err(|_| "ERR invalid timeout value".to_string())?;
+            CLIENT_TIMEOUT_SECS.store(secs, Ordering::Relaxed);
+            Ok(())
         }
+        "tcp-keepalive" => {
+            let secs: u64 = value
+                .parse()
+                .map_err(|_| "ERR invalid tcp-keepalive value".to_string())?;
+            TCP_KEEPALIVE_SECS.store(secs, Ordering::Relaxed);
+            Ok(())
+        }
+        "slowlog-log-slower-than" => {
+            let us: u64 = value
+                .parse()
+                .map_err(|_| "ERR invalid slowlog-log-slower-than value".to_string())?;
+            slowlog.set_threshold_us(us);
+            Ok(())
+        }
+        "slowlog-max-len" => {
+            let len: usize = value
+                .parse()
+                .map_err(|_| "ERR invalid slowlog-max-len value".to_string())?;
+            if len == 0 {
+                return Err("ERR slowlog-max-len must be positive".to_string());
+            }
+            slowlog.set_max_len(len);
+            Ok(())
+        }
+        _ => Err(format!("ERR Unsupported CONFIG parameter: {}", parameter)),
     }
 }
 

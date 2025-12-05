@@ -17,3 +17,4 @@ hex = "0.4"
 
 [dev-dependencies]
 redis = { version = "0.25", features = ["tokio-comp"] }
+serial_test = "3"
