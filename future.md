@@ -292,13 +292,13 @@ enum HllRepr {
   - Redis 支持 `[^abc]` 表示"不匹配 a/b/c 中任一字符"。
   - 已在 `match_set` 中增加对 `^` 前缀的处理，支持取反字符集和取反范围。
 
-- [ ] **SCAN TYPE 选项**
+- [x] **SCAN TYPE 选项** ✅ 已完成（2025-12）
   - Redis 6.0+ 支持 `SCAN cursor TYPE string|list|set|hash|zset` 按类型过滤。
-  - 可在 `Command::Scan` 中增加 `type_filter: Option<String>` 字段，并在扫描时调用 `storage.type_of()` 过滤。
+  - 已在 `Command::Scan` 中增加 `type_filter` 字段，扫描时调用 `storage.type_of()` 过滤。
 
-- [ ] **SCAN NOVALUES 选项（HSCAN/ZSCAN）**
+- [x] **SCAN NOVALUES 选项（HSCAN/ZSCAN）** ✅ 已完成（2025-12）
   - Redis 7.4+ 支持 `HSCAN key cursor NOVALUES` 仅返回 field 不返回 value，减少网络开销。
-  - 可作为后续优化点。
+  - 已实现 HSCAN 和 ZSCAN 的 NOVALUES 选项。
 
 - [ ] **SCAN 游标稳定性与性能**
   - 当前 SCAN 实现基于 key 列表索引作为 cursor，在并发写入/删除时可能出现重复或遗漏。
@@ -362,12 +362,10 @@ enum HllRepr {
   - 后续可支持动态修改部分配置（如 maxmemory、timeout、slowlog-log-slower-than 等）。
   - 需要考虑配置持久化（写入配置文件或环境变量）。
 
-- [ ] **SLOWLOG 实际实现**
-  - 当前 SLOWLOG 命令只是占位实现，返回空数据。
-  - 后续需要实现：
-    - 记录执行时间超过阈值的命令。
-    - 维护固定大小的慢日志队列。
-    - 支持 SLOWLOG GET/RESET/LEN 的完整语义。
+- [x] **SLOWLOG 实际实现** ✅ 已完成（2025-12）
+  - 已实现完整的慢日志功能：记录超过阈值的命令、维护固定大小队列。
+  - 支持 SLOWLOG GET/RESET/LEN 完整语义。
+  - 环境变量配置：REDUST_SLOWLOG_SLOWER_THAN（微秒）、REDUST_SLOWLOG_MAX_LEN。
 
 - [ ] **CLIENT 命令扩展**
   - 当前仅支持 LIST/ID/SETNAME/GETNAME。

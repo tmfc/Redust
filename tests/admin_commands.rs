@@ -185,20 +185,66 @@ async fn slowlog_commands_work() {
     let (addr, shutdown, handle) = spawn_server().await;
     let mut client = TestClient::connect(addr).await;
 
+    // SLOWLOG RESET 先清空
+    client.send_array(&["SLOWLOG", "RESET"]).await;
+    let line = client.read_line().await;
+    assert_eq!(line, "+OK\r\n");
+
     // SLOWLOG LEN
     client.send_array(&["SLOWLOG", "LEN"]).await;
     let line = client.read_line().await;
     assert!(line.starts_with(":"), "Expected integer response, got: {}", line);
 
-    // SLOWLOG GET
+    // SLOWLOG GET - 返回空数组
     client.send_array(&["SLOWLOG", "GET"]).await;
     let line = client.read_line().await;
     assert!(line.starts_with("*"), "Expected array response, got: {}", line);
 
-    // SLOWLOG RESET
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn slowlog_records_slow_commands() {
+    // 设置非常低的阈值（1微秒）以确保命令被记录
+    let _guard1 = set_env("REDUST_DISABLE_PERSISTENCE", "1");
+    let _guard2 = set_env("REDUST_SLOWLOG_SLOWER_THAN", "1");
+    
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // 先重置慢日志
     client.send_array(&["SLOWLOG", "RESET"]).await;
+    let _ = client.read_line().await;
+
+    // 获取重置后的长度（SLOWLOG RESET 本身也会被记录）
+    client.send_array(&["SLOWLOG", "LEN"]).await;
     let line = client.read_line().await;
-    assert_eq!(line, "+OK\r\n");
+    let initial_len: i64 = line[1..].trim().parse().unwrap();
+
+    // 执行一些命令
+    client.send_array(&["SET", "foo", "bar"]).await;
+    let _ = client.read_line().await;
+    
+    client.send_array(&["GET", "foo"]).await;
+    let _ = client.read_line().await;
+    let _ = client.read_line().await; // bulk string value
+
+    // 检查慢日志长度增加了
+    client.send_array(&["SLOWLOG", "LEN"]).await;
+    let line = client.read_line().await;
+    let new_len: i64 = line[1..].trim().parse().unwrap();
+    assert!(new_len > initial_len, "Expected slow log to grow, initial: {}, new: {}", initial_len, new_len);
+
+    // 重置后长度应该为 0（或只有 RESET 命令本身）
+    client.send_array(&["SLOWLOG", "RESET"]).await;
+    let _ = client.read_line().await;
+    
+    client.send_array(&["SLOWLOG", "LEN"]).await;
+    let line = client.read_line().await;
+    let len: i64 = line[1..].trim().parse().unwrap();
+    // SLOWLOG RESET 本身也会被记录，所以可能是 1
+    assert!(len <= 1, "Expected 0 or 1 entries after reset, got: {}", len);
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();

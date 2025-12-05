@@ -157,6 +157,7 @@ pub enum Command {
         cursor: u64,
         pattern: Option<String>,
         count: Option<u64>,
+        type_filter: Option<String>,
     },
     Sscan {
         key: String,
@@ -169,12 +170,14 @@ pub enum Command {
         cursor: u64,
         pattern: Option<String>,
         count: Option<u64>,
+        novalues: bool,
     },
     Zscan {
         key: String,
         cursor: u64,
         pattern: Option<String>,
         count: Option<u64>,
+        novalues: bool,
     },
     Type {
         key: String,
@@ -1394,6 +1397,7 @@ pub async fn read_command(
             }
             let mut pattern: Option<String> = None;
             let mut count: Option<u64> = None;
+            let mut type_filter: Option<String> = None;
 
             while let Some(opt) = iter.next() {
                 let opt_upper = match std::str::from_utf8(&opt) {
@@ -1430,6 +1434,19 @@ pub async fn read_command(
                         }
                         count = Some(c_i64 as u64);
                     }
+                    "TYPE" => {
+                        if type_filter.is_some() {
+                            return Ok(Some(err_syntax()));
+                        }
+                        let Some(type_bytes) = iter.next() else {
+                            return Ok(Some(err_syntax()));
+                        };
+                        let t = match parse_bulk_string(type_bytes) {
+                            Ok(t) => t.to_ascii_lowercase(),
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        type_filter = Some(t);
+                    }
                     _ => {
                         return Ok(Some(err_syntax()));
                     }
@@ -1440,6 +1457,7 @@ pub async fn read_command(
                 cursor: cursor_i64 as u64,
                 pattern,
                 count,
+                type_filter,
             }
         }
         "SSCAN" => {
@@ -1531,6 +1549,7 @@ pub async fn read_command(
             }
             let mut pattern: Option<String> = None;
             let mut count: Option<u64> = None;
+            let mut novalues = false;
 
             while let Some(opt) = iter.next() {
                 let opt_upper = match std::str::from_utf8(&opt) {
@@ -1567,6 +1586,9 @@ pub async fn read_command(
                         }
                         count = Some(c_i64 as u64);
                     }
+                    "NOVALUES" => {
+                        novalues = true;
+                    }
                     _ => {
                         return Ok(Some(err_syntax()));
                     }
@@ -1578,6 +1600,7 @@ pub async fn read_command(
                 cursor: cursor_i64 as u64,
                 pattern,
                 count,
+                novalues,
             }
         }
         "ZSCAN" => {
@@ -1600,6 +1623,7 @@ pub async fn read_command(
             }
             let mut pattern: Option<String> = None;
             let mut count: Option<u64> = None;
+            let mut novalues = false;
 
             while let Some(opt) = iter.next() {
                 let opt_upper = match std::str::from_utf8(&opt) {
@@ -1636,6 +1660,9 @@ pub async fn read_command(
                         }
                         count = Some(c_i64 as u64);
                     }
+                    "NOVALUES" => {
+                        novalues = true;
+                    }
                     _ => {
                         return Ok(Some(err_syntax()));
                     }
@@ -1647,6 +1674,7 @@ pub async fn read_command(
                 cursor: cursor_i64 as u64,
                 pattern,
                 count,
+                novalues,
             }
         }
         "ZADD" => {

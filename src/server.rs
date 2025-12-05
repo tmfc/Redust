@@ -38,6 +38,107 @@ struct Metrics {
     pubsub_messages_dropped: AtomicU64,
 }
 
+/// 慢日志条目
+#[derive(Clone)]
+struct SlowLogEntry {
+    /// 唯一 ID
+    id: u64,
+    /// 命令执行的 Unix 时间戳（秒）
+    timestamp: u64,
+    /// 执行耗时（微秒）
+    duration_us: u64,
+    /// 命令及参数
+    command: Vec<String>,
+    /// 客户端地址
+    client_addr: String,
+    /// 客户端名称
+    client_name: String,
+}
+
+/// 慢日志管理器
+struct SlowLog {
+    /// 慢日志条目队列
+    entries: std::sync::Mutex<std::collections::VecDeque<SlowLogEntry>>,
+    /// 下一个条目 ID
+    next_id: AtomicU64,
+    /// 慢查询阈值（微秒），超过此值的命令会被记录
+    threshold_us: AtomicU64,
+    /// 最大条目数
+    max_len: AtomicUsize,
+}
+
+impl SlowLog {
+    fn new() -> Self {
+        // 默认阈值 10ms = 10000us，最大 128 条
+        let threshold = env::var("REDUST_SLOWLOG_SLOWER_THAN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10000u64);
+        let max_len = env::var("REDUST_SLOWLOG_MAX_LEN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(128usize);
+        
+        SlowLog {
+            entries: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            next_id: AtomicU64::new(0),
+            threshold_us: AtomicU64::new(threshold),
+            max_len: AtomicUsize::new(max_len),
+        }
+    }
+    
+    /// 记录一条慢日志（如果耗时超过阈值）
+    fn log_if_slow(
+        &self,
+        duration_us: u64,
+        command: Vec<String>,
+        client_addr: &str,
+        client_name: &str,
+    ) {
+        let threshold = self.threshold_us.load(Ordering::Relaxed);
+        if duration_us < threshold {
+            return;
+        }
+        
+        let entry = SlowLogEntry {
+            id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            duration_us,
+            command,
+            client_addr: client_addr.to_string(),
+            client_name: client_name.to_string(),
+        };
+        
+        let max_len = self.max_len.load(Ordering::Relaxed);
+        let mut entries = self.entries.lock().unwrap();
+        entries.push_front(entry);
+        while entries.len() > max_len {
+            entries.pop_back();
+        }
+    }
+    
+    /// 获取最近的 N 条慢日志
+    fn get(&self, count: Option<usize>) -> Vec<SlowLogEntry> {
+        let entries = self.entries.lock().unwrap();
+        let n = count.unwrap_or(10).min(entries.len());
+        entries.iter().take(n).cloned().collect()
+    }
+    
+    /// 重置慢日志
+    fn reset(&self) {
+        let mut entries = self.entries.lock().unwrap();
+        entries.clear();
+    }
+    
+    /// 获取慢日志长度
+    fn len(&self) -> usize {
+        self.entries.lock().unwrap().len()
+    }
+}
+
 struct PersistenceState {
     rdb_path: String,
     aof_path: Option<String>,
@@ -280,6 +381,33 @@ fn format_bytes(bytes: u64) -> String {
         return format!("{:.2}KB", v);
     }
     format!("{}B", bytes)
+}
+
+/// 将命令转换为字符串数组用于慢日志记录
+fn command_to_strings(cmd: &Command) -> Vec<String> {
+    match cmd {
+        Command::Ping => vec!["PING".to_string()],
+        Command::PingWithPayload(msg) => vec!["PING".to_string(), String::from_utf8_lossy(msg).to_string()],
+        Command::Echo(msg) => vec!["ECHO".to_string(), String::from_utf8_lossy(msg).to_string()],
+        Command::Set { key, value, .. } => vec!["SET".to_string(), key.clone(), String::from_utf8_lossy(value).to_string()],
+        Command::Get { key } => vec!["GET".to_string(), key.clone()],
+        Command::Del { keys } => std::iter::once("DEL".to_string()).chain(keys.iter().cloned()).collect(),
+        Command::Lpush { key, values } => std::iter::once("LPUSH".to_string()).chain(std::iter::once(key.clone())).chain(values.iter().cloned()).collect(),
+        Command::Rpush { key, values } => std::iter::once("RPUSH".to_string()).chain(std::iter::once(key.clone())).chain(values.iter().cloned()).collect(),
+        Command::Hset { key, field, value } => vec!["HSET".to_string(), key.clone(), field.clone(), value.clone()],
+        Command::Hget { key, field } => vec!["HGET".to_string(), key.clone(), field.clone()],
+        Command::Sadd { key, members } => std::iter::once("SADD".to_string()).chain(std::iter::once(key.clone())).chain(members.iter().cloned()).collect(),
+        Command::Zadd { key, entries, .. } => {
+            let mut v = vec!["ZADD".to_string(), key.clone()];
+            for (score, member) in entries {
+                v.push(score.to_string());
+                v.push(member.clone());
+            }
+            v
+        }
+        // 对于其他命令，使用 Debug 格式的简化表示
+        _ => vec![format!("{:?}", cmd).chars().take(100).collect()],
+    }
 }
 
 fn pattern_match(pattern: &str, value: &str) -> bool {
@@ -1121,6 +1249,98 @@ async fn handle_string_command(
     Ok(())
 }
 
+async fn handle_meta_command(
+    cmd: Command,
+    storage: &Storage,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    current_db: u8,
+) -> io::Result<()> {
+    match cmd {
+        Command::Type { key } => {
+            let physical = prefix_key(current_db, &key);
+            let t = storage.type_of(&physical);
+            respond_simple_string(writer, &t).await?;
+        }
+        Command::Keys { pattern } => {
+            let all = storage.keys("*");
+            let prefix = format!("{}:", current_db);
+            let mut logical_keys: Vec<String> = Vec::new();
+            for k in all {
+                if let Some(rest) = k.strip_prefix(&prefix) {
+                    logical_keys.push(rest.to_string());
+                }
+            }
+
+            let mut result: Vec<String> = Vec::new();
+            for k in logical_keys {
+                if pattern_match(&pattern, &k) {
+                    result.push(k);
+                }
+            }
+
+            let mut response = format!("*{}\r\n", result.len());
+            for k in result {
+                response.push_str(&format!("${}\r\n{}\r\n", k.len(), k));
+            }
+            writer.write_all(response.as_bytes()).await?;
+        }
+        Command::Scan {
+            cursor,
+            pattern,
+            count,
+            type_filter,
+        } => {
+            let all = storage.keys("*");
+            let prefix = format!("{}:", current_db);
+            let mut logical: Vec<String> = Vec::new();
+            for k in all {
+                if let Some(rest) = k.strip_prefix(&prefix) {
+                    logical.push(rest.to_string());
+                }
+            }
+
+            let total = logical.len() as u64;
+            let start = if cursor > total { total } else { cursor } as usize;
+            let batch_size = count.unwrap_or(10) as usize;
+            let end = std::cmp::min(start + batch_size, logical.len());
+
+            let pat = pattern.unwrap_or_else(|| "*".to_string());
+            let mut matched: Vec<String> = Vec::new();
+            for k in &logical[start..end] {
+                if pattern_match(&pat, k) {
+                    if let Some(ref type_f) = type_filter {
+                        let physical = prefix_key(current_db, k);
+                        let key_type = storage.type_of(&physical);
+                        if key_type == "none" || key_type.to_ascii_lowercase() != *type_f {
+                            continue;
+                        }
+                    }
+                    matched.push(k.clone());
+                }
+            }
+
+            let next_cursor = if end >= logical.len() { 0 } else { end as u64 };
+            let cursor_str = next_cursor.to_string();
+            let mut response =
+                format!("*2\r\n${}\r\n{}\r\n*{}\r\n", cursor_str.len(), cursor_str, matched.len());
+            for k in matched {
+                response.push_str(&format!("${}\r\n{}\r\n", k.len(), k));
+            }
+            writer.write_all(response.as_bytes()).await?;
+        }
+        Command::Dbsize => {
+            let all = storage.keys("*");
+            let prefix = format!("{}:", current_db);
+            let count = all.into_iter().filter(|k| k.starts_with(&prefix)).count();
+            respond_integer(writer, count as i64).await?;
+        }
+        _ => {
+            respond_error(writer, "ERR command not supported in transaction").await?;
+        }
+    }
+    Ok(())
+}
+
 async fn handle_list_command(
     cmd: Command,
     storage: &Storage,
@@ -1598,6 +1818,7 @@ async fn handle_list_command(
             cursor: _,
             pattern,
             count: _,
+            novalues,
         } => {
             let physical = prefix_key(current_db, &key);
             match storage.hgetall(&physical) {
@@ -1614,15 +1835,18 @@ async fn handle_list_command(
                     let next_cursor = 0u64;
                     let cursor_str = next_cursor.to_string();
 
+                    let array_len = if novalues { flat.len() } else { flat.len() * 2 };
                     let mut response = format!(
                         "*2\r\n${}\r\n{}\r\n*{}\r\n",
                         cursor_str.len(),
                         cursor_str,
-                        flat.len() * 2
+                        array_len
                     );
                     for (f, v) in flat {
                         response.push_str(&format!("${}\r\n{}\r\n", f.len(), f));
-                        response.push_str(&format!("${}\r\n{}\r\n", v.len(), v));
+                        if !novalues {
+                            response.push_str(&format!("${}\r\n{}\r\n", v.len(), v));
+                        }
                     }
                     writer.write_all(response.as_bytes()).await?;
                 }
@@ -2268,6 +2492,7 @@ async fn handle_hash_command(
             cursor,
             pattern,
             count,
+            novalues,
         } => {
             let physical = prefix_key(current_db, &key);
             match storage.hgetall(&physical) {
@@ -2289,15 +2514,19 @@ async fn handle_hash_command(
 
                     let cursor_str = next_cursor.to_string();
 
+                    // NOVALUES: 只返回 field，不返回 value
+                    let array_len = if novalues { flat.len() } else { flat.len() * 2 };
                     let mut response = format!(
                         "*2\r\n${}\r\n{}\r\n*{}\r\n",
                         cursor_str.len(),
                         cursor_str,
-                        flat.len() * 2
+                        array_len
                     );
                     for (f, v) in flat {
                         response.push_str(&format!("${}\r\n{}\r\n", f.len(), f));
-                        response.push_str(&format!("${}\r\n{}\r\n", v.len(), v));
+                        if !novalues {
+                            response.push_str(&format!("${}\r\n{}\r\n", v.len(), v));
+                        }
                     }
                     writer.write_all(response.as_bytes()).await?;
                 }
@@ -2726,6 +2955,7 @@ async fn handle_zset_command(
             cursor,
             pattern,
             count,
+            novalues,
         } => {
             let physical = prefix_key(current_db, &key);
             match storage.zscan_entries(&physical) {
@@ -2746,16 +2976,20 @@ async fn handle_zset_command(
                     let next_cursor = if end >= entries.len() { 0 } else { end as u64 };
                     let cursor_str = next_cursor.to_string();
 
+                    // NOVALUES: 只返回 member，不返回 score
+                    let array_len = if novalues { flat.len() } else { flat.len() * 2 };
                     let mut response = format!(
                         "*2\r\n${}\r\n{}\r\n*{}\r\n",
                         cursor_str.len(),
                         cursor_str,
-                        flat.len() * 2
+                        array_len
                     );
                     for (member, score) in flat {
-                        let score_s = format_score(score);
                         response.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
-                        response.push_str(&format!("${}\r\n{}\r\n", score_s.len(), score_s));
+                        if !novalues {
+                            let score_s = format_score(score);
+                            response.push_str(&format!("${}\r\n{}\r\n", score_s.len(), score_s));
+                        }
                     }
                     writer.write_all(response.as_bytes()).await?;
                 }
@@ -2885,78 +3119,8 @@ async fn handle_key_meta_command(
             let v = if changed { 1 } else { 0 };
             respond_integer(writer, v).await?;
         }
-        Command::Type { key } => {
-            let physical = prefix_key(current_db, &key);
-            let t = storage.type_of(&physical);
-            respond_simple_string(writer, &t).await?;
-        }
-        Command::Keys { pattern } => {
-            let all = storage.keys("*");
-            let prefix = format!("{}:", current_db);
-            let mut logical_keys: Vec<String> = Vec::new();
-            for k in all {
-                if let Some(rest) = k.strip_prefix(&prefix) {
-                    logical_keys.push(rest.to_string());
-                }
-            }
-
-            let mut result: Vec<String> = Vec::new();
-            for k in logical_keys {
-                if pattern_match(&pattern, &k) {
-                    result.push(k);
-                }
-            }
-
-            let mut response = format!("*{}\r\n", result.len());
-            for k in result {
-                response.push_str(&format!("${}\r\n{}\r\n", k.len(), k));
-            }
-            writer.write_all(response.as_bytes()).await?;
-        }
-        Command::Scan {
-            cursor,
-            pattern,
-            count,
-        } => {
-            // 简化实现：基于当前 DB 的逻辑 key 列表做一次切片扫描。
-            let all = storage.keys("*");
-            let prefix = format!("{}:", current_db);
-            let mut logical: Vec<String> = Vec::new();
-            for k in all {
-                if let Some(rest) = k.strip_prefix(&prefix) {
-                    logical.push(rest.to_string());
-                }
-            }
-
-            let total = logical.len() as u64;
-            let start = if cursor > total { total } else { cursor } as usize;
-            let batch_size = count.unwrap_or(10) as usize;
-            let end = std::cmp::min(start + batch_size, logical.len());
-
-            let pat = pattern.unwrap_or_else(|| "*".to_string());
-            let mut matched: Vec<String> = Vec::new();
-            for k in &logical[start..end] {
-                if pattern_match(&pat, k) {
-                    matched.push(k.clone());
-                }
-            }
-
-            let next_cursor = if end >= logical.len() { 0 } else { end as u64 };
-
-            // RESP: *2 \r\n :<cursor> \r\n *N ...
-            let cursor_str = next_cursor.to_string();
-            let mut response =
-                format!("*2\r\n${}\r\n{}\r\n*{}\r\n", cursor_str.len(), cursor_str, matched.len());
-            for k in matched {
-                response.push_str(&format!("${}\r\n{}\r\n", k.len(), k));
-            }
-            writer.write_all(response.as_bytes()).await?;
-        }
-        Command::Dbsize => {
-            let all = storage.keys("*");
-            let prefix = format!("{}:", current_db);
-            let count = all.into_iter().filter(|k| k.starts_with(&prefix)).count();
-            respond_integer(writer, count as i64).await?;
+        Command::Type { .. } | Command::Keys { .. } | Command::Scan { .. } | Command::Dbsize => {
+            handle_meta_command(cmd, storage, writer, current_db).await?;
         }
         Command::Rename { key, newkey } => {
             let from = prefix_key(current_db, &key);
@@ -3258,10 +3422,35 @@ async fn execute_command_in_transaction(
         }
 
         // key meta 命令
-        Command::Type { .. }
-        | Command::Keys { .. }
-        | Command::Dbsize
-        | Command::Expire { .. }
+        Command::Type { key } => {
+            handle_meta_command(Command::Type { key }, storage, writer, current_db).await?;
+        }
+        Command::Keys { pattern } => {
+            handle_meta_command(Command::Keys { pattern }, storage, writer, current_db).await?;
+        }
+        Command::Dbsize => {
+            handle_meta_command(Command::Dbsize, storage, writer, current_db).await?;
+        }
+        Command::Scan {
+            cursor,
+            pattern,
+            count,
+            type_filter,
+        } => {
+            handle_meta_command(
+                Command::Scan {
+                    cursor,
+                    pattern,
+                    count,
+                    type_filter,
+                },
+                storage,
+                writer,
+                current_db,
+            )
+            .await?;
+        }
+        Command::Expire { .. }
         | Command::Pexpire { .. }
         | Command::Expireat { .. }
         | Command::Pexpireat { .. }
@@ -3272,10 +3461,7 @@ async fn execute_command_in_transaction(
         | Command::Persist { .. }
         | Command::Rename { .. }
         | Command::Renamenx { .. }
-        | Command::Scan { .. }
         | Command::Zscan { .. } => {
-            // 简化处理：这些命令在事务中可能需要特殊处理
-            // 但为了简单起见，我们直接返回错误
             respond_error(writer, "ERR command not supported in transaction").await?;
         }
 
@@ -3313,8 +3499,10 @@ async fn handle_connection(
     overflow_strategy: PubSubOverflowStrategy,
     persistence: Arc<PersistenceState>,
     script_cache: Arc<ScriptCache>,
+    slowlog: Arc<SlowLog>,
 ) -> io::Result<()> {
     let peer_addr = stream.peer_addr().ok();
+    let client_addr = peer_addr.map(|a| a.to_string()).unwrap_or_default();
     info!("[conn] new connection from {:?}", peer_addr);
 
     metrics.connected_clients.fetch_add(1, Ordering::Relaxed);
@@ -3380,6 +3568,10 @@ async fn handle_connection(
         };
 
         metrics.total_commands.fetch_add(1, Ordering::Relaxed);
+        
+        // 记录命令开始时间用于慢日志
+        let cmd_start = Instant::now();
+        let cmd_strings = command_to_strings(&cmd);
 
         match &cmd {
             Command::Auth { .. } => {
@@ -4160,15 +4352,37 @@ async fn handle_connection(
                 }
             }
             Command::SlowlogGet { count } => {
-                // 简化实现：返回空数组
-                let _ = count;
-                write_half.write_all(b"*0\r\n").await?;
+                let entries = slowlog.get(count);
+                // Redis SLOWLOG GET 返回格式:
+                // *N (N 条记录)
+                //   *6 (每条记录 6 个字段)
+                //     :id
+                //     :timestamp
+                //     :duration_us
+                //     *M (命令参数数组)
+                //     $client_addr
+                //     $client_name
+                let mut resp = format!("*{}\r\n", entries.len());
+                for entry in entries {
+                    resp.push_str("*6\r\n");
+                    resp.push_str(&format!(":{}\r\n", entry.id));
+                    resp.push_str(&format!(":{}\r\n", entry.timestamp));
+                    resp.push_str(&format!(":{}\r\n", entry.duration_us));
+                    resp.push_str(&format!("*{}\r\n", entry.command.len()));
+                    for arg in &entry.command {
+                        resp.push_str(&format!("${}\r\n{}\r\n", arg.len(), arg));
+                    }
+                    resp.push_str(&format!("${}\r\n{}\r\n", entry.client_addr.len(), entry.client_addr));
+                    resp.push_str(&format!("${}\r\n{}\r\n", entry.client_name.len(), entry.client_name));
+                }
+                write_half.write_all(resp.as_bytes()).await?;
             }
             Command::SlowlogReset => {
+                slowlog.reset();
                 respond_simple_string(&mut write_half, "OK").await?;
             }
             Command::SlowlogLen => {
-                respond_integer(&mut write_half, 0).await?;
+                respond_integer(&mut write_half, slowlog.len() as i64).await?;
             }
 
             // 解析阶段构造的错误命令
@@ -4187,6 +4401,10 @@ async fn handle_connection(
                 respond_error(&mut write_half, &msg).await?;
             }
         }
+        
+        // 记录慢日志
+        let duration_us = cmd_start.elapsed().as_micros() as u64;
+        slowlog.log_if_slow(duration_us, cmd_strings, &client_addr, &client_name);
     }
 
     let chan_len = channel_subscriptions.len();
@@ -4354,6 +4572,7 @@ pub async fn serve(
         pubsub_messages_delivered: AtomicU64::new(0),
         pubsub_messages_dropped: AtomicU64::new(0),
     });
+    let slowlog = Arc::new(SlowLog::new());
     let pubsub = PubSubHub::new();
     let script_cache = Arc::new(ScriptCache::new());
 
@@ -4389,8 +4608,9 @@ pub async fn serve(
                 info!("Accepted connection from {}", addr);
                 let persistence_clone = persistence.clone();
                 let script_cache_clone = script_cache.clone();
+                let slowlog_clone = slowlog.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_connection(stream, storage, metrics, pubsub, overflow_strategy, persistence_clone.clone(), script_cache_clone).await {
+                    if let Err(err) = handle_connection(stream, storage, metrics, pubsub, overflow_strategy, persistence_clone.clone(), script_cache_clone, slowlog_clone).await {
                         error!("Connection error: {}", err);
                     }
                 });

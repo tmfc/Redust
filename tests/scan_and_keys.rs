@@ -276,6 +276,88 @@ async fn scan_argument_and_integer_errors() {
     handle.await.unwrap().unwrap();
 }
 
+/// 测试 SCAN TYPE 选项按类型过滤
+#[tokio::test]
+async fn scan_with_type_filter() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // 创建不同类型的 key
+    client.send_array(&["SET", "str1", "value1"]).await;
+    let _ = client.read_simple_line().await;
+    client.send_array(&["SET", "str2", "value2"]).await;
+    let _ = client.read_simple_line().await;
+    client.send_array(&["LPUSH", "list1", "a", "b"]).await;
+    let _ = client.read_simple_line().await;
+    client.send_array(&["SADD", "set1", "x", "y"]).await;
+    let _ = client.read_simple_line().await;
+    client.send_array(&["HSET", "hash1", "f1", "v1"]).await;
+    let _ = client.read_simple_line().await;
+    client.send_array(&["ZADD", "zset1", "1", "m1"]).await;
+    let _ = client.read_simple_line().await;
+
+    // SCAN TYPE string - 只返回字符串类型
+    client.send_array(&["SCAN", "0", "TYPE", "string", "COUNT", "100"]).await;
+    let mut outer = String::new();
+    client.reader.read_line(&mut outer).await.unwrap();
+    assert_eq!(outer, "*2\r\n");
+    let _ = client.read_bulk_string().await; // cursor
+    let keys = client.read_array_of_bulk().await;
+    let mut keys_sorted: Vec<String> = keys.into_iter().filter(|k| !k.is_empty()).collect();
+    keys_sorted.sort();
+    assert_eq!(keys_sorted, vec!["str1", "str2"]);
+
+    // SCAN TYPE list - 只返回列表类型
+    client.send_array(&["SCAN", "0", "TYPE", "list", "COUNT", "100"]).await;
+    let mut outer = String::new();
+    client.reader.read_line(&mut outer).await.unwrap();
+    assert_eq!(outer, "*2\r\n");
+    let _ = client.read_bulk_string().await;
+    let keys = client.read_array_of_bulk().await;
+    assert_eq!(keys, vec!["list1"]);
+
+    // SCAN TYPE set - 只返回集合类型
+    client.send_array(&["SCAN", "0", "TYPE", "set", "COUNT", "100"]).await;
+    let mut outer = String::new();
+    client.reader.read_line(&mut outer).await.unwrap();
+    assert_eq!(outer, "*2\r\n");
+    let _ = client.read_bulk_string().await;
+    let keys = client.read_array_of_bulk().await;
+    assert_eq!(keys, vec!["set1"]);
+
+    // SCAN TYPE hash - 只返回哈希类型
+    client.send_array(&["SCAN", "0", "TYPE", "hash", "COUNT", "100"]).await;
+    let mut outer = String::new();
+    client.reader.read_line(&mut outer).await.unwrap();
+    assert_eq!(outer, "*2\r\n");
+    let _ = client.read_bulk_string().await;
+    let keys = client.read_array_of_bulk().await;
+    assert_eq!(keys, vec!["hash1"]);
+
+    // SCAN TYPE zset - 只返回有序集合类型
+    client.send_array(&["SCAN", "0", "TYPE", "zset", "COUNT", "100"]).await;
+    let mut outer = String::new();
+    client.reader.read_line(&mut outer).await.unwrap();
+    assert_eq!(outer, "*2\r\n");
+    let _ = client.read_bulk_string().await;
+    let keys = client.read_array_of_bulk().await;
+    assert_eq!(keys, vec!["zset1"]);
+
+    // SCAN MATCH str* TYPE string - 组合使用 MATCH 和 TYPE
+    client.send_array(&["SCAN", "0", "MATCH", "str*", "TYPE", "string", "COUNT", "100"]).await;
+    let mut outer = String::new();
+    client.reader.read_line(&mut outer).await.unwrap();
+    assert_eq!(outer, "*2\r\n");
+    let _ = client.read_bulk_string().await;
+    let keys = client.read_array_of_bulk().await;
+    let mut keys_sorted: Vec<String> = keys.into_iter().filter(|k| !k.is_empty()).collect();
+    keys_sorted.sort();
+    assert_eq!(keys_sorted, vec!["str1", "str2"]);
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn sscan_basic_roundtrip() {
     let (addr, shutdown, handle) = spawn_server().await;
@@ -632,6 +714,84 @@ async fn scan_with_various_glob_patterns() {
     seen.sort();
     let expected: Vec<String> = (0..5).map(|i| format!("item:{}", i)).collect();
     assert_eq!(seen, expected);
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+/// 测试 HSCAN NOVALUES 选项
+#[tokio::test]
+async fn hscan_novalues_option() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // 创建 hash - HSET 返回添加的字段数
+    client.send_array(&["HSET", "myhash", "f1", "v1"]).await;
+    let _ = client.read_simple_line().await; // :1
+    client.send_array(&["HSET", "myhash", "f2", "v2"]).await;
+    let _ = client.read_simple_line().await; // :1
+    client.send_array(&["HSET", "myhash", "f3", "v3"]).await;
+    let _ = client.read_simple_line().await; // :1
+
+    // HSCAN 不带 NOVALUES - 返回 field 和 value
+    client.send_array(&["HSCAN", "myhash", "0", "COUNT", "100"]).await;
+    let mut line = String::new();
+    client.reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "*2\r\n");
+    let _ = client.read_bulk_string().await; // cursor
+    let items = client.read_array_of_bulk().await;
+    // 应该有 6 个元素（3 个 field + 3 个 value）
+    assert_eq!(items.len(), 6);
+
+    // HSCAN 带 NOVALUES - 只返回 field
+    client.send_array(&["HSCAN", "myhash", "0", "COUNT", "100", "NOVALUES"]).await;
+    let mut line = String::new();
+    client.reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "*2\r\n");
+    let _ = client.read_bulk_string().await; // cursor
+    let items = client.read_array_of_bulk().await;
+    // 应该只有 3 个元素（只有 field）
+    assert_eq!(items.len(), 3);
+    let mut sorted = items.clone();
+    sorted.sort();
+    assert_eq!(sorted, vec!["f1", "f2", "f3"]);
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+/// 测试 ZSCAN NOVALUES 选项
+#[tokio::test]
+async fn zscan_novalues_option() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // 创建 zset
+    client.send_array(&["ZADD", "myzset", "1", "m1", "2", "m2", "3", "m3"]).await;
+    let _ = client.read_simple_line().await;
+
+    // ZSCAN 不带 NOVALUES - 返回 member 和 score
+    client.send_array(&["ZSCAN", "myzset", "0", "COUNT", "100"]).await;
+    let mut line = String::new();
+    client.reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "*2\r\n");
+    let _ = client.read_bulk_string().await; // cursor
+    let items = client.read_array_of_bulk().await;
+    // 应该有 6 个元素（3 个 member + 3 个 score）
+    assert_eq!(items.len(), 6);
+
+    // ZSCAN 带 NOVALUES - 只返回 member
+    client.send_array(&["ZSCAN", "myzset", "0", "COUNT", "100", "NOVALUES"]).await;
+    let mut line = String::new();
+    client.reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "*2\r\n");
+    let _ = client.read_bulk_string().await; // cursor
+    let items = client.read_array_of_bulk().await;
+    // 应该只有 3 个元素（只有 member）
+    assert_eq!(items.len(), 3);
+    let mut sorted = items.clone();
+    sorted.sort();
+    assert_eq!(sorted, vec!["m1", "m2", "m3"]);
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
