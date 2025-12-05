@@ -1988,9 +1988,10 @@ impl Storage {
     }
 
     pub fn sunion(&self, keys: &[String]) -> Result<Vec<String>, ()> {
+        let now = Instant::now();
         let mut result: HashSet<String> = HashSet::new();
+        
         for key in keys {
-            let now = Instant::now();
             if self.remove_if_expired(key, now) {
                 continue;
             }
@@ -1998,18 +1999,14 @@ impl Storage {
             if let Some(entry) = self.data.get(key) {
                 match entry.value() {
                     StorageValue::Set { value: set, .. } => {
-                        for m in set {
-                            result.insert(m.clone());
-                        }
+                        result.extend(set.iter().cloned());
                     }
                     _ => return Err(()),
                 }
             }
         }
 
-        let mut members: Vec<String> = result.into_iter().collect();
-        members.sort();
-        Ok(members)
+        Ok(result.into_iter().collect())
     }
 
     fn set_store_result(&self, dest: &str, members: HashSet<String>) -> usize {
@@ -2032,6 +2029,7 @@ impl Storage {
     pub fn sunionstore(&self, dest: &str, keys: &[String]) -> Result<usize, ()> {
         let now = Instant::now();
         let mut result: HashSet<String> = HashSet::new();
+        
         for key in keys {
             if self.remove_if_expired(key, now) {
                 continue;
@@ -2040,9 +2038,7 @@ impl Storage {
             if let Some(entry) = self.data.get(key) {
                 match entry.value() {
                     StorageValue::Set { value: set, .. } => {
-                        for m in set {
-                            result.insert(m.clone());
-                        }
+                        result.extend(set.iter().cloned());
                     }
                     _ => return Err(()),
                 }
@@ -2113,6 +2109,10 @@ impl Storage {
         };
 
         for key in iter {
+            if result.is_empty() {
+                break; // 早期退出：结果已为空
+            }
+            
             if self.remove_if_expired(key, now) {
                 continue;
             }
@@ -3755,9 +3755,7 @@ impl Storage {
             result.insert(member.clone());
         }
 
-        let mut members: Vec<String> = result.into_iter().collect();
-        members.sort();
-        Ok(members)
+        Ok(result.into_iter().collect())
     }
 
     pub fn sdiff(&self, keys: &[String]) -> Result<Vec<String>, ()> {
@@ -3782,6 +3780,10 @@ impl Storage {
         let mut result: HashSet<String> = first_set.iter().cloned().collect();
 
         for key in &keys[1..] {
+            if result.is_empty() {
+                break; // 早期退出：结果已为空
+            }
+            
             let now = Instant::now();
             if self.remove_if_expired(key, now) {
                 continue;
@@ -3790,18 +3792,15 @@ impl Storage {
             if let Some(entry) = self.data.get(key) {
                 match entry.value() {
                     StorageValue::Set { value: set, .. } => {
-                        for member in set.iter() {
-                            result.remove(member);
-                        }
+                        // 使用 retain 而不是遍历 set：当 result 较小时更高效
+                        result.retain(|m| !set.contains(m));
                     }
                     _ => return Err(()), // WRONGTYPE
                 }
             }
         }
 
-        let mut members: Vec<String> = result.into_iter().collect();
-        members.sort();
-        Ok(members)
+        Ok(result.into_iter().collect())
     }
 
     fn value_is_expired(value: &StorageValue, now: Instant) -> bool {

@@ -796,3 +796,114 @@ async fn zscan_novalues_option() {
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
 }
+
+/// 测试 SCAN 游标稳定性：在扫描过程中添加/删除键不会导致重复
+#[tokio::test]
+async fn scan_cursor_stability_no_duplicates() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // 写入初始键
+    for i in 0..20 {
+        let k = format!("key:{}", i);
+        client.send_array(&["SET", &k, "v"]).await;
+        let _ = client.read_simple_line().await;
+    }
+
+    // 开始扫描，每次只取 3 个
+    let mut cursor = 0u64;
+    let mut all_keys: Vec<String> = Vec::new();
+    let mut iterations = 0;
+
+    loop {
+        let (next, keys) = client.scan(cursor, None, Some(3)).await;
+        
+        // 在扫描过程中添加新键
+        if iterations == 1 {
+            for i in 20..25 {
+                let k = format!("key:{}", i);
+                client.send_array(&["SET", &k, "v"]).await;
+                let _ = client.read_simple_line().await;
+            }
+        }
+        
+        // 在扫描过程中删除一些键
+        if iterations == 2 {
+            client.send_array(&["DEL", "key:5", "key:10"]).await;
+            let _ = client.read_simple_line().await;
+        }
+
+        for k in keys {
+            if !k.is_empty() {
+                all_keys.push(k);
+            }
+        }
+
+        iterations += 1;
+        if next == 0 {
+            break;
+        }
+        cursor = next;
+        
+        // 防止无限循环
+        if iterations > 100 {
+            panic!("SCAN did not complete after 100 iterations");
+        }
+    }
+
+    // 验证没有重复键
+    let mut sorted = all_keys.clone();
+    sorted.sort();
+    let mut deduped = sorted.clone();
+    deduped.dedup();
+    assert_eq!(sorted, deduped, "SCAN returned duplicate keys: {:?}", all_keys);
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+/// 测试 SCAN 完整遍历：确保所有初始键都被扫描到
+#[tokio::test]
+async fn scan_complete_iteration() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // 写入键
+    let expected: Vec<String> = (0..50).map(|i| format!("item:{}", i)).collect();
+    for k in &expected {
+        client.send_array(&["SET", k, "v"]).await;
+        let _ = client.read_simple_line().await;
+    }
+
+    // 完整扫描
+    let mut cursor = 0u64;
+    let mut seen: Vec<String> = Vec::new();
+    let mut iterations = 0;
+
+    loop {
+        let (next, keys) = client.scan(cursor, None, Some(7)).await;
+        for k in keys {
+            if !k.is_empty() {
+                seen.push(k);
+            }
+        }
+        iterations += 1;
+        if next == 0 {
+            break;
+        }
+        cursor = next;
+        
+        if iterations > 100 {
+            panic!("SCAN did not complete after 100 iterations");
+        }
+    }
+
+    // 验证所有键都被扫描到
+    seen.sort();
+    let mut expected_sorted = expected.clone();
+    expected_sorted.sort();
+    assert_eq!(seen, expected_sorted, "SCAN missed some keys");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}

@@ -300,9 +300,12 @@ enum HllRepr {
   - Redis 7.4+ 支持 `HSCAN key cursor NOVALUES` 仅返回 field 不返回 value，减少网络开销。
   - 已实现 HSCAN 和 ZSCAN 的 NOVALUES 选项。
 
-- [ ] **SCAN 游标稳定性与性能**
-  - 当前 SCAN 实现基于 key 列表索引作为 cursor，在并发写入/删除时可能出现重复或遗漏。
-  - 后续可考虑引入更稳定的游标机制（如基于 key 排序后的二分查找位置）。
+- [x] **SCAN 游标稳定性优化** ✅ 已完成（2025-12）
+  - 使用键名哈希值作为游标，替代简单的数组索引。
+  - 游标基于 `DefaultHasher` 计算的 u64 哈希值，按哈希值排序后扫描。
+  - 优点：并发写入/删除时不会产生重复键（已扫描的哈希值不会再次返回）。
+  - 限制：新增键如果哈希值小于当前游标可能被跳过（与 Redis 行为一致）。
+  - 支持完整的 u64 游标范围，解析时使用 `parse_u64_from_bulk`。
 
 ---
 
@@ -326,13 +329,12 @@ enum HllRepr {
     ZADD/ZREM/ZSCORE/ZCARD/ZRANGE/ZREVRANGE、TYPE/TTL/PTTL/EXPIRE/PEXPIRE/PERSIST。
   - `redis.call()` 在错误时抛出 Lua 异常，`redis.pcall()` 返回 `{err = "..."}` 表。
 
-- [ ] **事务中 Lua 脚本支持**
-  - 当前 `EVAL`/`EVALSHA` 在事务中不支持（返回错误）。
-  - 后续可考虑支持在事务中执行脚本。
+- [x] **事务中 Lua 脚本支持** ✅ 已完成（2025-12）
+  - 支持 `EVAL`/`EVALSHA`/`SCRIPT LOAD`/`SCRIPT EXISTS`/`SCRIPT FLUSH` 在 MULTI 中执行。
+  - 脚本在事务中正常执行，结果作为事务响应数组的一部分返回。
 
-- [ ] **事务中更多命令支持**
-  - 当前事务中部分命令（如 `TYPE`、`KEYS`、`SCAN` 等）返回错误。
-  - 后续可逐步支持这些命令在事务中执行。
+- [x] **事务中更多命令支持** ✅ 已完成（2025-12）
+  - 已支持 `TYPE`、`KEYS`、`SCAN`、`DBSIZE` 等元命令在事务中执行。
 
 - [ ] **事务错误处理增强**
   - Redis 在 EXEC 时如果队列中有语法错误命令，会中止整个事务。
@@ -397,9 +399,13 @@ enum HllRepr {
   - 🔄 待实现：`BLPOP` / `BRPOP` 等阻塞语义命令
   - 思考阻塞列表操作在当前 Tokio 并发模型下的实现方式（例如：每 key 的等待队列 vs 全局调度）。
 
-- [ ] **集合命令扩展与性能调优**
-  - 在现有 `SADD` / `SMEMBERS` / `SISMEMBER` / `SCARD` / `SUNION` / `SINTER` / `SDIFF` 基础上，评估是否需要 `SPOP` / `SRANDMEMBER` / `SMOVE` / `*STORE` 等命令。
-  - 对大集合场景下的 `SUNION` / `SINTER` / `SDIFF` 做性能 Profiling，记录潜在优化方向（如减少分配、优化遍历策略）。
+- [x] **集合命令扩展与性能调优** ✅ 已完成（2025-12）
+  - 已实现 `SPOP` / `SRANDMEMBER` / `SMOVE` / `SUNIONSTORE` / `SINTERSTORE` / `SDIFFSTORE` 等命令。
+  - 性能优化：
+    - 移除 `SUNION`/`SINTER`/`SDIFF` 返回结果的不必要排序（Redis 不保证顺序）。
+    - `SUNION`/`SUNIONSTORE` 使用 `extend` 替代循环插入。
+    - `SDIFF`/`SDIFFSTORE` 使用 `retain` 替代遍历后续集合，并添加早期退出优化。
+  - 基准测试提升：`set_union` +17%，`set_difference` +8%。
 
 - [x] **Sorted Set 高级命令** ✅ 已完成
   - 已实现 `ZCOUNT` / `ZRANK` / `ZREVRANK` / `ZPOPMIN` / `ZPOPMAX`

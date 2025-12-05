@@ -665,6 +665,11 @@ fn parse_i64_from_bulk(bytes: Vec<u8>) -> Result<i64, Command> {
     s.parse::<i64>().map_err(|_| err_not_integer())
 }
 
+fn parse_u64_from_bulk(bytes: Vec<u8>) -> Result<u64, Command> {
+    let s = parse_bulk_string(bytes)?;
+    s.parse::<u64>().map_err(|_| err_not_integer())
+}
+
 fn parse_isize_from_bulk(bytes: Vec<u8>) -> Result<isize, Command> {
     let s = parse_bulk_string(bytes)?;
     s.parse::<isize>().map_err(|_| err_not_integer())
@@ -1392,13 +1397,10 @@ pub async fn read_command(
             let Some(cursor_bytes) = iter.next() else {
                 return Ok(Some(err_wrong_args("scan")));
             };
-            let cursor_i64 = match parse_i64_from_bulk(cursor_bytes) {
+            let cursor = match parse_u64_from_bulk(cursor_bytes) {
                 Ok(v) => v,
                 Err(e) => return Ok(Some(e)),
             };
-            if cursor_i64 < 0 {
-                return Ok(Some(err_not_integer()));
-            }
             let mut pattern: Option<String> = None;
             let mut count: Option<u64> = None;
             let mut type_filter: Option<String> = None;
@@ -1458,7 +1460,7 @@ pub async fn read_command(
             }
 
             Command::Scan {
-                cursor: cursor_i64 as u64,
+                cursor,
                 pattern,
                 count,
                 type_filter,

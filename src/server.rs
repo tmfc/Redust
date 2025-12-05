@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::sync::{
     atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
     Arc,
@@ -433,6 +435,14 @@ fn command_to_strings(cmd: &Command) -> Vec<String> {
         // 对于其他命令，使用 Debug 格式的简化表示
         _ => vec![format!("{:?}", cmd).chars().take(100).collect()],
     }
+}
+
+/// 计算键名的哈希值，用于 SCAN 游标
+/// 使用稳定的哈希算法确保同一键名总是产生相同的哈希值
+fn key_hash(key: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn pattern_match(pattern: &str, value: &str) -> bool {
@@ -1317,34 +1327,74 @@ async fn handle_meta_command(
         } => {
             let all = storage.keys("*");
             let prefix = format!("{}:", current_db);
-            let mut logical: Vec<String> = Vec::new();
+            
+            // 收集逻辑键及其哈希值，按哈希值排序
+            let mut keyed: Vec<(u64, String)> = Vec::new();
             for k in all {
                 if let Some(rest) = k.strip_prefix(&prefix) {
-                    logical.push(rest.to_string());
+                    let hash = key_hash(rest);
+                    keyed.push((hash, rest.to_string()));
                 }
             }
+            keyed.sort_by_key(|(h, _)| *h);
 
-            let total = logical.len() as u64;
-            let start = if cursor > total { total } else { cursor } as usize;
             let batch_size = count.unwrap_or(10) as usize;
-            let end = std::cmp::min(start + batch_size, logical.len());
-
             let pat = pattern.unwrap_or_else(|| "*".to_string());
             let mut matched: Vec<String> = Vec::new();
-            for k in &logical[start..end] {
-                if pattern_match(&pat, k) {
-                    if let Some(ref type_f) = type_filter {
-                        let physical = prefix_key(current_db, k);
-                        let key_type = storage.type_of(&physical);
-                        if key_type == "none" || key_type.to_ascii_lowercase() != *type_f {
-                            continue;
-                        }
+            let mut max_hash: u64 = 0;
+            let mut found_any = false;
+
+            for (hash, k) in &keyed {
+                // 跳过哈希值小于游标的键
+                if *hash < cursor {
+                    continue;
+                }
+                
+                // 检查模式匹配
+                if !pattern_match(&pat, k) {
+                    // 即使不匹配也要更新 max_hash 以推进游标
+                    if !found_any || *hash > max_hash {
+                        max_hash = *hash;
+                        found_any = true;
                     }
-                    matched.push(k.clone());
+                    continue;
+                }
+                
+                // 检查类型过滤
+                if let Some(ref type_f) = type_filter {
+                    let physical = prefix_key(current_db, k);
+                    let key_type = storage.type_of(&physical);
+                    if key_type == "none" || key_type.to_ascii_lowercase() != *type_f {
+                        if !found_any || *hash > max_hash {
+                            max_hash = *hash;
+                            found_any = true;
+                        }
+                        continue;
+                    }
+                }
+                
+                matched.push(k.clone());
+                if !found_any || *hash > max_hash {
+                    max_hash = *hash;
+                    found_any = true;
+                }
+                
+                // 达到批次大小后停止
+                if matched.len() >= batch_size {
+                    break;
                 }
             }
 
-            let next_cursor = if end >= logical.len() { 0 } else { end as u64 };
+            // 计算下一个游标
+            // 如果还有更多键（哈希值 > max_hash），返回 max_hash + 1
+            // 否则返回 0 表示扫描完成
+            let next_cursor = if found_any {
+                let has_more = keyed.iter().any(|(h, _)| *h > max_hash);
+                if has_more { max_hash.saturating_add(1) } else { 0 }
+            } else {
+                0
+            };
+
             let cursor_str = next_cursor.to_string();
             let mut response =
                 format!("*2\r\n${}\r\n{}\r\n*{}\r\n", cursor_str.len(), cursor_str, matched.len());
@@ -3323,6 +3373,7 @@ async fn execute_command_in_transaction(
     storage: &Storage,
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
     current_db: u8,
+    script_cache: &ScriptCache,
 ) -> io::Result<()> {
     match cmd {
         // string / generic key-value 命令
@@ -3499,13 +3550,66 @@ async fn execute_command_in_transaction(
             respond_error(writer, "ERR command not allowed in transaction").await?;
         }
 
-        // Lua 脚本命令在事务中不支持（简化实现）
-        Command::Eval { .. }
-        | Command::Evalsha { .. }
-        | Command::ScriptLoad { .. }
-        | Command::ScriptExists { .. }
-        | Command::ScriptFlush => {
-            respond_error(writer, "ERR EVAL/SCRIPT commands not supported in transaction").await?;
+        // Lua 脚本命令
+        Command::Eval { script, keys, args } => {
+            // 缓存脚本
+            script_cache.load(&script);
+            
+            let ctx = ScriptContext {
+                storage: Arc::new(storage.clone()),
+                current_db: current_db as u32,
+                keys,
+                args,
+            };
+            match execute_script(&script, ctx) {
+                Ok(result) => {
+                    let resp = result.to_resp_bytes();
+                    writer.write_all(&resp).await?;
+                }
+                Err(e) => {
+                    respond_error(writer, &e).await?;
+                }
+            }
+        }
+        Command::Evalsha { sha1, keys, args } => {
+            match script_cache.get(&sha1) {
+                Some(script) => {
+                    let ctx = ScriptContext {
+                        storage: Arc::new(storage.clone()),
+                        current_db: current_db as u32,
+                        keys,
+                        args,
+                    };
+                    match execute_script(&script, ctx) {
+                        Ok(result) => {
+                            let resp = result.to_resp_bytes();
+                            writer.write_all(&resp).await?;
+                        }
+                        Err(e) => {
+                            respond_error(writer, &e).await?;
+                        }
+                    }
+                }
+                None => {
+                    respond_error(writer, "NOSCRIPT No matching script. Please use EVAL.").await?;
+                }
+            }
+        }
+        Command::ScriptLoad { script } => {
+            let sha1 = script_cache.load(&script);
+            respond_bulk_string(writer, &sha1).await?;
+        }
+        Command::ScriptExists { sha1s } => {
+            let results = script_cache.exists(&sha1s);
+            let mut resp = format!("*{}\r\n", results.len());
+            for exists in results {
+                resp.push_str(&format!(":{}\r\n", if exists { 1 } else { 0 }));
+            }
+            writer.write_all(resp.as_bytes()).await?;
+        }
+        Command::ScriptFlush => {
+            script_cache.flush();
+            respond_simple_string(writer, "OK").await?;
         }
 
         // 其他命令返回错误
@@ -3750,6 +3854,7 @@ async fn handle_connection(
                         &storage,
                         &mut write_half,
                         current_db,
+                        &script_cache,
                     )
                     .await?;
                 }
