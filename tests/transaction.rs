@@ -194,7 +194,9 @@ async fn meta_commands_inside_transaction() {
     assert_eq!(line, "+QUEUED\r\n");
 
     // QUEUE SCAN
-    client.send_array(&["SCAN", "0", "COUNT", "10", "TYPE", "string"]).await;
+    client
+        .send_array(&["SCAN", "0", "COUNT", "10", "TYPE", "string"])
+        .await;
     let line = client.read_simple_line().await;
     assert_eq!(line, "+QUEUED\r\n");
 
@@ -332,7 +334,9 @@ async fn watch_basic() {
     let _ = client.read_simple_line().await;
 
     // SET watched_key new_value -> QUEUED
-    client.send_array(&["SET", "watched_key", "new_value"]).await;
+    client
+        .send_array(&["SET", "watched_key", "new_value"])
+        .await;
     let line = client.read_simple_line().await;
     assert_eq!(line, "+QUEUED\r\n");
 
@@ -389,7 +393,10 @@ async fn watch_aborted_by_concurrent_modification() {
     client1.send_array(&["EXEC"]).await;
     let mut header = String::new();
     client1.reader.read_line(&mut header).await.unwrap();
-    assert_eq!(header, "*-1\r\n", "EXEC should return null when WATCH fails");
+    assert_eq!(
+        header, "*-1\r\n",
+        "EXEC should return null when WATCH fails"
+    );
 
     // 验证值是 client2 设置的
     client1.send_array(&["GET", "key"]).await;
@@ -519,7 +526,10 @@ async fn watch_detects_hset_modification() {
     client1.send_array(&["EXEC"]).await;
     let mut header = String::new();
     client1.reader.read_line(&mut header).await.unwrap();
-    assert_eq!(header, "*-1\r\n", "EXEC should return null when WATCH fails due to HSET");
+    assert_eq!(
+        header, "*-1\r\n",
+        "EXEC should return null when WATCH fails due to HSET"
+    );
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
@@ -553,7 +563,10 @@ async fn watch_detects_lpush_modification() {
     client1.send_array(&["EXEC"]).await;
     let mut header = String::new();
     client1.reader.read_line(&mut header).await.unwrap();
-    assert_eq!(header, "*-1\r\n", "EXEC should return null when WATCH fails due to LPUSH");
+    assert_eq!(
+        header, "*-1\r\n",
+        "EXEC should return null when WATCH fails due to LPUSH"
+    );
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
@@ -573,7 +586,11 @@ async fn transaction_aborted_on_parse_error() {
     // SET key（缺少 value，应该返回错误而不是 QUEUED）
     client.send_array(&["SET", "key"]).await;
     let line = client.read_simple_line().await;
-    assert!(line.starts_with("-ERR"), "Expected error for wrong arity, got: {}", line);
+    assert!(
+        line.starts_with("-ERR"),
+        "Expected error for wrong arity, got: {}",
+        line
+    );
 
     // SET key2 value2 -> QUEUED（正常命令仍然入队）
     client.send_array(&["SET", "key2", "value2"]).await;
@@ -583,12 +600,19 @@ async fn transaction_aborted_on_parse_error() {
     // EXEC（应该返回 EXECABORT 错误）
     client.send_array(&["EXEC"]).await;
     let line = client.read_simple_line().await;
-    assert!(line.contains("EXECABORT"), "Expected EXECABORT error, got: {}", line);
+    assert!(
+        line.contains("EXECABORT"),
+        "Expected EXECABORT error, got: {}",
+        line
+    );
 
     // 验证 key2 没有被设置
     client.send_array(&["GET", "key2"]).await;
     let val = client.read_bulk_string().await;
-    assert_eq!(val, None, "key2 should not be set after aborted transaction");
+    assert_eq!(
+        val, None,
+        "key2 should not be set after aborted transaction"
+    );
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
@@ -650,7 +674,9 @@ async fn watch_detects_key_expiration() {
     let mut client = TestClient::connect(addr).await;
 
     // 设置一个很短 TTL 的 key
-    client.send_array(&["SET", "expiring", "value", "PX", "50"]).await;
+    client
+        .send_array(&["SET", "expiring", "value", "PX", "50"])
+        .await;
     let _ = client.read_simple_line().await;
 
     // WATCH 这个 key
@@ -678,7 +704,10 @@ async fn watch_detects_key_expiration() {
     client.send_array(&["EXEC"]).await;
     let mut header = String::new();
     client.reader.read_line(&mut header).await.unwrap();
-    assert_eq!(header, "*-1\r\n", "EXEC should return null when watched key expires");
+    assert_eq!(
+        header, "*-1\r\n",
+        "EXEC should return null when watched key expires"
+    );
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
@@ -700,7 +729,15 @@ async fn eval_inside_transaction() {
     assert_eq!(line, "+OK\r\n");
 
     // EVAL 脚本：增加 counter 并返回新值
-    client.send_array(&["EVAL", "return redis.call('INCRBY', KEYS[1], ARGV[1])", "1", "counter", "5"]).await;
+    client
+        .send_array(&[
+            "EVAL",
+            "return redis.call('INCRBY', KEYS[1], ARGV[1])",
+            "1",
+            "counter",
+            "5",
+        ])
+        .await;
     let line = client.read_simple_line().await;
     assert_eq!(line, "+QUEUED\r\n");
 
@@ -711,7 +748,7 @@ async fn eval_inside_transaction() {
 
     // EXEC
     client.send_array(&["EXEC"]).await;
-    
+
     // 读取数组头
     let mut header = String::new();
     client.reader.read_line(&mut header).await.unwrap();
@@ -741,11 +778,17 @@ async fn evalsha_inside_transaction() {
     let mut client = TestClient::connect(addr).await;
 
     // 先加载脚本
-    client.send_array(&["SCRIPT", "LOAD", "return redis.call('SET', KEYS[1], ARGV[1])"]).await;
+    client
+        .send_array(&[
+            "SCRIPT",
+            "LOAD",
+            "return redis.call('SET', KEYS[1], ARGV[1])",
+        ])
+        .await;
     let mut bulk_header = String::new();
     client.reader.read_line(&mut bulk_header).await.unwrap();
     assert!(bulk_header.starts_with('$'));
-    let len: usize = bulk_header[1..bulk_header.len()-2].parse().unwrap();
+    let len: usize = bulk_header[1..bulk_header.len() - 2].parse().unwrap();
     let mut sha1 = vec![0u8; len];
     client.reader.read_exact(&mut sha1).await.unwrap();
     let mut crlf = [0u8; 2];
@@ -758,7 +801,9 @@ async fn evalsha_inside_transaction() {
     assert_eq!(line, "+OK\r\n");
 
     // EVALSHA
-    client.send_array(&["EVALSHA", &sha1_str, "1", "mykey", "myvalue"]).await;
+    client
+        .send_array(&["EVALSHA", &sha1_str, "1", "mykey", "myvalue"])
+        .await;
     let line = client.read_simple_line().await;
     assert_eq!(line, "+QUEUED\r\n");
 
@@ -769,7 +814,7 @@ async fn evalsha_inside_transaction() {
 
     // EXEC
     client.send_array(&["EXEC"]).await;
-    
+
     // 读取数组头
     let mut header = String::new();
     client.reader.read_line(&mut header).await.unwrap();
@@ -810,7 +855,7 @@ async fn script_commands_inside_transaction() {
 
     // EXEC
     client.send_array(&["EXEC"]).await;
-    
+
     // 读取数组头
     let mut header = String::new();
     client.reader.read_line(&mut header).await.unwrap();
@@ -820,7 +865,7 @@ async fn script_commands_inside_transaction() {
     let mut bulk_header = String::new();
     client.reader.read_line(&mut bulk_header).await.unwrap();
     assert!(bulk_header.starts_with('$'));
-    let len: usize = bulk_header[1..bulk_header.len()-2].parse().unwrap();
+    let len: usize = bulk_header[1..bulk_header.len() - 2].parse().unwrap();
     assert_eq!(len, 40); // SHA1 是 40 个十六进制字符
 
     shutdown.send(()).unwrap();

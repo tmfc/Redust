@@ -155,3 +155,57 @@ async fn aof_everysec_persists_state() {
     std::env::remove_var("REDUST_AOF_ENABLED");
     std::env::remove_var("REDUST_AOF_PATH");
 }
+
+#[tokio::test]
+async fn corrupted_rdb_is_quarantined_and_ignored() {
+    let _guard = persistence_lock();
+    let tmp = std::env::temp_dir();
+    let base = format!("redust_corrupt_{}.rdb", rand::random::<u64>());
+    let path = tmp.join(&base);
+    let path_str = path.to_string_lossy().to_string();
+    // 写入明显损坏的内容
+    std::fs::write(&path, b"BAD").unwrap();
+    std::env::set_var("REDUST_RDB_PATH", &path_str);
+    std::env::remove_var("REDUST_AOF_ENABLED");
+    std::env::remove_var("REDUST_AOF_PATH");
+
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    client.send_array(&["PING"]).await;
+    let pong = client.read_simple_line().await;
+    assert_eq!(pong, "+PONG\r\n");
+
+    let parent = path.parent().unwrap();
+    let base_prefix = format!("{}.corrupt", base);
+    let mut quarantined: Option<std::path::PathBuf> = None;
+    for entry in std::fs::read_dir(parent).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with(&base_prefix) {
+            quarantined = Some(entry.path());
+            break;
+        }
+    }
+
+    assert!(
+        quarantined.is_some(),
+        "expected corrupt RDB to be quarantined next to {:?}",
+        path
+    );
+    assert!(
+        !path.exists(),
+        "original corrupt file should be moved away from {:?}",
+        path
+    );
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+
+    if let Some(q) = quarantined {
+        let _ = std::fs::remove_file(q);
+    }
+    let _ = std::fs::remove_file(&path);
+    std::env::remove_var("REDUST_RDB_PATH");
+}

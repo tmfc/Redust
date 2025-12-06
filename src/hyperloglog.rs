@@ -11,7 +11,6 @@
 /// 参考：
 /// - Redis hyperloglog.c: https://github.com/redis/redis/blob/unstable/src/hyperloglog.c
 /// - HyperLogLog 论文: http://algo.inria.fr/flajolet/Publications/FlFuGaMe07.pdf
-
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
@@ -35,7 +34,7 @@ enum HllRepr {
     /// 稀疏表示：存储非零的 (index, value) 对，按 index 排序
     /// 内存占用：entries.len() * 3 bytes
     Sparse { entries: Vec<(u16, u8)> },
-    
+
     /// 密集表示：完整的 16384 个寄存器
     /// 内存占用：16384 bytes
     Dense { registers: Vec<u8> },
@@ -55,7 +54,9 @@ impl HyperLogLog {
     /// 创建一个新的空 HyperLogLog（使用稀疏表示）
     pub fn new() -> Self {
         HyperLogLog {
-            repr: HllRepr::Sparse { entries: Vec::new() },
+            repr: HllRepr::Sparse {
+                entries: Vec::new(),
+            },
         }
     }
 
@@ -99,7 +100,7 @@ impl HyperLogLog {
                     Err(pos) => {
                         // 没找到，插入新条目
                         entries.insert(pos, (index, count));
-                        
+
                         // 检查是否需要转换为密集表示
                         if entries.len() > SPARSE_TO_DENSE_THRESHOLD {
                             self.convert_to_dense();
@@ -121,7 +122,7 @@ impl HyperLogLog {
             }
         }
     }
-    
+
     /// 将稀疏表示转换为密集表示
     fn convert_to_dense(&mut self) {
         if let HllRepr::Sparse { entries } = &self.repr {
@@ -147,7 +148,7 @@ impl HyperLogLog {
                 zeros = HLL_REGISTERS - entries.len();
                 // 所有零寄存器的贡献
                 sum = zeros as f64; // 1.0 / (1 << 0) = 1.0
-                // 非零寄存器的贡献
+                                    // 非零寄存器的贡献
                 for &(_, value) in entries {
                     sum += 1.0 / (1u64 << value) as f64;
                 }
@@ -193,14 +194,28 @@ impl HyperLogLog {
     pub fn merge(&mut self, other: &HyperLogLog) {
         // 如果任一方是密集表示，结果也用密集表示
         match (&mut self.repr, &other.repr) {
-            (HllRepr::Dense { registers: self_regs }, HllRepr::Dense { registers: other_regs }) => {
+            (
+                HllRepr::Dense {
+                    registers: self_regs,
+                },
+                HllRepr::Dense {
+                    registers: other_regs,
+                },
+            ) => {
                 for i in 0..HLL_REGISTERS {
                     if other_regs[i] > self_regs[i] {
                         self_regs[i] = other_regs[i];
                     }
                 }
             }
-            (HllRepr::Dense { registers: self_regs }, HllRepr::Sparse { entries: other_entries }) => {
+            (
+                HllRepr::Dense {
+                    registers: self_regs,
+                },
+                HllRepr::Sparse {
+                    entries: other_entries,
+                },
+            ) => {
                 for &(index, value) in other_entries {
                     let idx = index as usize;
                     if value > self_regs[idx] {
@@ -208,10 +223,18 @@ impl HyperLogLog {
                     }
                 }
             }
-            (HllRepr::Sparse { .. }, HllRepr::Dense { registers: other_regs }) => {
+            (
+                HllRepr::Sparse { .. },
+                HllRepr::Dense {
+                    registers: other_regs,
+                },
+            ) => {
                 // 转换为密集表示
                 self.convert_to_dense();
-                if let HllRepr::Dense { registers: self_regs } = &mut self.repr {
+                if let HllRepr::Dense {
+                    registers: self_regs,
+                } = &mut self.repr
+                {
                     for i in 0..HLL_REGISTERS {
                         if other_regs[i] > self_regs[i] {
                             self_regs[i] = other_regs[i];
@@ -219,16 +242,23 @@ impl HyperLogLog {
                     }
                 }
             }
-            (HllRepr::Sparse { entries: self_entries }, HllRepr::Sparse { entries: other_entries }) => {
+            (
+                HllRepr::Sparse {
+                    entries: self_entries,
+                },
+                HllRepr::Sparse {
+                    entries: other_entries,
+                },
+            ) => {
                 // 合并两个稀疏表示
                 let mut merged = Vec::with_capacity(self_entries.len() + other_entries.len());
                 let mut i = 0;
                 let mut j = 0;
-                
+
                 while i < self_entries.len() && j < other_entries.len() {
                     let (self_idx, self_val) = self_entries[i];
                     let (other_idx, other_val) = other_entries[j];
-                    
+
                     match self_idx.cmp(&other_idx) {
                         std::cmp::Ordering::Less => {
                             merged.push((self_idx, self_val));
@@ -245,11 +275,11 @@ impl HyperLogLog {
                         }
                     }
                 }
-                
+
                 // 添加剩余元素
                 merged.extend_from_slice(&self_entries[i..]);
                 merged.extend_from_slice(&other_entries[j..]);
-                
+
                 // 检查是否需要转换为密集表示
                 if merged.len() > SPARSE_TO_DENSE_THRESHOLD {
                     let mut registers = vec![0u8; HLL_REGISTERS];
@@ -275,7 +305,7 @@ impl HyperLogLog {
     }
 
     /// 获取寄存器数据（用于序列化）
-    /// 
+    ///
     /// 如果是稀疏表示，会先转换为密集表示
     pub fn registers(&self) -> Vec<u8> {
         match &self.repr {
@@ -291,7 +321,7 @@ impl HyperLogLog {
     }
 
     /// 从寄存器数据创建 HyperLogLog（用于反序列化）
-    /// 
+    ///
     /// 会自动选择稀疏或密集表示
     pub fn from_registers(registers: Vec<u8>) -> Option<Self> {
         if registers.len() != HLL_REGISTERS {
@@ -301,10 +331,10 @@ impl HyperLogLog {
         if registers.iter().any(|&r| r > HLL_REGISTER_MAX) {
             return None;
         }
-        
+
         // 统计非零寄存器数量，决定使用哪种表示
         let non_zero_count = registers.iter().filter(|&&r| r > 0).count();
-        
+
         if non_zero_count <= SPARSE_TO_DENSE_THRESHOLD {
             // 使用稀疏表示
             let entries: Vec<(u16, u8)> = registers
@@ -331,7 +361,7 @@ impl HyperLogLog {
             HllRepr::Dense { registers } => registers.iter().all(|&r| r == 0),
         }
     }
-    
+
     /// 获取当前内存占用（字节）
     pub fn memory_usage(&self) -> usize {
         match &self.repr {
@@ -345,7 +375,7 @@ impl HyperLogLog {
             }
         }
     }
-    
+
     /// 检查是否使用稀疏表示
     pub fn is_sparse(&self) -> bool {
         matches!(self.repr, HllRepr::Sparse { .. })
@@ -375,7 +405,7 @@ mod tests {
         let changed = hll.add(b"hello");
         assert!(changed);
         assert!(!hll.is_empty());
-        
+
         // 添加相同元素不应改变
         let changed = hll.add(b"hello");
         assert!(!changed);
@@ -384,12 +414,12 @@ mod tests {
     #[test]
     fn test_count_small_cardinality() {
         let mut hll = HyperLogLog::new();
-        
+
         // 添加 100 个不同元素
         for i in 0..100 {
             hll.add(format!("element_{}", i).as_bytes());
         }
-        
+
         let count = hll.count();
         // 允许约 0.81% 的误差，对于 100 个元素，误差应该在 ±5 以内
         assert!(count >= 95 && count <= 105, "count = {}", count);
@@ -398,12 +428,12 @@ mod tests {
     #[test]
     fn test_count_medium_cardinality() {
         let mut hll = HyperLogLog::new();
-        
+
         // 添加 1000 个不同元素
         for i in 0..1000 {
             hll.add(format!("element_{}", i).as_bytes());
         }
-        
+
         let count = hll.count();
         // 允许约 2% 的误差
         assert!(count >= 980 && count <= 1020, "count = {}", count);
@@ -412,12 +442,12 @@ mod tests {
     #[test]
     fn test_count_large_cardinality() {
         let mut hll = HyperLogLog::new();
-        
+
         // 添加 10000 个不同元素
         for i in 0..10000 {
             hll.add(format!("element_{}", i).as_bytes());
         }
-        
+
         let count = hll.count();
         // 允许约 2% 的误差
         assert!(count >= 9800 && count <= 10200, "count = {}", count);
@@ -427,17 +457,17 @@ mod tests {
     fn test_merge() {
         let mut hll1 = HyperLogLog::new();
         let mut hll2 = HyperLogLog::new();
-        
+
         // hll1 添加 0-99
         for i in 0..100 {
             hll1.add(format!("element_{}", i).as_bytes());
         }
-        
+
         // hll2 添加 50-149（与 hll1 有 50 个重叠）
         for i in 50..150 {
             hll2.add(format!("element_{}", i).as_bytes());
         }
-        
+
         // 合并后应该有约 150 个不同元素
         hll1.merge(&hll2);
         let count = hll1.count();
@@ -448,13 +478,13 @@ mod tests {
     fn test_merge_empty() {
         let mut hll1 = HyperLogLog::new();
         let hll2 = HyperLogLog::new();
-        
+
         hll1.add(b"test");
         let count_before = hll1.count();
-        
+
         hll1.merge(&hll2);
         let count_after = hll1.count();
-        
+
         assert_eq!(count_before, count_after);
     }
 
@@ -464,10 +494,10 @@ mod tests {
         for i in 0..100 {
             hll.add(format!("element_{}", i).as_bytes());
         }
-        
+
         let registers = hll.registers();
         let restored = HyperLogLog::from_registers(registers).unwrap();
-        
+
         assert_eq!(hll.count(), restored.count());
     }
 
@@ -487,14 +517,14 @@ mod tests {
     #[test]
     fn test_duplicate_elements() {
         let mut hll = HyperLogLog::new();
-        
+
         // 添加 1000 次相同的 10 个元素
         for _ in 0..1000 {
             for i in 0..10 {
                 hll.add(format!("element_{}", i).as_bytes());
             }
         }
-        
+
         let count = hll.count();
         // 应该只计数 10 个不同元素
         assert!(count >= 8 && count <= 12, "count = {}", count);
@@ -503,87 +533,87 @@ mod tests {
     #[test]
     fn test_binary_data() {
         let mut hll = HyperLogLog::new();
-        
+
         // 测试二进制数据
         for i in 0..100u8 {
             hll.add(&[i, i.wrapping_mul(2), i.wrapping_mul(3)]);
         }
-        
+
         let count = hll.count();
         assert!(count >= 95 && count <= 105, "count = {}", count);
     }
-    
+
     #[test]
     fn test_sparse_representation() {
         let mut hll = HyperLogLog::new();
-        
+
         // 新创建的 HLL 应该是稀疏表示
         assert!(hll.is_sparse());
-        
+
         // 添加少量元素应该保持稀疏
         for i in 0..100 {
             hll.add(format!("element_{}", i).as_bytes());
         }
         assert!(hll.is_sparse());
-        
+
         // 内存占用应该远小于密集表示
         let sparse_memory = hll.memory_usage();
         assert!(sparse_memory < 1000, "sparse memory = {}", sparse_memory);
     }
-    
+
     #[test]
     fn test_sparse_to_dense_conversion() {
         let mut hll = HyperLogLog::new();
-        
+
         // 添加大量元素应该触发转换为密集表示
         for i in 0..5000 {
             hll.add(format!("element_{}", i).as_bytes());
         }
-        
+
         // 应该已经转换为密集表示
         assert!(!hll.is_sparse());
-        
+
         // 内存占用应该接近 16KB
         let dense_memory = hll.memory_usage();
         assert!(dense_memory > 16000, "dense memory = {}", dense_memory);
     }
-    
+
     #[test]
     fn test_merge_sparse_sparse() {
         let mut hll1 = HyperLogLog::new();
         let mut hll2 = HyperLogLog::new();
-        
+
         for i in 0..50 {
             hll1.add(format!("a_{}", i).as_bytes());
         }
         for i in 0..50 {
             hll2.add(format!("b_{}", i).as_bytes());
         }
-        
+
         assert!(hll1.is_sparse());
         assert!(hll2.is_sparse());
-        
+
         hll1.merge(&hll2);
-        
+
         // 合并后仍应是稀疏
         assert!(hll1.is_sparse());
-        
+
         let count = hll1.count();
         assert!(count >= 95 && count <= 105, "count = {}", count);
     }
-    
+
     #[test]
     fn test_memory_savings() {
         let mut hll = HyperLogLog::new();
-        
+
         // 添加 100 个元素
         for i in 0..100 {
             hll.add(format!("element_{}", i).as_bytes());
         }
-        
+
         let sparse_memory = hll.memory_usage();
         let dense_memory = HLL_REGISTERS; // 16384 bytes
-        
+
         // 稀疏表示应该节省 90%+ 内存
         let savings = 1.0 - (sparse_memory as f64 / dense_memory as f64);
         assert!(savings > 0.9, "memory savings = {:.1}%", savings * 100.0);

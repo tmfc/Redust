@@ -170,6 +170,39 @@ async fn responds_to_basic_commands() {
 }
 
 #[tokio::test]
+async fn pipeline_roundtrip_is_fast_enough() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 发送一批 PING（pipeline），验证响应顺序与延迟
+    let batch = 200;
+    let mut buf = String::new();
+    for _ in 0..batch {
+        buf.push_str("*1\r\n$4\r\nPING\r\n");
+    }
+    let start = Instant::now();
+    write_half.write_all(buf.as_bytes()).await.unwrap();
+
+    for _ in 0..batch {
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert_eq!(line, "+PONG\r\n");
+    }
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "pipeline roundtrip too slow: {:?}",
+        elapsed
+    );
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn rename_and_flush_commands_behaviour() {
     let (addr, shutdown, handle) = spawn_server().await;
 
@@ -1929,7 +1962,11 @@ async fn test_hmset() {
     let mut reader = BufReader::new(read_half);
 
     // HMSET 批量设置
-    send_array(&mut write_half, &["HMSET", "myhash", "f1", "v1", "f2", "v2", "f3", "v3"]).await;
+    send_array(
+        &mut write_half,
+        &["HMSET", "myhash", "f1", "v1", "f2", "v2", "f3", "v3"],
+    )
+    .await;
     let resp = read_line_helper(&mut reader).await;
     assert_eq!(resp, "+OK\r\n");
 
@@ -2133,7 +2170,11 @@ async fn test_lpos() {
     let mut reader = BufReader::new(read_half);
 
     // 创建列表
-    send_array(&mut write_half, &["RPUSH", "mylist", "a", "b", "c", "b", "d", "b"]).await;
+    send_array(
+        &mut write_half,
+        &["RPUSH", "mylist", "a", "b", "c", "b", "d", "b"],
+    )
+    .await;
     let _ = read_line_helper(&mut reader).await;
 
     // LPOS 基本查找
@@ -2173,7 +2214,13 @@ async fn test_zcount() {
     let mut reader = BufReader::new(read_half);
 
     // 创建 sorted set
-    send_array(&mut write_half, &["ZADD", "myzset", "1", "a", "2", "b", "3", "c", "4", "d", "5", "e"]).await;
+    send_array(
+        &mut write_half,
+        &[
+            "ZADD", "myzset", "1", "a", "2", "b", "3", "c", "4", "d", "5", "e",
+        ],
+    )
+    .await;
     let _ = read_line_helper(&mut reader).await;
 
     // ZCOUNT 全范围
@@ -2207,7 +2254,11 @@ async fn test_zrank_zrevrank() {
     let mut reader = BufReader::new(read_half);
 
     // 创建 sorted set
-    send_array(&mut write_half, &["ZADD", "myzset", "1", "a", "2", "b", "3", "c"]).await;
+    send_array(
+        &mut write_half,
+        &["ZADD", "myzset", "1", "a", "2", "b", "3", "c"],
+    )
+    .await;
     let _ = read_line_helper(&mut reader).await;
 
     // ZRANK
@@ -2244,7 +2295,11 @@ async fn test_zpopmin_zpopmax() {
     let mut reader = BufReader::new(read_half);
 
     // 创建 sorted set
-    send_array(&mut write_half, &["ZADD", "myzset", "1", "a", "2", "b", "3", "c"]).await;
+    send_array(
+        &mut write_half,
+        &["ZADD", "myzset", "1", "a", "2", "b", "3", "c"],
+    )
+    .await;
     let _ = read_line_helper(&mut reader).await;
 
     // ZPOPMIN
@@ -2289,16 +2344,24 @@ async fn test_zinter_zunion_zdiff() {
     let mut reader = BufReader::new(read_half);
 
     // 创建两个 sorted set
-    send_array(&mut write_half, &["ZADD", "zset1", "1", "a", "2", "b", "3", "c"]).await;
+    send_array(
+        &mut write_half,
+        &["ZADD", "zset1", "1", "a", "2", "b", "3", "c"],
+    )
+    .await;
     let _ = read_line_helper(&mut reader).await;
-    send_array(&mut write_half, &["ZADD", "zset2", "2", "b", "3", "c", "4", "d"]).await;
+    send_array(
+        &mut write_half,
+        &["ZADD", "zset2", "2", "b", "3", "c", "4", "d"],
+    )
+    .await;
     let _ = read_line_helper(&mut reader).await;
 
     // ZINTER - 交集
     send_array(&mut write_half, &["ZINTER", "2", "zset1", "zset2"]).await;
     let resp = read_line_helper(&mut reader).await;
     assert_eq!(resp, "*2\r\n"); // b, c
-    // 读取两个成员
+                                // 读取两个成员
     for _ in 0..4 {
         let _ = read_line_helper(&mut reader).await;
     }
@@ -2320,17 +2383,29 @@ async fn test_zinter_zunion_zdiff() {
     assert_eq!(resp, "a\r\n");
 
     // ZINTERSTORE
-    send_array(&mut write_half, &["ZINTERSTORE", "out", "2", "zset1", "zset2"]).await;
+    send_array(
+        &mut write_half,
+        &["ZINTERSTORE", "out", "2", "zset1", "zset2"],
+    )
+    .await;
     let resp = read_line_helper(&mut reader).await;
     assert_eq!(resp, ":2\r\n");
 
     // ZUNIONSTORE
-    send_array(&mut write_half, &["ZUNIONSTORE", "out2", "2", "zset1", "zset2"]).await;
+    send_array(
+        &mut write_half,
+        &["ZUNIONSTORE", "out2", "2", "zset1", "zset2"],
+    )
+    .await;
     let resp = read_line_helper(&mut reader).await;
     assert_eq!(resp, ":4\r\n");
 
     // ZDIFFSTORE
-    send_array(&mut write_half, &["ZDIFFSTORE", "out3", "2", "zset1", "zset2"]).await;
+    send_array(
+        &mut write_half,
+        &["ZDIFFSTORE", "out3", "2", "zset1", "zset2"],
+    )
+    .await;
     let resp = read_line_helper(&mut reader).await;
     assert_eq!(resp, ":1\r\n");
 
@@ -2345,7 +2420,13 @@ async fn test_zlexcount() {
     let mut reader = BufReader::new(read_half);
 
     // 创建 sorted set，所有成员分数相同
-    send_array(&mut write_half, &["ZADD", "myzset", "0", "a", "0", "b", "0", "c", "0", "d", "0", "e", "0", "f"]).await;
+    send_array(
+        &mut write_half,
+        &[
+            "ZADD", "myzset", "0", "a", "0", "b", "0", "c", "0", "d", "0", "e", "0", "f",
+        ],
+    )
+    .await;
     let _ = read_line_helper(&mut reader).await;
 
     // ZLEXCOUNT 全范围
@@ -2474,8 +2555,13 @@ async fn test_expire_commands() {
     let future_ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs() + 100;
-    send_array(&mut write_half, &["EXPIREAT", "mykey", &future_ts.to_string()]).await;
+        .as_secs()
+        + 100;
+    send_array(
+        &mut write_half,
+        &["EXPIREAT", "mykey", &future_ts.to_string()],
+    )
+    .await;
     let resp = read_line_helper(&mut reader).await;
     assert_eq!(resp, ":1\r\n");
 
@@ -2493,8 +2579,13 @@ async fn test_expire_commands() {
     let future_ts_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_millis() as u64 + 100000;
-    send_array(&mut write_half, &["PEXPIREAT", "mykey2", &future_ts_ms.to_string()]).await;
+        .as_millis() as u64
+        + 100000;
+    send_array(
+        &mut write_half,
+        &["PEXPIREAT", "mykey2", &future_ts_ms.to_string()],
+    )
+    .await;
     let resp = read_line_helper(&mut reader).await;
     assert_eq!(resp, ":1\r\n");
 
@@ -2625,7 +2716,7 @@ async fn test_blocking_list_commands() {
     send_array(&mut write_half, &["LPOP", "mylist"]).await; // 清空列表
     let _ = read_line_helper(&mut reader).await;
     let _ = read_line_helper(&mut reader).await;
-    
+
     send_array(&mut write_half, &["BLPOP", "emptylist", "0.2"]).await;
     let resp = read_line_helper(&mut reader).await;
     assert_eq!(resp, "*-1\r\n"); // null array (Redis 协议规范)

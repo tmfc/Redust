@@ -154,21 +154,15 @@ async fn zincrby_updates_scores() {
     let (addr, shutdown, handle) = spawn_server().await;
     let mut client = TestClient::connect(addr).await;
 
-    client
-        .send_array(&["ZINCRBY", "myz", "1.5", "alpha"])
-        .await;
+    client.send_array(&["ZINCRBY", "myz", "1.5", "alpha"]).await;
     let s1 = client.read_bulk_string().await.unwrap();
     assert_eq!(s1, "1.5");
 
-    client
-        .send_array(&["ZINCRBY", "myz", "2.0", "alpha"])
-        .await;
+    client.send_array(&["ZINCRBY", "myz", "2.0", "alpha"]).await;
     let s2 = client.read_bulk_string().await.unwrap();
     assert_eq!(s2, "3.5");
 
-    client
-        .send_array(&["ZINCRBY", "myz", "4", "beta"])
-        .await;
+    client.send_array(&["ZINCRBY", "myz", "4", "beta"]).await;
     let s3 = client.read_bulk_string().await.unwrap();
     assert_eq!(s3, "4");
 
@@ -246,23 +240,38 @@ async fn zscan_roundtrip_and_wrongtype() {
 /// 测试 ZSET 持久化（RDB save/load）
 #[tokio::test]
 async fn zset_persistence_roundtrip() {
-    use std::path::PathBuf;
     use redust::storage::Storage;
+    use std::path::PathBuf;
 
     let temp_dir = std::env::temp_dir();
     let rdb_path: PathBuf = temp_dir.join(format!("test_zset_{}.rdb", std::process::id()));
 
     // 创建 storage 并添加 ZSET 数据
-    let storage = Storage::new(None);
-    assert!(storage.zadd("0:myzset", &[(1.5, "a".to_string()), (2.5, "b".to_string()), (3.0, "c".to_string())]).is_ok());
-    assert!(storage.zadd("0:anotherzset", &[(100.0, "x".to_string())]).is_ok());
+    let storage = Storage::new(None, None);
+    assert!(storage
+        .zadd(
+            "0:myzset",
+            &[
+                (1.5, "a".to_string()),
+                (2.5, "b".to_string()),
+                (3.0, "c".to_string())
+            ]
+        )
+        .is_ok());
+    assert!(storage
+        .zadd("0:anotherzset", &[(100.0, "x".to_string())])
+        .is_ok());
 
     // 保存 RDB
-    storage.save_rdb(&rdb_path).expect("save_rdb should succeed");
+    storage
+        .save_rdb(&rdb_path)
+        .expect("save_rdb should succeed");
 
     // 创建新的 storage 并加载
-    let storage2 = Storage::new(None);
-    storage2.load_rdb(&rdb_path).expect("load_rdb should succeed");
+    let storage2 = Storage::new(None, None);
+    storage2
+        .load_rdb(&rdb_path)
+        .expect("load_rdb should succeed");
 
     // 验证 ZSET 数据已恢复
     let score_a = storage2.zscore("0:myzset", "a").unwrap();

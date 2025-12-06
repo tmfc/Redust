@@ -55,7 +55,11 @@ async fn test_pfadd_basic() {
     // 再次添加相同元素应该返回 0（未修改）
     send_array(&mut write_half, &["PFADD", "testhll", "hello"]).await;
     let resp = read_line(&mut reader).await;
-    assert!(resp == ":0\r\n" || resp == ":1\r\n", "Expected :0 or :1, got: {}", resp);
+    assert!(
+        resp == ":0\r\n" || resp == ":1\r\n",
+        "Expected :0 or :1, got: {}",
+        resp
+    );
 
     let _ = shutdown.send(());
 }
@@ -92,10 +96,14 @@ async fn test_pfcount_single_key() {
     // PFCOUNT 应该返回接近 100 的值
     send_array(&mut write_half, &["PFCOUNT", "counthll"]).await;
     let resp = read_line(&mut reader).await;
-    
+
     // 解析返回的整数
     let count: i64 = resp.trim().trim_start_matches(':').parse().unwrap();
-    assert!(count >= 95 && count <= 105, "Expected count near 100, got: {}", count);
+    assert!(
+        count >= 95 && count <= 105,
+        "Expected count near 100, got: {}",
+        count
+    );
 
     let _ = shutdown.send(());
 }
@@ -138,9 +146,13 @@ async fn test_pfcount_multiple_keys() {
     // PFCOUNT 两个 key 应该返回接近 75 的值（并集）
     send_array(&mut write_half, &["PFCOUNT", "hll_a", "hll_b"]).await;
     let resp = read_line(&mut reader).await;
-    
+
     let count: i64 = resp.trim().trim_start_matches(':').parse().unwrap();
-    assert!(count >= 70 && count <= 80, "Expected count near 75, got: {}", count);
+    assert!(
+        count >= 70 && count <= 80,
+        "Expected count near 75, got: {}",
+        count
+    );
 
     let _ = shutdown.send(());
 }
@@ -166,16 +178,24 @@ async fn test_pfmerge() {
     }
 
     // PFMERGE 合并到新 key
-    send_array(&mut write_half, &["PFMERGE", "merge_ab", "merge_a", "merge_b"]).await;
+    send_array(
+        &mut write_half,
+        &["PFMERGE", "merge_ab", "merge_a", "merge_b"],
+    )
+    .await;
     let resp = read_line(&mut reader).await;
     assert_eq!(resp, "+OK\r\n");
 
     // 验证合并后的基数接近 50
     send_array(&mut write_half, &["PFCOUNT", "merge_ab"]).await;
     let resp = read_line(&mut reader).await;
-    
+
     let count: i64 = resp.trim().trim_start_matches(':').parse().unwrap();
-    assert!(count >= 45 && count <= 55, "Expected count near 50, got: {}", count);
+    assert!(
+        count >= 45 && count <= 55,
+        "Expected count near 50, got: {}",
+        count
+    );
 
     let _ = shutdown.send(());
 }
@@ -194,7 +214,11 @@ async fn test_pfadd_wrongtype() {
     // 尝试对字符串 key 执行 PFADD 应该返回 WRONGTYPE 错误
     send_array(&mut write_half, &["PFADD", "stringkey", "elem"]).await;
     let resp = read_line(&mut reader).await;
-    assert!(resp.contains("WRONGTYPE"), "Expected WRONGTYPE error, got: {}", resp);
+    assert!(
+        resp.contains("WRONGTYPE"),
+        "Expected WRONGTYPE error, got: {}",
+        resp
+    );
 
     let _ = shutdown.send(());
 }
@@ -213,7 +237,11 @@ async fn test_pfcount_wrongtype() {
     // 尝试对列表 key 执行 PFCOUNT 应该返回 WRONGTYPE 错误
     send_array(&mut write_half, &["PFCOUNT", "listkey"]).await;
     let resp = read_line(&mut reader).await;
-    assert!(resp.contains("WRONGTYPE"), "Expected WRONGTYPE error, got: {}", resp);
+    assert!(
+        resp.contains("WRONGTYPE"),
+        "Expected WRONGTYPE error, got: {}",
+        resp
+    );
 
     let _ = shutdown.send(());
 }
@@ -232,9 +260,17 @@ async fn test_pfmerge_wrongtype() {
     let _ = read_line(&mut reader).await;
 
     // 尝试合并 HLL 和集合应该返回 WRONGTYPE 错误
-    send_array(&mut write_half, &["PFMERGE", "hllkey_2", "hllkey_1", "setkey"]).await;
+    send_array(
+        &mut write_half,
+        &["PFMERGE", "hllkey_2", "hllkey_1", "setkey"],
+    )
+    .await;
     let resp = read_line(&mut reader).await;
-    assert!(resp.contains("WRONGTYPE"), "Expected WRONGTYPE error, got: {}", resp);
+    assert!(
+        resp.contains("WRONGTYPE"),
+        "Expected WRONGTYPE error, got: {}",
+        resp
+    );
 
     let _ = shutdown.send(());
 }
@@ -279,12 +315,16 @@ async fn performance_pfadd_bulk() {
     }
 
     let elapsed = start.elapsed();
-    
+
     // 验证基数估算接近 1000
     send_array(&mut write_half, &["PFCOUNT", "perf_hll"]).await;
     let resp = read_line(&mut reader).await;
     let count: i64 = resp.trim().trim_start_matches(':').parse().unwrap();
-    assert!(count >= 950 && count <= 1050, "Expected count near 1000, got: {}", count);
+    assert!(
+        count >= 950 && count <= 1050,
+        "Expected count near 1000, got: {}",
+        count
+    );
 
     // 性能断言：1000 次 PFADD 应该在 5 秒内完成
     assert!(
@@ -325,7 +365,11 @@ async fn performance_pfadd_multi_elements() {
     send_array(&mut write_half, &["PFCOUNT", "perf_multi_hll"]).await;
     let resp = read_line(&mut reader).await;
     let count: i64 = resp.trim().trim_start_matches(':').parse().unwrap();
-    assert!(count >= 4750 && count <= 5250, "Expected count near 5000, got: {}", count);
+    assert!(
+        count >= 4750 && count <= 5250,
+        "Expected count near 5000, got: {}",
+        count
+    );
 
     // 性能断言：100 次批量 PFADD 应该在 3 秒内完成
     assert!(
@@ -376,7 +420,11 @@ async fn performance_pfmerge_multi_keys() {
     send_array(&mut write_half, &["PFCOUNT", "merge_dest"]).await;
     let resp = read_line(&mut reader).await;
     let count: i64 = resp.trim().trim_start_matches(':').parse().unwrap();
-    assert!(count >= 4750 && count <= 5250, "Expected count near 5000, got: {}", count);
+    assert!(
+        count >= 4750 && count <= 5250,
+        "Expected count near 5000, got: {}",
+        count
+    );
 
     // 性能断言：合并 10 个 HLL 应该在 1 秒内完成
     assert!(
@@ -412,13 +460,26 @@ async fn performance_pfcount_multi_keys() {
     let start = Instant::now();
 
     for _ in 0..iterations {
-        send_array(&mut write_half, &[
-            "PFCOUNT", "count_src_0", "count_src_1", "count_src_2", "count_src_3", "count_src_4"
-        ]).await;
+        send_array(
+            &mut write_half,
+            &[
+                "PFCOUNT",
+                "count_src_0",
+                "count_src_1",
+                "count_src_2",
+                "count_src_3",
+                "count_src_4",
+            ],
+        )
+        .await;
         let resp = read_line(&mut reader).await;
         let count: i64 = resp.trim().trim_start_matches(':').parse().unwrap();
         // 5 个 HLL 各 200 个不同元素 = 1000
-        assert!(count >= 950 && count <= 1050, "Expected count near 1000, got: {}", count);
+        assert!(
+            count >= 950 && count <= 1050,
+            "Expected count near 1000, got: {}",
+            count
+        );
     }
 
     let elapsed = start.elapsed();
@@ -440,15 +501,15 @@ async fn test_hll_memory_size() {
     // 每个 HLL 使用 16384 个 6-bit 寄存器
     // 实际存储为 16384 个 u8 = 16384 bytes ≈ 16KB
     // （比理论的 12KB 稍大，因为使用 u8 而非紧凑的 6-bit 存储）
-    
+
     use redust::hyperloglog::HyperLogLog;
-    
+
     let hll = HyperLogLog::new();
     let registers = hll.registers();
-    
+
     // 验证寄存器数量为 16384
     assert_eq!(registers.len(), 16384, "Expected 16384 registers");
-    
+
     // 内存占用：16384 bytes = 16 KB
     let memory_bytes = registers.len();
     assert_eq!(memory_bytes, 16384, "Expected 16384 bytes per HLL");
@@ -461,7 +522,7 @@ async fn test_hll_memory_size() {
 async fn test_hll_rdb_persistence() {
     use redust::storage::Storage;
     use std::path::PathBuf;
-    
+
     fn temp_path(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
         let nanos = std::time::SystemTime::now()
@@ -471,31 +532,38 @@ async fn test_hll_rdb_persistence() {
         p.push(format!("redust_{}_{}.rdb", name, nanos));
         p
     }
-    
+
     let storage = Storage::default();
-    
+
     // 创建 HLL 并添加元素
     for i in 0..100 {
         let elem = format!("elem_{}", i).into_bytes();
         storage.pfadd("test_hll", &[elem]).unwrap();
     }
-    
+
     // 获取原始基数
     let original_count = storage.pfcount(&["test_hll".to_string()]).unwrap();
-    assert!(original_count >= 95 && original_count <= 105, "Original count: {}", original_count);
-    
+    assert!(
+        original_count >= 95 && original_count <= 105,
+        "Original count: {}",
+        original_count
+    );
+
     // 保存 RDB
     let path = temp_path("hll_persistence");
     storage.save_rdb(&path).unwrap();
-    
+
     // 加载到新的 Storage
     let restored = Storage::default();
     restored.load_rdb(&path).unwrap();
-    
+
     // 验证基数一致
     let restored_count = restored.pfcount(&["test_hll".to_string()]).unwrap();
-    assert_eq!(original_count, restored_count, "Count mismatch after restore");
-    
+    assert_eq!(
+        original_count, restored_count,
+        "Count mismatch after restore"
+    );
+
     // 清理
     let _ = std::fs::remove_file(&path);
 }
@@ -505,7 +573,7 @@ async fn test_hll_rdb_persistence() {
 async fn test_multiple_hll_rdb_persistence() {
     use redust::storage::Storage;
     use std::path::PathBuf;
-    
+
     fn temp_path(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
         let nanos = std::time::SystemTime::now()
@@ -515,9 +583,9 @@ async fn test_multiple_hll_rdb_persistence() {
         p.push(format!("redust_{}_{}.rdb", name, nanos));
         p
     }
-    
+
     let storage = Storage::default();
-    
+
     // 创建多个 HLL
     for hll_idx in 0..3 {
         let key = format!("hll_{}", hll_idx);
@@ -526,27 +594,27 @@ async fn test_multiple_hll_rdb_persistence() {
             storage.pfadd(&key, &[elem]).unwrap();
         }
     }
-    
+
     // 获取原始基数
     let counts: Vec<u64> = (0..3)
         .map(|i| storage.pfcount(&[format!("hll_{}", i)]).unwrap())
         .collect();
-    
+
     // 保存 RDB
     let path = temp_path("multi_hll_persistence");
     storage.save_rdb(&path).unwrap();
-    
+
     // 加载到新的 Storage
     let restored = Storage::default();
     restored.load_rdb(&path).unwrap();
-    
+
     // 验证每个 HLL 的基数一致
     for i in 0..3 {
         let key = format!("hll_{}", i);
         let restored_count = restored.pfcount(&[key]).unwrap();
         assert_eq!(counts[i], restored_count, "Count mismatch for hll_{}", i);
     }
-    
+
     // 清理
     let _ = std::fs::remove_file(&path);
 }
@@ -556,7 +624,7 @@ async fn test_multiple_hll_rdb_persistence() {
 async fn test_hll_mixed_types_rdb_persistence() {
     use redust::storage::Storage;
     use std::path::PathBuf;
-    
+
     fn temp_path(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
         let nanos = std::time::SystemTime::now()
@@ -566,43 +634,52 @@ async fn test_hll_mixed_types_rdb_persistence() {
         p.push(format!("redust_{}_{}.rdb", name, nanos));
         p
     }
-    
+
     let storage = Storage::default();
-    
+
     // 创建不同类型的数据
-    storage.set("string_key".to_string(), b"string_value".to_vec());
-    storage.lpush("list_key", &vec!["a".to_string(), "b".to_string()]).unwrap();
-    storage.sadd("set_key", &vec!["x".to_string(), "y".to_string()]).unwrap();
-    
+    storage
+        .set("string_key".to_string(), b"string_value".to_vec())
+        .expect("set string_key");
+    storage
+        .lpush("list_key", &vec!["a".to_string(), "b".to_string()])
+        .unwrap();
+    storage
+        .sadd("set_key", &vec!["x".to_string(), "y".to_string()])
+        .unwrap();
+
     // 创建 HLL
     for i in 0..50 {
         let elem = format!("elem_{}", i).into_bytes();
         storage.pfadd("hll_key", &[elem]).unwrap();
     }
-    
+
     let hll_count = storage.pfcount(&["hll_key".to_string()]).unwrap();
-    
+
     // 保存 RDB
     let path = temp_path("mixed_types_persistence");
     storage.save_rdb(&path).unwrap();
-    
+
     // 加载到新的 Storage
     let restored = Storage::default();
     restored.load_rdb(&path).unwrap();
-    
+
     // 验证所有类型的数据
-    assert_eq!(restored.get("string_key").as_deref(), Some(b"string_value".as_slice()));
-    
+    assert_eq!(
+        restored.get("string_key").as_deref(),
+        Some(b"string_value".as_slice())
+    );
+
     let list_vals = restored.lrange("list_key", 0, -1).unwrap();
     assert_eq!(list_vals, vec!["b".to_string(), "a".to_string()]);
-    
+
     let mut set_vals = restored.smembers("set_key").unwrap();
     set_vals.sort();
     assert_eq!(set_vals, vec!["x".to_string(), "y".to_string()]);
-    
+
     let restored_hll_count = restored.pfcount(&["hll_key".to_string()]).unwrap();
     assert_eq!(hll_count, restored_hll_count, "HLL count mismatch");
-    
+
     // 清理
     let _ = std::fs::remove_file(&path);
 }
@@ -612,7 +689,7 @@ async fn test_hll_mixed_types_rdb_persistence() {
 async fn test_hll_persistence_continue_add() {
     use redust::storage::Storage;
     use std::path::PathBuf;
-    
+
     fn temp_path(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
         let nanos = std::time::SystemTime::now()
@@ -622,33 +699,37 @@ async fn test_hll_persistence_continue_add() {
         p.push(format!("redust_{}_{}.rdb", name, nanos));
         p
     }
-    
+
     let storage = Storage::default();
-    
+
     // 添加前 50 个元素
     for i in 0..50 {
         let elem = format!("elem_{}", i).into_bytes();
         storage.pfadd("continue_hll", &[elem]).unwrap();
     }
-    
+
     // 保存 RDB
     let path = temp_path("continue_add");
     storage.save_rdb(&path).unwrap();
-    
+
     // 加载到新的 Storage
     let restored = Storage::default();
     restored.load_rdb(&path).unwrap();
-    
+
     // 继续添加后 50 个元素
     for i in 50..100 {
         let elem = format!("elem_{}", i).into_bytes();
         restored.pfadd("continue_hll", &[elem]).unwrap();
     }
-    
+
     // 验证基数接近 100
     let count = restored.pfcount(&["continue_hll".to_string()]).unwrap();
-    assert!(count >= 95 && count <= 105, "Expected count near 100, got: {}", count);
-    
+    assert!(
+        count >= 95 && count <= 105,
+        "Expected count near 100, got: {}",
+        count
+    );
+
     // 清理
     let _ = std::fs::remove_file(&path);
 }

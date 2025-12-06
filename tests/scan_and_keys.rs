@@ -297,7 +297,9 @@ async fn scan_with_type_filter() {
     let _ = client.read_simple_line().await;
 
     // SCAN TYPE string - 只返回字符串类型
-    client.send_array(&["SCAN", "0", "TYPE", "string", "COUNT", "100"]).await;
+    client
+        .send_array(&["SCAN", "0", "TYPE", "string", "COUNT", "100"])
+        .await;
     let mut outer = String::new();
     client.reader.read_line(&mut outer).await.unwrap();
     assert_eq!(outer, "*2\r\n");
@@ -308,7 +310,9 @@ async fn scan_with_type_filter() {
     assert_eq!(keys_sorted, vec!["str1", "str2"]);
 
     // SCAN TYPE list - 只返回列表类型
-    client.send_array(&["SCAN", "0", "TYPE", "list", "COUNT", "100"]).await;
+    client
+        .send_array(&["SCAN", "0", "TYPE", "list", "COUNT", "100"])
+        .await;
     let mut outer = String::new();
     client.reader.read_line(&mut outer).await.unwrap();
     assert_eq!(outer, "*2\r\n");
@@ -317,7 +321,9 @@ async fn scan_with_type_filter() {
     assert_eq!(keys, vec!["list1"]);
 
     // SCAN TYPE set - 只返回集合类型
-    client.send_array(&["SCAN", "0", "TYPE", "set", "COUNT", "100"]).await;
+    client
+        .send_array(&["SCAN", "0", "TYPE", "set", "COUNT", "100"])
+        .await;
     let mut outer = String::new();
     client.reader.read_line(&mut outer).await.unwrap();
     assert_eq!(outer, "*2\r\n");
@@ -326,7 +332,9 @@ async fn scan_with_type_filter() {
     assert_eq!(keys, vec!["set1"]);
 
     // SCAN TYPE hash - 只返回哈希类型
-    client.send_array(&["SCAN", "0", "TYPE", "hash", "COUNT", "100"]).await;
+    client
+        .send_array(&["SCAN", "0", "TYPE", "hash", "COUNT", "100"])
+        .await;
     let mut outer = String::new();
     client.reader.read_line(&mut outer).await.unwrap();
     assert_eq!(outer, "*2\r\n");
@@ -335,7 +343,9 @@ async fn scan_with_type_filter() {
     assert_eq!(keys, vec!["hash1"]);
 
     // SCAN TYPE zset - 只返回有序集合类型
-    client.send_array(&["SCAN", "0", "TYPE", "zset", "COUNT", "100"]).await;
+    client
+        .send_array(&["SCAN", "0", "TYPE", "zset", "COUNT", "100"])
+        .await;
     let mut outer = String::new();
     client.reader.read_line(&mut outer).await.unwrap();
     assert_eq!(outer, "*2\r\n");
@@ -344,7 +354,11 @@ async fn scan_with_type_filter() {
     assert_eq!(keys, vec!["zset1"]);
 
     // SCAN MATCH str* TYPE string - 组合使用 MATCH 和 TYPE
-    client.send_array(&["SCAN", "0", "MATCH", "str*", "TYPE", "string", "COUNT", "100"]).await;
+    client
+        .send_array(&[
+            "SCAN", "0", "MATCH", "str*", "TYPE", "string", "COUNT", "100",
+        ])
+        .await;
     let mut outer = String::new();
     client.reader.read_line(&mut outer).await.unwrap();
     assert_eq!(outer, "*2\r\n");
@@ -734,7 +748,9 @@ async fn hscan_novalues_option() {
     let _ = client.read_simple_line().await; // :1
 
     // HSCAN 不带 NOVALUES - 返回 field 和 value
-    client.send_array(&["HSCAN", "myhash", "0", "COUNT", "100"]).await;
+    client
+        .send_array(&["HSCAN", "myhash", "0", "COUNT", "100"])
+        .await;
     let mut line = String::new();
     client.reader.read_line(&mut line).await.unwrap();
     assert_eq!(line, "*2\r\n");
@@ -744,7 +760,9 @@ async fn hscan_novalues_option() {
     assert_eq!(items.len(), 6);
 
     // HSCAN 带 NOVALUES - 只返回 field
-    client.send_array(&["HSCAN", "myhash", "0", "COUNT", "100", "NOVALUES"]).await;
+    client
+        .send_array(&["HSCAN", "myhash", "0", "COUNT", "100", "NOVALUES"])
+        .await;
     let mut line = String::new();
     client.reader.read_line(&mut line).await.unwrap();
     assert_eq!(line, "*2\r\n");
@@ -767,11 +785,15 @@ async fn zscan_novalues_option() {
     let mut client = TestClient::connect(addr).await;
 
     // 创建 zset
-    client.send_array(&["ZADD", "myzset", "1", "m1", "2", "m2", "3", "m3"]).await;
+    client
+        .send_array(&["ZADD", "myzset", "1", "m1", "2", "m2", "3", "m3"])
+        .await;
     let _ = client.read_simple_line().await;
 
     // ZSCAN 不带 NOVALUES - 返回 member 和 score
-    client.send_array(&["ZSCAN", "myzset", "0", "COUNT", "100"]).await;
+    client
+        .send_array(&["ZSCAN", "myzset", "0", "COUNT", "100"])
+        .await;
     let mut line = String::new();
     client.reader.read_line(&mut line).await.unwrap();
     assert_eq!(line, "*2\r\n");
@@ -781,7 +803,9 @@ async fn zscan_novalues_option() {
     assert_eq!(items.len(), 6);
 
     // ZSCAN 带 NOVALUES - 只返回 member
-    client.send_array(&["ZSCAN", "myzset", "0", "COUNT", "100", "NOVALUES"]).await;
+    client
+        .send_array(&["ZSCAN", "myzset", "0", "COUNT", "100", "NOVALUES"])
+        .await;
     let mut line = String::new();
     client.reader.read_line(&mut line).await.unwrap();
     assert_eq!(line, "*2\r\n");
@@ -817,7 +841,7 @@ async fn scan_cursor_stability_no_duplicates() {
 
     loop {
         let (next, keys) = client.scan(cursor, None, Some(3)).await;
-        
+
         // 在扫描过程中添加新键
         if iterations == 1 {
             for i in 20..25 {
@@ -826,7 +850,7 @@ async fn scan_cursor_stability_no_duplicates() {
                 let _ = client.read_simple_line().await;
             }
         }
-        
+
         // 在扫描过程中删除一些键
         if iterations == 2 {
             client.send_array(&["DEL", "key:5", "key:10"]).await;
@@ -844,7 +868,7 @@ async fn scan_cursor_stability_no_duplicates() {
             break;
         }
         cursor = next;
-        
+
         // 防止无限循环
         if iterations > 100 {
             panic!("SCAN did not complete after 100 iterations");
@@ -856,7 +880,11 @@ async fn scan_cursor_stability_no_duplicates() {
     sorted.sort();
     let mut deduped = sorted.clone();
     deduped.dedup();
-    assert_eq!(sorted, deduped, "SCAN returned duplicate keys: {:?}", all_keys);
+    assert_eq!(
+        sorted, deduped,
+        "SCAN returned duplicate keys: {:?}",
+        all_keys
+    );
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
@@ -892,7 +920,7 @@ async fn scan_complete_iteration() {
             break;
         }
         cursor = next;
-        
+
         if iterations > 100 {
             panic!("SCAN did not complete after 100 iterations");
         }
