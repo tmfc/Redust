@@ -1,6 +1,8 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::env;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::sync::{
     atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
     Arc,
@@ -21,10 +23,14 @@ use crate::resp::{
     respond_simple_string,
 };
 use crate::scripting::{execute_script, ScriptCache, ScriptContext};
-use crate::storage::Storage;
+use crate::storage::{MaxmemoryPolicy, Storage};
 
 // 全局客户端 ID 计数器
 static CLIENT_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+static CLIENT_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(0);
+static TCP_KEEPALIVE_SECS: AtomicU64 = AtomicU64::new(300);
+// CLIENT PAUSE 截止时间（毫秒 Unix 时间戳），0 表示未暂停
+static CLIENT_PAUSE_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 
 struct Metrics {
     start_time: Instant,
@@ -36,6 +42,128 @@ struct Metrics {
     pubsub_shard_subs: AtomicU64,
     pubsub_messages_delivered: AtomicU64,
     pubsub_messages_dropped: AtomicU64,
+}
+
+/// 慢日志条目
+#[derive(Clone)]
+struct SlowLogEntry {
+    /// 唯一 ID
+    id: u64,
+    /// 命令执行的 Unix 时间戳（秒）
+    timestamp: u64,
+    /// 执行耗时（微秒）
+    duration_us: u64,
+    /// 命令及参数
+    command: Vec<String>,
+    /// 客户端地址
+    client_addr: String,
+    /// 客户端名称
+    client_name: String,
+}
+
+/// 慢日志管理器
+struct SlowLog {
+    /// 慢日志条目队列
+    entries: std::sync::Mutex<std::collections::VecDeque<SlowLogEntry>>,
+    /// 下一个条目 ID
+    next_id: AtomicU64,
+    /// 慢查询阈值（微秒），超过此值的命令会被记录
+    threshold_us: AtomicU64,
+    /// 最大条目数
+    max_len: AtomicUsize,
+}
+
+impl SlowLog {
+    fn new() -> Self {
+        // 默认阈值 10ms = 10000us，最大 128 条
+        let threshold = env::var("REDUST_SLOWLOG_SLOWER_THAN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10000u64);
+        let max_len = env::var("REDUST_SLOWLOG_MAX_LEN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(128usize);
+
+        SlowLog {
+            entries: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            next_id: AtomicU64::new(0),
+            threshold_us: AtomicU64::new(threshold),
+            max_len: AtomicUsize::new(max_len),
+        }
+    }
+
+    /// 记录一条慢日志（如果耗时超过阈值）
+    fn log_if_slow(
+        &self,
+        duration_us: u64,
+        command: Vec<String>,
+        client_addr: &str,
+        client_name: &str,
+    ) {
+        let threshold = self.threshold_us.load(Ordering::Relaxed);
+        if duration_us < threshold {
+            return;
+        }
+
+        let entry = SlowLogEntry {
+            id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            duration_us,
+            command,
+            client_addr: client_addr.to_string(),
+            client_name: client_name.to_string(),
+        };
+
+        let max_len = self.max_len.load(Ordering::Relaxed);
+        let mut entries = self.entries.lock().unwrap();
+        entries.push_front(entry);
+        while entries.len() > max_len {
+            entries.pop_back();
+        }
+    }
+
+    /// 获取最近的 N 条慢日志
+    fn get(&self, count: Option<usize>) -> Vec<SlowLogEntry> {
+        let entries = self.entries.lock().unwrap();
+        let n = count.unwrap_or(10).min(entries.len());
+        entries.iter().take(n).cloned().collect()
+    }
+
+    /// 重置慢日志
+    fn reset(&self) {
+        let mut entries = self.entries.lock().unwrap();
+        entries.clear();
+    }
+
+    /// 获取慢日志长度
+    fn len(&self) -> usize {
+        self.entries.lock().unwrap().len()
+    }
+
+    fn set_threshold_us(&self, threshold: u64) {
+        self.threshold_us.store(threshold, Ordering::Relaxed);
+    }
+
+    fn set_max_len(&self, len: usize) {
+        self.max_len.store(len, Ordering::Relaxed);
+        // 立即裁剪队列以匹配新限制
+        let mut entries = self.entries.lock().unwrap();
+        while entries.len() > len {
+            entries.pop_back();
+        }
+    }
+
+    fn threshold_us(&self) -> u64 {
+        self.threshold_us.load(Ordering::Relaxed)
+    }
+
+    fn max_len(&self) -> usize {
+        self.max_len.load(Ordering::Relaxed)
+    }
 }
 
 struct PersistenceState {
@@ -262,6 +390,10 @@ fn parse_maxmemory_bytes(input: &str) -> Option<u64> {
     base.checked_mul(multiplier)
 }
 
+fn parse_maxmemory_policy(input: &str) -> Option<MaxmemoryPolicy> {
+    MaxmemoryPolicy::from_str(input)
+}
+
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
@@ -282,14 +414,80 @@ fn format_bytes(bytes: u64) -> String {
     format!("{}B", bytes)
 }
 
+/// 将命令转换为字符串数组用于慢日志记录
+fn command_to_strings(cmd: &Command) -> Vec<String> {
+    match cmd {
+        Command::Ping => vec!["PING".to_string()],
+        Command::PingWithPayload(msg) => {
+            vec!["PING".to_string(), String::from_utf8_lossy(msg).to_string()]
+        }
+        Command::Echo(msg) => vec!["ECHO".to_string(), String::from_utf8_lossy(msg).to_string()],
+        Command::Set { key, value, .. } => vec![
+            "SET".to_string(),
+            key.clone(),
+            String::from_utf8_lossy(value).to_string(),
+        ],
+        Command::Get { key } => vec!["GET".to_string(), key.clone()],
+        Command::Del { keys } => std::iter::once("DEL".to_string())
+            .chain(keys.iter().cloned())
+            .collect(),
+        Command::Lpush { key, values } => std::iter::once("LPUSH".to_string())
+            .chain(std::iter::once(key.clone()))
+            .chain(values.iter().cloned())
+            .collect(),
+        Command::Rpush { key, values } => std::iter::once("RPUSH".to_string())
+            .chain(std::iter::once(key.clone()))
+            .chain(values.iter().cloned())
+            .collect(),
+        Command::Hset { key, field, value } => vec![
+            "HSET".to_string(),
+            key.clone(),
+            field.clone(),
+            value.clone(),
+        ],
+        Command::Hget { key, field } => vec!["HGET".to_string(), key.clone(), field.clone()],
+        Command::Sadd { key, members } => std::iter::once("SADD".to_string())
+            .chain(std::iter::once(key.clone()))
+            .chain(members.iter().cloned())
+            .collect(),
+        Command::Zadd { key, entries, .. } => {
+            let mut v = vec!["ZADD".to_string(), key.clone()];
+            for (score, member) in entries {
+                v.push(score.to_string());
+                v.push(member.clone());
+            }
+            v
+        }
+        // 对于其他命令，使用 Debug 格式的简化表示
+        _ => vec![format!("{:?}", cmd).chars().take(100).collect()],
+    }
+}
+
+/// 计算键名的哈希值，用于 SCAN 游标
+/// 使用稳定的哈希算法确保同一键名总是产生相同的哈希值
+fn key_hash(key: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn pattern_match(pattern: &str, value: &str) -> bool {
     fn match_set(p: &[u8], ch: u8) -> Option<(bool, usize)> {
         let mut ranges: Vec<(u8, u8)> = Vec::new();
         let mut i = 1; // skip '['
+
+        // 检查是否是取反字符集 [^...]
+        let negate = i < p.len() && p[i] == b'^';
+        if negate {
+            i += 1;
+        }
+
         while i < p.len() {
             if p[i] == b']' {
                 let matched = ranges.iter().any(|(s, e)| ch >= *s && ch <= *e);
-                return Some((matched, i + 1));
+                // 如果是取反，则反转匹配结果
+                let result = if negate { !matched } else { matched };
+                return Some((result, i + 1));
             }
 
             let mut start = p[i];
@@ -395,6 +593,13 @@ fn file_mtime_seconds(path: &str) -> Option<i64> {
     let modified = meta.modified().ok()?;
     let dur = modified.duration_since(UNIX_EPOCH).ok()?;
     Some(dur.as_secs() as i64)
+}
+
+fn quarantine_corrupt_file(path: &str) -> Option<String> {
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let new_path = format!("{}.corrupt.{}", path, ts);
+    std::fs::rename(path, &new_path).ok()?;
+    Some(new_path)
 }
 
 fn build_prometheus_metrics(storage: &Storage, metrics: &Metrics) -> String {
@@ -643,9 +848,6 @@ async fn handle_string_command(
 
             // 处理写入和 TTL
             if should_write {
-                // 写入新值
-                storage.set(physical.clone(), value);
-
                 // 先根据 EX/PX/EXAT/PXAT 计算“显式指定”的 TTL；存在显式 TTL 时优先级高于 KEEPTTL。
                 let explicit_ttl_ms: Option<i64> = if let Some(at_ms) = expire_at_millis {
                     use std::time::{SystemTime, UNIX_EPOCH};
@@ -657,6 +859,36 @@ async fn handle_string_command(
                 } else {
                     expire_millis
                 };
+
+                let expires_at_instant = explicit_ttl_ms.or(keep_ttl_ms).and_then(|ms| {
+                    if ms > 0 {
+                        Some(Instant::now() + Duration::from_millis(ms as u64))
+                    } else {
+                        None
+                    }
+                });
+
+                // 写入新值
+                if let Err(e) = storage.set_with_expiry(physical.clone(), value, expires_at_instant)
+                {
+                    match e {
+                        crate::storage::StorageError::Oom => {
+                            respond_error(
+                                writer,
+                                "OOM command not allowed when used memory > 'maxmemory'.",
+                            )
+                            .await?;
+                        }
+                        crate::storage::StorageError::WrongType => {
+                            respond_error(
+                                writer,
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            )
+                            .await?;
+                        }
+                    }
+                    return Ok(());
+                }
 
                 // TTL 处理优先级：
                 // 1. 显式 TTL（EX/PX/EXAT/PXAT）：覆盖旧 TTL
@@ -703,7 +935,21 @@ async fn handle_string_command(
                     };
                     respond_bulk_string(writer, &s).await?;
                 }
-                Err(_) => {
+                Err(crate::storage::IncrFloatError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::IncrFloatError::WrongType) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::IncrFloatError::NotFloat) => {
                     respond_error(writer, "ERR value is not a valid float").await?;
                 }
             }
@@ -789,7 +1035,14 @@ async fn handle_string_command(
                 Ok(len) => {
                     respond_integer(writer, len as i64).await?;
                 }
-                Err(()) => {
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
                     respond_error(
                         writer,
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -811,7 +1064,14 @@ async fn handle_string_command(
                 Ok(new_len) => {
                     respond_integer(writer, new_len as i64).await?;
                 }
-                Err(()) => {
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
                     respond_error(
                         writer,
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -851,7 +1111,14 @@ async fn handle_string_command(
                 Ok(None) => {
                     respond_null_bulk(writer).await?;
                 }
-                Err(()) => {
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
                     respond_error(
                         writer,
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -866,8 +1133,22 @@ async fn handle_string_command(
                 Ok(value) => {
                     respond_integer(writer, value).await?;
                 }
-                Err(_) => {
+                Err(crate::storage::IncrError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::IncrError::NotInteger) => {
                     respond_error(writer, "ERR value is not an integer or out of range").await?;
+                }
+                Err(crate::storage::IncrError::WrongType) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -877,8 +1158,22 @@ async fn handle_string_command(
                 Ok(value) => {
                     respond_integer(writer, value).await?;
                 }
-                Err(_) => {
+                Err(crate::storage::IncrError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::IncrError::NotInteger) => {
                     respond_error(writer, "ERR value is not an integer or out of range").await?;
+                }
+                Err(crate::storage::IncrError::WrongType) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -888,8 +1183,22 @@ async fn handle_string_command(
                 Ok(value) => {
                     respond_integer(writer, value).await?;
                 }
-                Err(_) => {
+                Err(crate::storage::IncrError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::IncrError::NotInteger) => {
                     respond_error(writer, "ERR value is not an integer or out of range").await?;
+                }
+                Err(crate::storage::IncrError::WrongType) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -899,8 +1208,22 @@ async fn handle_string_command(
                 Ok(value) => {
                     respond_integer(writer, value).await?;
                 }
-                Err(_) => {
+                Err(crate::storage::IncrError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::IncrError::NotInteger) => {
                     respond_error(writer, "ERR value is not an integer or out of range").await?;
+                }
+                Err(crate::storage::IncrError::WrongType) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
                 }
             }
         }
@@ -911,6 +1234,44 @@ async fn handle_string_command(
                 .collect();
             let removed = storage.del(&physical);
             respond_integer(writer, removed as i64).await?;
+        }
+        Command::Unlink { keys } => {
+            let physical: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
+            let removed = storage.unlink(&physical);
+            respond_integer(writer, removed as i64).await?;
+        }
+        Command::Copy {
+            source,
+            destination,
+            replace,
+        } => {
+            let src_physical = prefix_key(current_db, &source);
+            let dst_physical = prefix_key(current_db, &destination);
+            match storage.copy(&src_physical, &dst_physical, replace) {
+                Ok(true) => respond_integer(writer, 1).await?,
+                Ok(false) => respond_integer(writer, 0).await?,
+                Err(()) => {
+                    respond_error(writer, "ERR source and destination objects are the same").await?
+                }
+            }
+        }
+        Command::Touch { keys } => {
+            let physical: Vec<String> = keys
+                .into_iter()
+                .map(|k| prefix_key(current_db, &k))
+                .collect();
+            let count = storage.touch(&physical);
+            respond_integer(writer, count as i64).await?;
+        }
+        Command::ObjectEncoding { key } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.object_encoding(&physical) {
+                Some(encoding) => respond_bulk_string(writer, encoding).await?,
+                None => respond_null_bulk(writer).await?,
+            }
         }
         Command::Exists { keys } => {
             let physical: Vec<String> = keys
@@ -958,8 +1319,23 @@ async fn handle_string_command(
                 .into_iter()
                 .map(|(k, v)| (prefix_key(current_db, &k), v))
                 .collect();
-            storage.mset(&mapped);
-            respond_simple_string(writer, "OK").await?;
+            match storage.mset(&mapped) {
+                Ok(()) => respond_simple_string(writer, "OK").await?,
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
         }
         Command::Msetnx { pairs } => {
             if let Some(limit) = current_max_value_bytes() {
@@ -976,9 +1352,26 @@ async fn handle_string_command(
                 .map(|(k, v)| (prefix_key(current_db, &k), v))
                 .collect();
 
-            let ok = storage.msetnx(&mapped);
-            let v = if ok { 1 } else { 0 };
-            respond_integer(writer, v).await?;
+            match storage.msetnx(&mapped) {
+                Ok(ok) => {
+                    let v = if ok { 1 } else { 0 };
+                    respond_integer(writer, v).await?;
+                }
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
         }
         Command::Setnx { key, value } => {
             let physical = prefix_key(current_db, &key);
@@ -988,9 +1381,26 @@ async fn handle_string_command(
                     return Ok(());
                 }
             }
-            let inserted = storage.setnx(&physical, value);
-            let v = if inserted { 1 } else { 0 };
-            respond_integer(writer, v).await?;
+            match storage.setnx(&physical, value) {
+                Ok(inserted) => {
+                    let v = if inserted { 1 } else { 0 };
+                    respond_integer(writer, v).await?;
+                }
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
         }
         Command::Setex {
             key,
@@ -1004,8 +1414,23 @@ async fn handle_string_command(
                     return Ok(());
                 }
             }
-            storage.set_with_expire_seconds(physical, value, seconds);
-            respond_simple_string(writer, "OK").await?;
+            match storage.set_with_expire_seconds(physical, value, seconds) {
+                Ok(()) => respond_simple_string(writer, "OK").await?,
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
         }
         Command::Psetex { key, millis, value } => {
             let physical = prefix_key(current_db, &key);
@@ -1015,8 +1440,23 @@ async fn handle_string_command(
                     return Ok(());
                 }
             }
-            storage.set_with_expire_millis(physical, value, millis);
-            respond_simple_string(writer, "OK").await?;
+            match storage.set_with_expire_millis(physical, value, millis) {
+                Ok(()) => respond_simple_string(writer, "OK").await?,
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
         }
         // HyperLogLog 命令
         Command::Pfadd { key, elements } => {
@@ -1035,10 +1475,8 @@ async fn handle_string_command(
             }
         }
         Command::Pfcount { keys } => {
-            let physical_keys: Vec<String> = keys
-                .iter()
-                .map(|k| prefix_key(current_db, k))
-                .collect();
+            let physical_keys: Vec<String> =
+                keys.iter().map(|k| prefix_key(current_db, k)).collect();
             match storage.pfcount(&physical_keys) {
                 Ok(count) => {
                     respond_integer(writer, count as i64).await?;
@@ -1080,6 +1518,146 @@ async fn handle_string_command(
     Ok(())
 }
 
+async fn handle_meta_command(
+    cmd: Command,
+    storage: &Storage,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    current_db: u8,
+) -> io::Result<()> {
+    match cmd {
+        Command::Type { key } => {
+            let physical = prefix_key(current_db, &key);
+            let t = storage.type_of(&physical);
+            respond_simple_string(writer, &t).await?;
+        }
+        Command::Keys { pattern } => {
+            let all = storage.keys("*");
+            let prefix = format!("{}:", current_db);
+            let mut logical_keys: Vec<String> = Vec::new();
+            for k in all {
+                if let Some(rest) = k.strip_prefix(&prefix) {
+                    logical_keys.push(rest.to_string());
+                }
+            }
+
+            let mut result: Vec<String> = Vec::new();
+            for k in logical_keys {
+                if pattern_match(&pattern, &k) {
+                    result.push(k);
+                }
+            }
+
+            let mut response = format!("*{}\r\n", result.len());
+            for k in result {
+                response.push_str(&format!("${}\r\n{}\r\n", k.len(), k));
+            }
+            writer.write_all(response.as_bytes()).await?;
+        }
+        Command::Scan {
+            cursor,
+            pattern,
+            count,
+            type_filter,
+        } => {
+            let all = storage.keys("*");
+            let prefix = format!("{}:", current_db);
+
+            // 收集逻辑键及其哈希值，按哈希值排序
+            let mut keyed: Vec<(u64, String)> = Vec::new();
+            for k in all {
+                if let Some(rest) = k.strip_prefix(&prefix) {
+                    let hash = key_hash(rest);
+                    keyed.push((hash, rest.to_string()));
+                }
+            }
+            keyed.sort_by_key(|(h, _)| *h);
+
+            let batch_size = count.unwrap_or(10) as usize;
+            let pat = pattern.unwrap_or_else(|| "*".to_string());
+            let mut matched: Vec<String> = Vec::new();
+            let mut max_hash: u64 = 0;
+            let mut found_any = false;
+
+            for (hash, k) in &keyed {
+                // 跳过哈希值小于游标的键
+                if *hash < cursor {
+                    continue;
+                }
+
+                // 检查模式匹配
+                if !pattern_match(&pat, k) {
+                    // 即使不匹配也要更新 max_hash 以推进游标
+                    if !found_any || *hash > max_hash {
+                        max_hash = *hash;
+                        found_any = true;
+                    }
+                    continue;
+                }
+
+                // 检查类型过滤
+                if let Some(ref type_f) = type_filter {
+                    let physical = prefix_key(current_db, k);
+                    let key_type = storage.type_of(&physical);
+                    if key_type == "none" || key_type.to_ascii_lowercase() != *type_f {
+                        if !found_any || *hash > max_hash {
+                            max_hash = *hash;
+                            found_any = true;
+                        }
+                        continue;
+                    }
+                }
+
+                matched.push(k.clone());
+                if !found_any || *hash > max_hash {
+                    max_hash = *hash;
+                    found_any = true;
+                }
+
+                // 达到批次大小后停止
+                if matched.len() >= batch_size {
+                    break;
+                }
+            }
+
+            // 计算下一个游标
+            // 如果还有更多键（哈希值 > max_hash），返回 max_hash + 1
+            // 否则返回 0 表示扫描完成
+            let next_cursor = if found_any {
+                let has_more = keyed.iter().any(|(h, _)| *h > max_hash);
+                if has_more {
+                    max_hash.saturating_add(1)
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+
+            let cursor_str = next_cursor.to_string();
+            let mut response = format!(
+                "*2\r\n${}\r\n{}\r\n*{}\r\n",
+                cursor_str.len(),
+                cursor_str,
+                matched.len()
+            );
+            for k in matched {
+                response.push_str(&format!("${}\r\n{}\r\n", k.len(), k));
+            }
+            writer.write_all(response.as_bytes()).await?;
+        }
+        Command::Dbsize => {
+            let all = storage.keys("*");
+            let prefix = format!("{}:", current_db);
+            let count = all.into_iter().filter(|k| k.starts_with(&prefix)).count();
+            respond_integer(writer, count as i64).await?;
+        }
+        _ => {
+            respond_error(writer, "ERR command not supported in transaction").await?;
+        }
+    }
+    Ok(())
+}
+
 async fn handle_list_command(
     cmd: Command,
     storage: &Storage,
@@ -1101,7 +1679,14 @@ async fn handle_list_command(
                 Ok(len) => {
                     respond_integer(writer, len as i64).await?;
                 }
-                Err(()) => {
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
                     respond_error(
                         writer,
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -1188,7 +1773,14 @@ async fn handle_list_command(
                 Ok(len) => {
                     respond_integer(writer, len as i64).await?;
                 }
-                Err(()) => {
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
                     respond_error(
                         writer,
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -1249,6 +1841,167 @@ async fn handle_list_command(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
                     )
                     .await?;
+                }
+            }
+        }
+        Command::Blpop { keys, timeout } => {
+            let physical_keys: Vec<String> =
+                keys.iter().map(|k| prefix_key(current_db, k)).collect();
+
+            // 先尝试立即获取
+            for (i, physical) in physical_keys.iter().enumerate() {
+                match storage.lpop(physical) {
+                    Ok(Some(value)) => {
+                        // 返回 [key, value] 数组
+                        let key = &keys[i];
+                        let response = format!(
+                            "*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                            key.len(),
+                            key,
+                            value.len(),
+                            value
+                        );
+                        writer.write_all(response.as_bytes()).await?;
+                        return Ok(());
+                    }
+                    Ok(None) => continue,
+                    Err(()) => {
+                        respond_error(
+                            writer,
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            }
+
+            // 如果 timeout 为 0，无限等待；否则等待指定时间
+            let timeout_duration = if timeout == 0.0 {
+                None
+            } else {
+                Some(std::time::Duration::from_secs_f64(timeout))
+            };
+
+            let poll_interval = std::time::Duration::from_millis(100);
+            let start = std::time::Instant::now();
+
+            loop {
+                // 检查是否超时
+                if let Some(timeout_dur) = timeout_duration {
+                    if start.elapsed() >= timeout_dur {
+                        // BLPOP/BRPOP 超时返回 null array (*-1)，而非 null bulk ($-1)
+                        writer.write_all(b"*-1\r\n").await?;
+                        return Ok(());
+                    }
+                }
+
+                // 等待一小段时间后重试
+                tokio::time::sleep(poll_interval).await;
+
+                // 再次尝试获取
+                for (i, physical) in physical_keys.iter().enumerate() {
+                    match storage.lpop(physical) {
+                        Ok(Some(value)) => {
+                            let key = &keys[i];
+                            let response = format!(
+                                "*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                                key.len(),
+                                key,
+                                value.len(),
+                                value
+                            );
+                            writer.write_all(response.as_bytes()).await?;
+                            return Ok(());
+                        }
+                        Ok(None) => continue,
+                        Err(()) => {
+                            respond_error(
+                                writer,
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+        Command::Brpop { keys, timeout } => {
+            let physical_keys: Vec<String> =
+                keys.iter().map(|k| prefix_key(current_db, k)).collect();
+
+            // 先尝试立即获取
+            for (i, physical) in physical_keys.iter().enumerate() {
+                match storage.rpop(physical) {
+                    Ok(Some(value)) => {
+                        let key = &keys[i];
+                        let response = format!(
+                            "*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                            key.len(),
+                            key,
+                            value.len(),
+                            value
+                        );
+                        writer.write_all(response.as_bytes()).await?;
+                        return Ok(());
+                    }
+                    Ok(None) => continue,
+                    Err(()) => {
+                        respond_error(
+                            writer,
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            }
+
+            let timeout_duration = if timeout == 0.0 {
+                None
+            } else {
+                Some(std::time::Duration::from_secs_f64(timeout))
+            };
+
+            let poll_interval = std::time::Duration::from_millis(100);
+            let start = std::time::Instant::now();
+
+            loop {
+                if let Some(timeout_dur) = timeout_duration {
+                    if start.elapsed() >= timeout_dur {
+                        // BLPOP/BRPOP 超时返回 null array (*-1)，而非 null bulk ($-1)
+                        writer.write_all(b"*-1\r\n").await?;
+                        return Ok(());
+                    }
+                }
+
+                tokio::time::sleep(poll_interval).await;
+
+                for (i, physical) in physical_keys.iter().enumerate() {
+                    match storage.rpop(physical) {
+                        Ok(Some(value)) => {
+                            let key = &keys[i];
+                            let response = format!(
+                                "*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                                key.len(),
+                                key,
+                                value.len(),
+                                value
+                            );
+                            writer.write_all(response.as_bytes()).await?;
+                            return Ok(());
+                        }
+                        Ok(None) => continue,
+                        Err(()) => {
+                            respond_error(
+                                writer,
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                    }
                 }
             }
         }
@@ -1315,11 +2068,124 @@ async fn handle_list_command(
                 }
             }
         }
+        Command::Lset { key, index, value } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.lset(&physical, index, value) {
+                Ok(()) => {
+                    respond_simple_string(writer, "OK").await?;
+                }
+                Err(crate::storage::LsetError::WrongType) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::LsetError::NoSuchKey) => {
+                    respond_error(writer, "ERR no such key").await?;
+                }
+                Err(crate::storage::LsetError::OutOfRange) => {
+                    respond_error(writer, "ERR index out of range").await?;
+                }
+            }
+        }
+        Command::Linsert {
+            key,
+            before,
+            pivot,
+            value,
+        } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.linsert(&physical, before, &pivot, value) {
+                Ok(len) => {
+                    respond_integer(writer, len as i64).await?;
+                }
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Rpoplpush {
+            source,
+            destination,
+        } => {
+            let src_physical = prefix_key(current_db, &source);
+            let dst_physical = prefix_key(current_db, &destination);
+            match storage.rpoplpush(&src_physical, &dst_physical) {
+                Ok(Some(value)) => {
+                    respond_bulk_string(writer, &value).await?;
+                }
+                Ok(None) => {
+                    respond_null_bulk(writer).await?;
+                }
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Lpos {
+            key,
+            element,
+            rank,
+            count,
+            maxlen,
+        } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.lpos(&physical, &element, rank, count, maxlen) {
+                Ok(positions) => {
+                    if count.is_some() {
+                        // 返回数组
+                        let mut response = format!("*{}\r\n", positions.len());
+                        for pos in positions {
+                            response.push_str(&format!(":{}\r\n", pos));
+                        }
+                        writer.write_all(response.as_bytes()).await?;
+                    } else {
+                        // 返回单个值或 null
+                        if let Some(&pos) = positions.first() {
+                            respond_integer(writer, pos as i64).await?;
+                        } else {
+                            respond_null_bulk(writer).await?;
+                        }
+                    }
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
         Command::Hscan {
             key,
             cursor: _,
             pattern,
             count: _,
+            novalues,
         } => {
             let physical = prefix_key(current_db, &key);
             match storage.hgetall(&physical) {
@@ -1336,15 +2202,18 @@ async fn handle_list_command(
                     let next_cursor = 0u64;
                     let cursor_str = next_cursor.to_string();
 
+                    let array_len = if novalues { flat.len() } else { flat.len() * 2 };
                     let mut response = format!(
                         "*2\r\n${}\r\n{}\r\n*{}\r\n",
                         cursor_str.len(),
                         cursor_str,
-                        flat.len() * 2
+                        array_len
                     );
                     for (f, v) in flat {
                         response.push_str(&format!("${}\r\n{}\r\n", f.len(), f));
-                        response.push_str(&format!("${}\r\n{}\r\n", v.len(), v));
+                        if !novalues {
+                            response.push_str(&format!("${}\r\n{}\r\n", v.len(), v));
+                        }
                     }
                     writer.write_all(response.as_bytes()).await?;
                 }
@@ -1384,7 +2253,14 @@ async fn handle_set_command(
                 Ok(added) => {
                     respond_integer(writer, added as i64).await?;
                 }
-                Err(()) => {
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
                     respond_error(
                         writer,
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -1580,7 +2456,14 @@ async fn handle_set_command(
                 Ok(len) => {
                     respond_integer(writer, len as i64).await?;
                 }
-                Err(()) => {
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
                     respond_error(
                         writer,
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -1599,7 +2482,14 @@ async fn handle_set_command(
                 Ok(len) => {
                     respond_integer(writer, len as i64).await?;
                 }
-                Err(()) => {
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
                     respond_error(
                         writer,
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -1618,6 +2508,32 @@ async fn handle_set_command(
                 Ok(len) => {
                     respond_integer(writer, len as i64).await?;
                 }
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Smove {
+            source,
+            destination,
+            member,
+        } => {
+            let src_physical = prefix_key(current_db, &source);
+            let dst_physical = prefix_key(current_db, &destination);
+            match storage.smove(&src_physical, &dst_physical, &member) {
+                Ok(true) => respond_integer(writer, 1).await?,
+                Ok(false) => respond_integer(writer, 0).await?,
                 Err(()) => {
                     respond_error(
                         writer,
@@ -1711,7 +2627,14 @@ async fn handle_hash_command(
                 Ok(added) => {
                     respond_integer(writer, added as i64).await?;
                 }
-                Err(()) => {
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
                     respond_error(
                         writer,
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -1861,6 +2784,13 @@ async fn handle_hash_command(
                 Ok(value) => {
                     respond_integer(writer, value).await?;
                 }
+                Err(crate::storage::HincrError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
                 Err(crate::storage::HincrError::WrongType) => {
                     respond_error(
                         writer,
@@ -1895,6 +2825,13 @@ async fn handle_hash_command(
                     }
                     respond_bulk_string(writer, &s).await?;
                 }
+                Err(crate::storage::HincrFloatError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
                 Err(crate::storage::HincrFloatError::WrongType) => {
                     respond_error(
                         writer,
@@ -1925,11 +2862,71 @@ async fn handle_hash_command(
                 }
             }
         }
+        Command::Hsetnx { key, field, value } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.hsetnx(&physical, &field, value) {
+                Ok(result) => {
+                    respond_integer(writer, result as i64).await?;
+                }
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Hstrlen { key, field } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.hstrlen(&physical, &field) {
+                Ok(len) => {
+                    respond_integer(writer, len as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Hmset { key, field_values } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.hmset(&physical, &field_values) {
+                Ok(()) => {
+                    respond_simple_string(writer, "OK").await?;
+                }
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
         Command::Hscan {
             key,
             cursor,
             pattern,
             count,
+            novalues,
         } => {
             let physical = prefix_key(current_db, &key);
             match storage.hgetall(&physical) {
@@ -1951,15 +2948,19 @@ async fn handle_hash_command(
 
                     let cursor_str = next_cursor.to_string();
 
+                    // NOVALUES: 只返回 field，不返回 value
+                    let array_len = if novalues { flat.len() } else { flat.len() * 2 };
                     let mut response = format!(
                         "*2\r\n${}\r\n{}\r\n*{}\r\n",
                         cursor_str.len(),
                         cursor_str,
-                        flat.len() * 2
+                        array_len
                     );
                     for (f, v) in flat {
                         response.push_str(&format!("${}\r\n{}\r\n", f.len(), f));
-                        response.push_str(&format!("${}\r\n{}\r\n", v.len(), v));
+                        if !novalues {
+                            response.push_str(&format!("${}\r\n{}\r\n", v.len(), v));
+                        }
                     }
                     writer.write_all(response.as_bytes()).await?;
                 }
@@ -1976,6 +2977,28 @@ async fn handle_hash_command(
     }
 
     Ok(())
+}
+
+/// 将 ZRangeBound 转换为 (f64, exclusive) 元组
+fn zrange_bound_to_f64(bound: &crate::command::ZRangeBound) -> (f64, bool) {
+    use crate::command::ZRangeBound;
+    match bound {
+        ZRangeBound::NegInf => (f64::NEG_INFINITY, false),
+        ZRangeBound::PosInf => (f64::INFINITY, false),
+        ZRangeBound::Inclusive(v) => (*v, false),
+        ZRangeBound::Exclusive(v) => (*v, true),
+    }
+}
+
+/// 将 ZLexBound 转换为 (value, inclusive, unbounded) 元组
+fn zlex_bound_to_params(bound: &crate::command::ZLexBound) -> (String, bool, bool) {
+    use crate::command::ZLexBound;
+    match bound {
+        ZLexBound::NegInf => (String::new(), false, true),
+        ZLexBound::PosInf => (String::new(), false, true),
+        ZLexBound::Inclusive(v) => (v.clone(), true, false),
+        ZLexBound::Exclusive(v) => (v.clone(), false, false),
+    }
 }
 
 async fn handle_zset_command(
@@ -2004,6 +3027,13 @@ async fn handle_zset_command(
             match storage.zadd(&physical, &entries) {
                 Ok(added) => {
                     respond_integer(writer, added as i64).await?;
+                }
+                Err(crate::storage::ZsetError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
                 }
                 Err(crate::storage::ZsetError::WrongType) => {
                     respond_error(
@@ -2108,6 +3138,13 @@ async fn handle_zset_command(
                     let s = format_score(score);
                     respond_bulk_string(writer, &s).await?;
                 }
+                Err(crate::storage::ZsetError::Oom) => {
+                    respond_error(
+                        writer,
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    )
+                    .await?;
+                }
                 Err(crate::storage::ZsetError::WrongType) => {
                     respond_error(
                         writer,
@@ -2120,11 +3157,323 @@ async fn handle_zset_command(
                 }
             }
         }
+        Command::Zcount { key, min, max } => {
+            let physical = prefix_key(current_db, &key);
+            let (min_val, min_excl) = zrange_bound_to_f64(&min);
+            let (max_val, max_excl) = zrange_bound_to_f64(&max);
+            match storage.zcount(&physical, min_val, min_excl, max_val, max_excl) {
+                Ok(count) => {
+                    respond_integer(writer, count as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Zrank { key, member } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.zrank(&physical, &member) {
+                Ok(Some(rank)) => {
+                    respond_integer(writer, rank as i64).await?;
+                }
+                Ok(None) => {
+                    respond_null_bulk(writer).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Zrevrank { key, member } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.zrevrank(&physical, &member) {
+                Ok(Some(rank)) => {
+                    respond_integer(writer, rank as i64).await?;
+                }
+                Ok(None) => {
+                    respond_null_bulk(writer).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Zpopmin { key, count } => {
+            let physical = prefix_key(current_db, &key);
+            let cnt = count.unwrap_or(1);
+            match storage.zpopmin(&physical, cnt) {
+                Ok(items) => {
+                    let mut response = format!("*{}\r\n", items.len() * 2);
+                    for (member, score) in items {
+                        let score_s = format_score(score);
+                        response.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
+                        response.push_str(&format!("${}\r\n{}\r\n", score_s.len(), score_s));
+                    }
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Zpopmax { key, count } => {
+            let physical = prefix_key(current_db, &key);
+            let cnt = count.unwrap_or(1);
+            match storage.zpopmax(&physical, cnt) {
+                Ok(items) => {
+                    let mut response = format!("*{}\r\n", items.len() * 2);
+                    for (member, score) in items {
+                        let score_s = format_score(score);
+                        response.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
+                        response.push_str(&format!("${}\r\n{}\r\n", score_s.len(), score_s));
+                    }
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Zinter {
+            keys,
+            weights,
+            aggregate,
+            withscores,
+        } => {
+            let physical_keys: Vec<String> =
+                keys.iter().map(|k| prefix_key(current_db, k)).collect();
+            let agg = aggregate
+                .map(|a| match a {
+                    crate::command::ZAggregate::Sum => crate::storage::ZsetAggregate::Sum,
+                    crate::command::ZAggregate::Min => crate::storage::ZsetAggregate::Min,
+                    crate::command::ZAggregate::Max => crate::storage::ZsetAggregate::Max,
+                })
+                .unwrap_or(crate::storage::ZsetAggregate::Sum);
+            match storage.zinter(&physical_keys, weights.as_deref(), agg) {
+                Ok(items) => {
+                    if withscores {
+                        let mut response = format!("*{}\r\n", items.len() * 2);
+                        for (member, score) in items {
+                            let score_s = format_score(score);
+                            response.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
+                            response.push_str(&format!("${}\r\n{}\r\n", score_s.len(), score_s));
+                        }
+                        writer.write_all(response.as_bytes()).await?;
+                    } else {
+                        let mut response = format!("*{}\r\n", items.len());
+                        for (member, _) in items {
+                            response.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
+                        }
+                        writer.write_all(response.as_bytes()).await?;
+                    }
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Zunion {
+            keys,
+            weights,
+            aggregate,
+            withscores,
+        } => {
+            let physical_keys: Vec<String> =
+                keys.iter().map(|k| prefix_key(current_db, k)).collect();
+            let agg = aggregate
+                .map(|a| match a {
+                    crate::command::ZAggregate::Sum => crate::storage::ZsetAggregate::Sum,
+                    crate::command::ZAggregate::Min => crate::storage::ZsetAggregate::Min,
+                    crate::command::ZAggregate::Max => crate::storage::ZsetAggregate::Max,
+                })
+                .unwrap_or(crate::storage::ZsetAggregate::Sum);
+            match storage.zunion(&physical_keys, weights.as_deref(), agg) {
+                Ok(items) => {
+                    if withscores {
+                        let mut response = format!("*{}\r\n", items.len() * 2);
+                        for (member, score) in items {
+                            let score_s = format_score(score);
+                            response.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
+                            response.push_str(&format!("${}\r\n{}\r\n", score_s.len(), score_s));
+                        }
+                        writer.write_all(response.as_bytes()).await?;
+                    } else {
+                        let mut response = format!("*{}\r\n", items.len());
+                        for (member, _) in items {
+                            response.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
+                        }
+                        writer.write_all(response.as_bytes()).await?;
+                    }
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Zdiff { keys, withscores } => {
+            let physical_keys: Vec<String> =
+                keys.iter().map(|k| prefix_key(current_db, k)).collect();
+            match storage.zdiff(&physical_keys) {
+                Ok(items) => {
+                    if withscores {
+                        let mut response = format!("*{}\r\n", items.len() * 2);
+                        for (member, score) in items {
+                            let score_s = format_score(score);
+                            response.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
+                            response.push_str(&format!("${}\r\n{}\r\n", score_s.len(), score_s));
+                        }
+                        writer.write_all(response.as_bytes()).await?;
+                    } else {
+                        let mut response = format!("*{}\r\n", items.len());
+                        for (member, _) in items {
+                            response.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
+                        }
+                        writer.write_all(response.as_bytes()).await?;
+                    }
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Zinterstore {
+            destination,
+            keys,
+            weights,
+            aggregate,
+        } => {
+            let dest_physical = prefix_key(current_db, &destination);
+            let physical_keys: Vec<String> =
+                keys.iter().map(|k| prefix_key(current_db, k)).collect();
+            let agg = aggregate
+                .map(|a| match a {
+                    crate::command::ZAggregate::Sum => crate::storage::ZsetAggregate::Sum,
+                    crate::command::ZAggregate::Min => crate::storage::ZsetAggregate::Min,
+                    crate::command::ZAggregate::Max => crate::storage::ZsetAggregate::Max,
+                })
+                .unwrap_or(crate::storage::ZsetAggregate::Sum);
+            match storage.zinterstore(&dest_physical, &physical_keys, weights.as_deref(), agg) {
+                Ok(count) => {
+                    respond_integer(writer, count as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Zunionstore {
+            destination,
+            keys,
+            weights,
+            aggregate,
+        } => {
+            let dest_physical = prefix_key(current_db, &destination);
+            let physical_keys: Vec<String> =
+                keys.iter().map(|k| prefix_key(current_db, k)).collect();
+            let agg = aggregate
+                .map(|a| match a {
+                    crate::command::ZAggregate::Sum => crate::storage::ZsetAggregate::Sum,
+                    crate::command::ZAggregate::Min => crate::storage::ZsetAggregate::Min,
+                    crate::command::ZAggregate::Max => crate::storage::ZsetAggregate::Max,
+                })
+                .unwrap_or(crate::storage::ZsetAggregate::Sum);
+            match storage.zunionstore(&dest_physical, &physical_keys, weights.as_deref(), agg) {
+                Ok(count) => {
+                    respond_integer(writer, count as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Zdiffstore { destination, keys } => {
+            let dest_physical = prefix_key(current_db, &destination);
+            let physical_keys: Vec<String> =
+                keys.iter().map(|k| prefix_key(current_db, k)).collect();
+            match storage.zdiffstore(&dest_physical, &physical_keys) {
+                Ok(count) => {
+                    respond_integer(writer, count as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Zlexcount { key, min, max } => {
+            let physical = prefix_key(current_db, &key);
+            let (min_val, min_incl, min_unbounded) = zlex_bound_to_params(&min);
+            let (max_val, max_incl, max_unbounded) = zlex_bound_to_params(&max);
+            match storage.zlexcount(
+                &physical,
+                &min_val,
+                min_incl,
+                &max_val,
+                max_incl,
+                min_unbounded,
+                max_unbounded,
+            ) {
+                Ok(count) => {
+                    respond_integer(writer, count as i64).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
         Command::Zscan {
             key,
             cursor,
             pattern,
             count,
+            novalues,
         } => {
             let physical = prefix_key(current_db, &key);
             match storage.zscan_entries(&physical) {
@@ -2145,16 +3494,20 @@ async fn handle_zset_command(
                     let next_cursor = if end >= entries.len() { 0 } else { end as u64 };
                     let cursor_str = next_cursor.to_string();
 
+                    // NOVALUES: 只返回 member，不返回 score
+                    let array_len = if novalues { flat.len() } else { flat.len() * 2 };
                     let mut response = format!(
                         "*2\r\n${}\r\n{}\r\n*{}\r\n",
                         cursor_str.len(),
                         cursor_str,
-                        flat.len() * 2
+                        array_len
                     );
                     for (member, score) in flat {
-                        let score_s = format_score(score);
                         response.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
-                        response.push_str(&format!("${}\r\n{}\r\n", score_s.len(), score_s));
+                        if !novalues {
+                            let score_s = format_score(score);
+                            response.push_str(&format!("${}\r\n{}\r\n", score_s.len(), score_s));
+                        }
                     }
                     writer.write_all(response.as_bytes()).await?;
                 }
@@ -2201,15 +3554,16 @@ async fn handle_persistence_command(
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                 .is_err()
             {
-                respond_error(writer, "ERR Background save already in progress")
-                    .await?;
+                respond_error(writer, "ERR Background save already in progress").await?;
             } else {
                 let path = persistence.rdb_path.clone();
                 let storage_clone = storage.clone();
                 let persistence_clone = persistence.clone();
                 tokio::spawn(async move {
                     let res = perform_save(storage_clone, path, persistence_clone.clone()).await;
-                    persistence_clone.bgsave_running.store(false, Ordering::SeqCst);
+                    persistence_clone
+                        .bgsave_running
+                        .store(false, Ordering::SeqCst);
                     if let Err(e) = res {
                         error!("[rdb] BGSAVE failed: {}", e);
                     }
@@ -2246,6 +3600,18 @@ async fn handle_key_meta_command(
             let v = if res { 1 } else { 0 };
             respond_integer(writer, v).await?;
         }
+        Command::Expireat { key, timestamp } => {
+            let physical = prefix_key(current_db, &key);
+            let res = storage.expireat(&physical, timestamp);
+            let v = if res { 1 } else { 0 };
+            respond_integer(writer, v).await?;
+        }
+        Command::Pexpireat { key, timestamp_ms } => {
+            let physical = prefix_key(current_db, &key);
+            let res = storage.pexpireat(&physical, timestamp_ms);
+            let v = if res { 1 } else { 0 };
+            respond_integer(writer, v).await?;
+        }
         Command::Ttl { key } => {
             let physical = prefix_key(current_db, &key);
             let ttl = storage.ttl_seconds(&physical);
@@ -2256,84 +3622,24 @@ async fn handle_key_meta_command(
             let ttl = storage.pttl_millis(&physical);
             respond_integer(writer, ttl).await?;
         }
+        Command::Expiretime { key } => {
+            let physical = prefix_key(current_db, &key);
+            let ts = storage.expiretime(&physical);
+            respond_integer(writer, ts).await?;
+        }
+        Command::Pexpiretime { key } => {
+            let physical = prefix_key(current_db, &key);
+            let ts = storage.pexpiretime(&physical);
+            respond_integer(writer, ts).await?;
+        }
         Command::Persist { key } => {
             let physical = prefix_key(current_db, &key);
             let changed = storage.persist(&physical);
             let v = if changed { 1 } else { 0 };
             respond_integer(writer, v).await?;
         }
-        Command::Type { key } => {
-            let physical = prefix_key(current_db, &key);
-            let t = storage.type_of(&physical);
-            respond_simple_string(writer, &t).await?;
-        }
-        Command::Keys { pattern } => {
-            let all = storage.keys("*");
-            let prefix = format!("{}:", current_db);
-            let mut logical_keys: Vec<String> = Vec::new();
-            for k in all {
-                if let Some(rest) = k.strip_prefix(&prefix) {
-                    logical_keys.push(rest.to_string());
-                }
-            }
-
-            let mut result: Vec<String> = Vec::new();
-            for k in logical_keys {
-                if pattern_match(&pattern, &k) {
-                    result.push(k);
-                }
-            }
-
-            let mut response = format!("*{}\r\n", result.len());
-            for k in result {
-                response.push_str(&format!("${}\r\n{}\r\n", k.len(), k));
-            }
-            writer.write_all(response.as_bytes()).await?;
-        }
-        Command::Scan {
-            cursor,
-            pattern,
-            count,
-        } => {
-            // 简化实现：基于当前 DB 的逻辑 key 列表做一次切片扫描。
-            let all = storage.keys("*");
-            let prefix = format!("{}:", current_db);
-            let mut logical: Vec<String> = Vec::new();
-            for k in all {
-                if let Some(rest) = k.strip_prefix(&prefix) {
-                    logical.push(rest.to_string());
-                }
-            }
-
-            let total = logical.len() as u64;
-            let start = if cursor > total { total } else { cursor } as usize;
-            let batch_size = count.unwrap_or(10) as usize;
-            let end = std::cmp::min(start + batch_size, logical.len());
-
-            let pat = pattern.unwrap_or_else(|| "*".to_string());
-            let mut matched: Vec<String> = Vec::new();
-            for k in &logical[start..end] {
-                if pattern_match(&pat, k) {
-                    matched.push(k.clone());
-                }
-            }
-
-            let next_cursor = if end >= logical.len() { 0 } else { end as u64 };
-
-            // RESP: *2 \r\n :<cursor> \r\n *N ...
-            let cursor_str = next_cursor.to_string();
-            let mut response =
-                format!("*2\r\n${}\r\n{}\r\n*{}\r\n", cursor_str.len(), cursor_str, matched.len());
-            for k in matched {
-                response.push_str(&format!("${}\r\n{}\r\n", k.len(), k));
-            }
-            writer.write_all(response.as_bytes()).await?;
-        }
-        Command::Dbsize => {
-            let all = storage.keys("*");
-            let prefix = format!("{}:", current_db);
-            let count = all.into_iter().filter(|k| k.starts_with(&prefix)).count();
-            respond_integer(writer, count as i64).await?;
+        Command::Type { .. } | Command::Keys { .. } | Command::Scan { .. } | Command::Dbsize => {
+            handle_meta_command(cmd, storage, writer, current_db).await?;
         }
         Command::Rename { key, newkey } => {
             let from = prefix_key(current_db, &key);
@@ -2386,6 +3692,7 @@ async fn handle_info_command(
     let total_cmds = metrics.total_commands.load(Ordering::Relaxed);
     let maxmemory = storage.maxmemory_bytes().unwrap_or(0);
     let maxmemory_human = format_bytes(maxmemory);
+    let maxmemory_policy = storage.maxmemory_policy().as_str();
     let used_memory = storage.approximate_used_memory();
     let used_memory_human = format_bytes(used_memory);
 
@@ -2396,6 +3703,7 @@ async fn handle_info_command(
     info.push_str(&format!("uptime_in_seconds:{}\r\n", uptime));
     info.push_str(&format!("maxmemory:{}\r\n", maxmemory));
     info.push_str(&format!("maxmemory_human:{}\r\n", maxmemory_human));
+    info.push_str(&format!("maxmemory_policy:{}\r\n", maxmemory_policy));
     info.push_str(&format!("used_memory:{}\r\n", used_memory));
     info.push_str(&format!("used_memory_human:{}\r\n", used_memory_human));
     info.push_str("\r\n# Clients\r\n");
@@ -2511,6 +3819,7 @@ async fn execute_command_in_transaction(
     storage: &Storage,
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
     current_db: u8,
+    script_cache: &ScriptCache,
 ) -> io::Result<()> {
     match cmd {
         // string / generic key-value 命令
@@ -2532,6 +3841,10 @@ async fn execute_command_in_transaction(
         | Command::Decrby { .. }
         | Command::Incrbyfloat { .. }
         | Command::Del { .. }
+        | Command::Unlink { .. }
+        | Command::Copy { .. }
+        | Command::Touch { .. }
+        | Command::ObjectEncoding { .. }
         | Command::Exists { .. }
         | Command::Mget { .. }
         | Command::Mset { .. }
@@ -2552,8 +3865,17 @@ async fn execute_command_in_transaction(
         | Command::Llen { .. }
         | Command::Lindex { .. }
         | Command::Lrem { .. }
-        | Command::Ltrim { .. } => {
+        | Command::Ltrim { .. }
+        | Command::Lset { .. }
+        | Command::Linsert { .. }
+        | Command::Rpoplpush { .. }
+        | Command::Lpos { .. } => {
             handle_list_command(cmd, storage, writer, current_db).await?;
+        }
+
+        // 阻塞命令在事务中不支持
+        Command::Blpop { .. } | Command::Brpop { .. } => {
+            respond_error(writer, "ERR BLPOP/BRPOP inside MULTI is not allowed").await?;
         }
 
         // set 命令
@@ -2570,6 +3892,7 @@ async fn execute_command_in_transaction(
         | Command::Sunionstore { .. }
         | Command::Sinterstore { .. }
         | Command::Sdiffstore { .. }
+        | Command::Smove { .. }
         | Command::Sscan { .. } => {
             handle_set_command(cmd, storage, writer, current_db).await?;
         }
@@ -2586,6 +3909,9 @@ async fn execute_command_in_transaction(
         | Command::Hincrby { .. }
         | Command::Hincrbyfloat { .. }
         | Command::Hlen { .. }
+        | Command::Hsetnx { .. }
+        | Command::Hstrlen { .. }
+        | Command::Hmset { .. }
         | Command::Hscan { .. } => {
             handle_hash_command(cmd, storage, writer, current_db).await?;
         }
@@ -2596,7 +3922,19 @@ async fn execute_command_in_transaction(
         | Command::Zrange { .. }
         | Command::Zscore { .. }
         | Command::Zrem { .. }
-        | Command::Zincrby { .. } => {
+        | Command::Zincrby { .. }
+        | Command::Zcount { .. }
+        | Command::Zrank { .. }
+        | Command::Zrevrank { .. }
+        | Command::Zpopmin { .. }
+        | Command::Zpopmax { .. }
+        | Command::Zinter { .. }
+        | Command::Zunion { .. }
+        | Command::Zdiff { .. }
+        | Command::Zinterstore { .. }
+        | Command::Zunionstore { .. }
+        | Command::Zdiffstore { .. }
+        | Command::Zlexcount { .. } => {
             handle_zset_command(cmd, storage, writer, current_db).await?;
         }
 
@@ -2606,20 +3944,46 @@ async fn execute_command_in_transaction(
         }
 
         // key meta 命令
-        Command::Type { .. }
-        | Command::Keys { .. }
-        | Command::Dbsize
-        | Command::Expire { .. }
+        Command::Type { key } => {
+            handle_meta_command(Command::Type { key }, storage, writer, current_db).await?;
+        }
+        Command::Keys { pattern } => {
+            handle_meta_command(Command::Keys { pattern }, storage, writer, current_db).await?;
+        }
+        Command::Dbsize => {
+            handle_meta_command(Command::Dbsize, storage, writer, current_db).await?;
+        }
+        Command::Scan {
+            cursor,
+            pattern,
+            count,
+            type_filter,
+        } => {
+            handle_meta_command(
+                Command::Scan {
+                    cursor,
+                    pattern,
+                    count,
+                    type_filter,
+                },
+                storage,
+                writer,
+                current_db,
+            )
+            .await?;
+        }
+        Command::Expire { .. }
         | Command::Pexpire { .. }
+        | Command::Expireat { .. }
+        | Command::Pexpireat { .. }
         | Command::Ttl { .. }
         | Command::Pttl { .. }
+        | Command::Expiretime { .. }
+        | Command::Pexpiretime { .. }
         | Command::Persist { .. }
         | Command::Rename { .. }
         | Command::Renamenx { .. }
-        | Command::Scan { .. }
         | Command::Zscan { .. } => {
-            // 简化处理：这些命令在事务中可能需要特殊处理
-            // 但为了简单起见，我们直接返回错误
             respond_error(writer, "ERR command not supported in transaction").await?;
         }
 
@@ -2632,13 +3996,64 @@ async fn execute_command_in_transaction(
             respond_error(writer, "ERR command not allowed in transaction").await?;
         }
 
-        // Lua 脚本命令在事务中不支持（简化实现）
-        Command::Eval { .. }
-        | Command::Evalsha { .. }
-        | Command::ScriptLoad { .. }
-        | Command::ScriptExists { .. }
-        | Command::ScriptFlush => {
-            respond_error(writer, "ERR EVAL/SCRIPT commands not supported in transaction").await?;
+        // Lua 脚本命令
+        Command::Eval { script, keys, args } => {
+            // 缓存脚本
+            script_cache.load(&script);
+
+            let ctx = ScriptContext {
+                storage: Arc::new(storage.clone()),
+                current_db: current_db as u32,
+                keys,
+                args,
+            };
+            match execute_script(&script, ctx) {
+                Ok(result) => {
+                    let resp = result.to_resp_bytes();
+                    writer.write_all(&resp).await?;
+                }
+                Err(e) => {
+                    respond_error(writer, &e).await?;
+                }
+            }
+        }
+        Command::Evalsha { sha1, keys, args } => match script_cache.get(&sha1) {
+            Some(script) => {
+                let ctx = ScriptContext {
+                    storage: Arc::new(storage.clone()),
+                    current_db: current_db as u32,
+                    keys,
+                    args,
+                };
+                match execute_script(&script, ctx) {
+                    Ok(result) => {
+                        let resp = result.to_resp_bytes();
+                        writer.write_all(&resp).await?;
+                    }
+                    Err(e) => {
+                        respond_error(writer, &e).await?;
+                    }
+                }
+            }
+            None => {
+                respond_error(writer, "NOSCRIPT No matching script. Please use EVAL.").await?;
+            }
+        },
+        Command::ScriptLoad { script } => {
+            let sha1 = script_cache.load(&script);
+            respond_bulk_string(writer, &sha1).await?;
+        }
+        Command::ScriptExists { sha1s } => {
+            let results = script_cache.exists(&sha1s);
+            let mut resp = format!("*{}\r\n", results.len());
+            for exists in results {
+                resp.push_str(&format!(":{}\r\n", if exists { 1 } else { 0 }));
+            }
+            writer.write_all(resp.as_bytes()).await?;
+        }
+        Command::ScriptFlush => {
+            script_cache.flush();
+            respond_simple_string(writer, "OK").await?;
         }
 
         // 其他命令返回错误
@@ -2657,8 +4072,10 @@ async fn handle_connection(
     overflow_strategy: PubSubOverflowStrategy,
     persistence: Arc<PersistenceState>,
     script_cache: Arc<ScriptCache>,
+    slowlog: Arc<SlowLog>,
 ) -> io::Result<()> {
     let peer_addr = stream.peer_addr().ok();
+    let client_addr = peer_addr.map(|a| a.to_string()).unwrap_or_default();
     info!("[conn] new connection from {:?}", peer_addr);
 
     metrics.connected_clients.fetch_add(1, Ordering::Relaxed);
@@ -2666,7 +4083,7 @@ async fn handle_connection(
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut current_db: u8 = 0;
-    
+
     // 客户端标识
     let client_id = CLIENT_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut client_name = String::new();
@@ -2724,6 +4141,33 @@ async fn handle_connection(
         };
 
         metrics.total_commands.fetch_add(1, Ordering::Relaxed);
+
+        // 检查 CLIENT PAUSE：如果处于暂停状态，等待直到超时或被 UNPAUSE
+        // 注意：CLIENT PAUSE/UNPAUSE 命令本身不受暂停影响
+        let skip_pause = matches!(cmd, Command::ClientPause { .. } | Command::ClientUnpause);
+        if !skip_pause {
+            loop {
+                let pause_until = CLIENT_PAUSE_UNTIL_MS.load(Ordering::Relaxed);
+                if pause_until == 0 {
+                    break;
+                }
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                if now_ms >= pause_until {
+                    // 超时自动解除
+                    CLIENT_PAUSE_UNTIL_MS.store(0, Ordering::Relaxed);
+                    break;
+                }
+                // 等待一小段时间后重试
+                sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        // 记录命令开始时间用于慢日志
+        let cmd_start = Instant::now();
+        let cmd_strings = command_to_strings(&cmd);
 
         match &cmd {
             Command::Auth { .. } => {
@@ -2820,7 +4264,11 @@ async fn handle_connection(
                     transaction_aborted = false;
                     queued_commands.clear();
                     watched_keys.clear();
-                    respond_error(&mut write_half, "EXECABORT Transaction discarded because of previous errors.").await?;
+                    respond_error(
+                        &mut write_half,
+                        "EXECABORT Transaction discarded because of previous errors.",
+                    )
+                    .await?;
                     continue;
                 }
 
@@ -2854,6 +4302,7 @@ async fn handle_connection(
                         &storage,
                         &mut write_half,
                         current_db,
+                        &script_cache,
                     )
                     .await?;
                 }
@@ -2873,8 +4322,7 @@ async fn handle_connection(
             }
             Command::Watch { keys } => {
                 if in_transaction {
-                    respond_error(&mut write_half, "ERR WATCH inside MULTI is not allowed")
-                        .await?;
+                    respond_error(&mut write_half, "ERR WATCH inside MULTI is not allowed").await?;
                 } else {
                     for key in keys {
                         let physical = prefix_key(current_db, key);
@@ -2927,6 +4375,10 @@ async fn handle_connection(
             | Command::Decrby { .. }
             | Command::Incrbyfloat { .. }
             | Command::Del { .. }
+            | Command::Unlink { .. }
+            | Command::Copy { .. }
+            | Command::Touch { .. }
+            | Command::ObjectEncoding { .. }
             | Command::Exists { .. }
             | Command::Mget { .. }
             | Command::Mset { .. }
@@ -2951,7 +4403,13 @@ async fn handle_connection(
             | Command::Llen { .. }
             | Command::Lindex { .. }
             | Command::Lrem { .. }
-            | Command::Ltrim { .. } => {
+            | Command::Ltrim { .. }
+            | Command::Lset { .. }
+            | Command::Linsert { .. }
+            | Command::Rpoplpush { .. }
+            | Command::Blpop { .. }
+            | Command::Brpop { .. }
+            | Command::Lpos { .. } => {
                 handle_list_command(cmd, &storage, &mut write_half, current_db).await?;
             }
 
@@ -2969,6 +4427,7 @@ async fn handle_connection(
             | Command::Sunionstore { .. }
             | Command::Sinterstore { .. }
             | Command::Sdiffstore { .. }
+            | Command::Smove { .. }
             | Command::Sscan { .. } => {
                 handle_set_command(cmd, &storage, &mut write_half, current_db).await?;
             }
@@ -2985,6 +4444,9 @@ async fn handle_connection(
             | Command::Hincrby { .. }
             | Command::Hincrbyfloat { .. }
             | Command::Hlen { .. }
+            | Command::Hsetnx { .. }
+            | Command::Hstrlen { .. }
+            | Command::Hmset { .. }
             | Command::Hscan { .. } => {
                 handle_hash_command(cmd, &storage, &mut write_half, current_db).await?;
             }
@@ -2996,6 +4458,18 @@ async fn handle_connection(
             | Command::Zscore { .. }
             | Command::Zrem { .. }
             | Command::Zincrby { .. }
+            | Command::Zcount { .. }
+            | Command::Zrank { .. }
+            | Command::Zrevrank { .. }
+            | Command::Zpopmin { .. }
+            | Command::Zpopmax { .. }
+            | Command::Zinter { .. }
+            | Command::Zunion { .. }
+            | Command::Zdiff { .. }
+            | Command::Zinterstore { .. }
+            | Command::Zunionstore { .. }
+            | Command::Zdiffstore { .. }
+            | Command::Zlexcount { .. }
             | Command::Zscan { .. } => {
                 handle_zset_command(cmd, &storage, &mut write_half, current_db).await?;
             }
@@ -3014,8 +4488,12 @@ async fn handle_connection(
             // key 元信息、过期相关命令
             Command::Expire { .. }
             | Command::Pexpire { .. }
+            | Command::Expireat { .. }
+            | Command::Pexpireat { .. }
             | Command::Ttl { .. }
             | Command::Pttl { .. }
+            | Command::Expiretime { .. }
+            | Command::Pexpiretime { .. }
             | Command::Persist { .. }
             | Command::Type { .. }
             | Command::Keys { .. }
@@ -3362,7 +4840,11 @@ async fn handle_connection(
             }
 
             // 事务命令已在前面处理，这里不应该到达
-            Command::Multi | Command::Exec | Command::Discard | Command::Watch { .. } | Command::Unwatch => {
+            Command::Multi
+            | Command::Exec
+            | Command::Discard
+            | Command::Watch { .. }
+            | Command::Unwatch => {
                 unreachable!("transaction commands should be handled earlier");
             }
 
@@ -3370,7 +4852,7 @@ async fn handle_connection(
             Command::Eval { script, keys, args } => {
                 // 缓存脚本
                 script_cache.load(&script);
-                
+
                 let ctx = ScriptContext {
                     storage: Arc::new(storage.clone()),
                     current_db: current_db as u32,
@@ -3387,30 +4869,32 @@ async fn handle_connection(
                     }
                 }
             }
-            Command::Evalsha { sha1, keys, args } => {
-                match script_cache.get(&sha1) {
-                    Some(script) => {
-                        let ctx = ScriptContext {
-                            storage: Arc::new(storage.clone()),
-                            current_db: current_db as u32,
-                            keys,
-                            args,
-                        };
-                        match execute_script(&script, ctx) {
-                            Ok(result) => {
-                                let resp = result.to_resp_bytes();
-                                write_half.write_all(&resp).await?;
-                            }
-                            Err(e) => {
-                                respond_error(&mut write_half, &e).await?;
-                            }
+            Command::Evalsha { sha1, keys, args } => match script_cache.get(&sha1) {
+                Some(script) => {
+                    let ctx = ScriptContext {
+                        storage: Arc::new(storage.clone()),
+                        current_db: current_db as u32,
+                        keys,
+                        args,
+                    };
+                    match execute_script(&script, ctx) {
+                        Ok(result) => {
+                            let resp = result.to_resp_bytes();
+                            write_half.write_all(&resp).await?;
+                        }
+                        Err(e) => {
+                            respond_error(&mut write_half, &e).await?;
                         }
                     }
-                    None => {
-                        respond_error(&mut write_half, "NOSCRIPT No matching script. Please use EVAL.").await?;
-                    }
                 }
-            }
+                None => {
+                    respond_error(
+                        &mut write_half,
+                        "NOSCRIPT No matching script. Please use EVAL.",
+                    )
+                    .await?;
+                }
+            },
             Command::ScriptLoad { script } => {
                 let sha1 = script_cache.load(&script);
                 respond_bulk_string(&mut write_half, &sha1).await?;
@@ -3431,7 +4915,7 @@ async fn handle_connection(
             // 运维命令
             Command::ConfigGet { pattern } => {
                 // 返回匹配的配置参数
-                let configs = get_config_values(&pattern);
+                let configs = get_config_values(&pattern, &storage, &slowlog);
                 let mut resp = format!("*{}\r\n", configs.len() * 2);
                 for (key, value) in configs {
                     resp.push_str(&format!("${}\r\n{}\r\n", key.len(), key));
@@ -3441,7 +4925,7 @@ async fn handle_connection(
             }
             Command::ConfigSet { parameter, value } => {
                 // 尝试设置配置参数
-                match set_config_value(&parameter, &value) {
+                match set_config_value(&parameter, &value, &storage, &slowlog) {
                     Ok(()) => respond_simple_string(&mut write_half, "OK").await?,
                     Err(e) => respond_error(&mut write_half, &e).await?,
                 }
@@ -3451,7 +4935,9 @@ async fn handle_connection(
                 let info = format!(
                     "id={} addr={} name={} db={}\n",
                     client_id,
-                    peer_addr.map(|a| a.to_string()).unwrap_or_else(|| "unknown".to_string()),
+                    peer_addr
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
                     client_name,
                     current_db
                 );
@@ -3473,16 +4959,59 @@ async fn handle_connection(
                     write_half.write_all(resp.as_bytes()).await?;
                 }
             }
+            Command::ClientPause { timeout_ms } => {
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let until = now_ms.saturating_add(timeout_ms);
+                CLIENT_PAUSE_UNTIL_MS.store(until, Ordering::Relaxed);
+                respond_simple_string(&mut write_half, "OK").await?;
+            }
+            Command::ClientUnpause => {
+                CLIENT_PAUSE_UNTIL_MS.store(0, Ordering::Relaxed);
+                respond_simple_string(&mut write_half, "OK").await?;
+            }
             Command::SlowlogGet { count } => {
-                // 简化实现：返回空数组
-                let _ = count;
-                write_half.write_all(b"*0\r\n").await?;
+                let entries = slowlog.get(count);
+                // Redis SLOWLOG GET 返回格式:
+                // *N (N 条记录)
+                //   *6 (每条记录 6 个字段)
+                //     :id
+                //     :timestamp
+                //     :duration_us
+                //     *M (命令参数数组)
+                //     $client_addr
+                //     $client_name
+                let mut resp = format!("*{}\r\n", entries.len());
+                for entry in entries {
+                    resp.push_str("*6\r\n");
+                    resp.push_str(&format!(":{}\r\n", entry.id));
+                    resp.push_str(&format!(":{}\r\n", entry.timestamp));
+                    resp.push_str(&format!(":{}\r\n", entry.duration_us));
+                    resp.push_str(&format!("*{}\r\n", entry.command.len()));
+                    for arg in &entry.command {
+                        resp.push_str(&format!("${}\r\n{}\r\n", arg.len(), arg));
+                    }
+                    resp.push_str(&format!(
+                        "${}\r\n{}\r\n",
+                        entry.client_addr.len(),
+                        entry.client_addr
+                    ));
+                    resp.push_str(&format!(
+                        "${}\r\n{}\r\n",
+                        entry.client_name.len(),
+                        entry.client_name
+                    ));
+                }
+                write_half.write_all(resp.as_bytes()).await?;
             }
             Command::SlowlogReset => {
+                slowlog.reset();
                 respond_simple_string(&mut write_half, "OK").await?;
             }
             Command::SlowlogLen => {
-                respond_integer(&mut write_half, 0).await?;
+                respond_integer(&mut write_half, slowlog.len() as i64).await?;
             }
 
             // 解析阶段构造的错误命令
@@ -3501,6 +5030,10 @@ async fn handle_connection(
                 respond_error(&mut write_half, &msg).await?;
             }
         }
+
+        // 记录慢日志
+        let duration_us = cmd_start.elapsed().as_micros() as u64;
+        slowlog.log_if_slow(duration_us, cmd_strings, &client_addr, &client_name);
     }
 
     let chan_len = channel_subscriptions.len();
@@ -3543,8 +5076,17 @@ pub async fn serve(
         .ok()
         .and_then(|s| parse_maxmemory_bytes(&s))
         .filter(|v| *v > 0);
+    let maxmemory_policy = env::var("REDUST_MAXMEMORY_POLICY")
+        .ok()
+        .and_then(|s| parse_maxmemory_policy(&s))
+        .unwrap_or(MaxmemoryPolicy::AllKeysLru);
+    let maxmemory_samples = env::var("REDUST_MAXMEMORY_SAMPLES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|v| *v > 0);
 
-    let storage = Storage::new(maxmemory_bytes);
+    let storage = Storage::new(maxmemory_bytes, maxmemory_samples);
+    storage.set_maxmemory_policy(maxmemory_policy);
 
     let rdb_path = env::var("REDUST_RDB_PATH").unwrap_or_else(|_| "redust.rdb".to_string());
     let persistence_disabled = env::var("REDUST_DISABLE_PERSISTENCE")
@@ -3582,6 +5124,11 @@ pub async fn serve(
                     }
                     Err(e) => {
                         error!("[aof] failed to load AOF snapshot {}: {}", path, e);
+                        if let Some(new_path) = quarantine_corrupt_file(&path) {
+                            error!("[aof] quarantined corrupt file to {}", new_path);
+                        } else {
+                            error!("[aof] failed to quarantine corrupt file {}", path);
+                        }
                     }
                 }
             }
@@ -3590,6 +5137,11 @@ pub async fn serve(
         if !loaded_ok {
             if let Err(e) = storage.load_rdb(&rdb_path) {
                 error!("[rdb] failed to load RDB from {}: {}", rdb_path, e);
+                if let Some(new_path) = quarantine_corrupt_file(&rdb_path) {
+                    error!("[rdb] quarantined corrupt file to {}", new_path);
+                } else {
+                    error!("[rdb] failed to quarantine corrupt file {}", rdb_path);
+                }
             } else {
                 if let Some(ts) = file_mtime_seconds(&rdb_path) {
                     persistence.last_save.store(ts, Ordering::Relaxed);
@@ -3645,9 +5197,12 @@ pub async fn serve(
                 interval.tick().await;
                 loop {
                     interval.tick().await;
-                    if let Err(e) =
-                        perform_save(storage_clone.clone(), path.clone(), persistence_clone.clone())
-                            .await
+                    if let Err(e) = perform_save(
+                        storage_clone.clone(),
+                        path.clone(),
+                        persistence_clone.clone(),
+                    )
+                    .await
                     {
                         error!("[aof] everysec save failed: {}", e);
                     }
@@ -3668,6 +5223,7 @@ pub async fn serve(
         pubsub_messages_delivered: AtomicU64::new(0),
         pubsub_messages_dropped: AtomicU64::new(0),
     });
+    let slowlog = Arc::new(SlowLog::new());
     let pubsub = PubSubHub::new();
     let script_cache = Arc::new(ScriptCache::new());
 
@@ -3703,8 +5259,9 @@ pub async fn serve(
                 info!("Accepted connection from {}", addr);
                 let persistence_clone = persistence.clone();
                 let script_cache_clone = script_cache.clone();
+                let slowlog_clone = slowlog.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_connection(stream, storage, metrics, pubsub, overflow_strategy, persistence_clone.clone(), script_cache_clone).await {
+                    if let Err(err) = handle_connection(stream, storage, metrics, pubsub, overflow_strategy, persistence_clone.clone(), script_cache_clone, slowlog_clone).await {
                         error!("Connection error: {}", err);
                     }
                 });
@@ -3750,48 +5307,128 @@ pub async fn run_server(
 // ============================================================================
 
 /// 获取匹配模式的配置值
-fn get_config_values(pattern: &str) -> Vec<(String, String)> {
+fn get_config_values(pattern: &str, storage: &Storage, slowlog: &SlowLog) -> Vec<(String, String)> {
     let mut results = Vec::new();
-    
+
     // 支持的配置参数
+    let maxmemory = storage.maxmemory_bytes().unwrap_or(0);
+    let policy = storage.maxmemory_policy().as_str().to_string();
+    let maxmemory_samples = storage.maxmemory_samples().to_string();
     let configs = [
-        ("maxmemory", env::var("REDUST_MAXMEMORY_BYTES").unwrap_or_else(|_| "0".to_string())),
-        ("maxmemory-policy", "noeviction".to_string()),
-        ("timeout", "0".to_string()),
-        ("tcp-keepalive", "300".to_string()),
+        ("maxmemory", maxmemory.to_string()),
+        ("maxmemory-policy", policy),
+        ("maxmemory-samples", maxmemory_samples),
+        (
+            "timeout",
+            CLIENT_TIMEOUT_SECS.load(Ordering::Relaxed).to_string(),
+        ),
+        (
+            "tcp-keepalive",
+            TCP_KEEPALIVE_SECS.load(Ordering::Relaxed).to_string(),
+        ),
         ("databases", "16".to_string()),
         ("save", "".to_string()),
-        ("appendonly", env::var("REDUST_AOF_ENABLED").unwrap_or_else(|_| "no".to_string())),
+        (
+            "appendonly",
+            env::var("REDUST_AOF_ENABLED").unwrap_or_else(|_| "no".to_string()),
+        ),
         ("appendfsync", "everysec".to_string()),
         ("dir", ".".to_string()),
-        ("dbfilename", env::var("REDUST_RDB_PATH").unwrap_or_else(|_| "redust.rdb".to_string())),
-        ("appendfilename", env::var("REDUST_AOF_PATH").unwrap_or_else(|_| "redust.aof".to_string())),
-        ("requirepass", if env::var("REDUST_AUTH_PASSWORD").is_ok() { "yes".to_string() } else { "".to_string() }),
+        (
+            "dbfilename",
+            env::var("REDUST_RDB_PATH").unwrap_or_else(|_| "redust.rdb".to_string()),
+        ),
+        (
+            "appendfilename",
+            env::var("REDUST_AOF_PATH").unwrap_or_else(|_| "redust.aof".to_string()),
+        ),
+        (
+            "requirepass",
+            if env::var("REDUST_AUTH_PASSWORD").is_ok() {
+                "yes".to_string()
+            } else {
+                "".to_string()
+            },
+        ),
         ("loglevel", "notice".to_string()),
-        ("slowlog-log-slower-than", "10000".to_string()),
-        ("slowlog-max-len", "128".to_string()),
+        (
+            "slowlog-log-slower-than",
+            slowlog.threshold_us().to_string(),
+        ),
+        ("slowlog-max-len", slowlog.max_len().to_string()),
     ];
-    
+
     for (key, value) in configs {
         if pattern_match_config(pattern, key) {
             results.push((key.to_string(), value));
         }
     }
-    
+
     results
 }
 
 /// 设置配置值（大多数配置在运行时不可修改）
-fn set_config_value(parameter: &str, _value: &str) -> Result<(), String> {
-    // 大多数配置在运行时不可修改，返回错误
+fn set_config_value(
+    parameter: &str,
+    value: &str,
+    storage: &Storage,
+    slowlog: &SlowLog,
+) -> Result<(), String> {
     match parameter.to_lowercase().as_str() {
-        "maxmemory" | "timeout" | "tcp-keepalive" | "slowlog-log-slower-than" | "slowlog-max-len" => {
-            // 这些配置理论上可以动态修改，但我们简化实现，暂不支持
-            Err(format!("ERR Unsupported CONFIG parameter: {}", parameter))
+        "maxmemory" => {
+            let bytes = parse_maxmemory_bytes(value)
+                .ok_or_else(|| "ERR invalid maxmemory value".to_string())?;
+            storage.set_maxmemory_bytes(Some(bytes));
+            Ok(())
         }
-        _ => {
-            Err(format!("ERR Unsupported CONFIG parameter: {}", parameter))
+        "maxmemory-policy" => {
+            let policy = parse_maxmemory_policy(value)
+                .ok_or_else(|| "ERR invalid maxmemory-policy value".to_string())?;
+            storage.set_maxmemory_policy(policy);
+            Ok(())
         }
+        "maxmemory-samples" => {
+            let samples: usize = value
+                .parse()
+                .map_err(|_| "ERR invalid maxmemory-samples value".to_string())?;
+            if samples == 0 {
+                return Err("ERR maxmemory-samples must be positive".to_string());
+            }
+            storage.set_maxmemory_samples(samples);
+            Ok(())
+        }
+        "timeout" => {
+            let secs: u64 = value
+                .parse()
+                .map_err(|_| "ERR invalid timeout value".to_string())?;
+            CLIENT_TIMEOUT_SECS.store(secs, Ordering::Relaxed);
+            Ok(())
+        }
+        "tcp-keepalive" => {
+            let secs: u64 = value
+                .parse()
+                .map_err(|_| "ERR invalid tcp-keepalive value".to_string())?;
+            TCP_KEEPALIVE_SECS.store(secs, Ordering::Relaxed);
+            Ok(())
+        }
+        "slowlog-log-slower-than" => {
+            let us: u64 = value
+                .parse()
+                .map_err(|_| "ERR invalid slowlog-log-slower-than value".to_string())?;
+            slowlog.set_threshold_us(us);
+            Ok(())
+        }
+        "slowlog-max-len" => {
+            let len: usize = value
+                .parse()
+                .map_err(|_| "ERR invalid slowlog-max-len value".to_string())?;
+            if len == 0 {
+                return Err("ERR slowlog-max-len must be positive".to_string());
+            }
+            slowlog.set_max_len(len);
+            Ok(())
+        }
+        _ => Err(format!("ERR Unsupported CONFIG parameter: {}", parameter)),
     }
 }
 

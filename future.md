@@ -5,6 +5,101 @@
 
 ---
 
+## 🎉 Phase B: 命令补全完成总结（2025-12）
+
+### 已完成命令（25+ 个）
+
+#### Hash 命令
+- ✅ HSETNX - 字段不存在时设置
+- ✅ HSTRLEN - 获取字段值长度
+- ✅ HMSET - 批量设置字段
+
+#### List 命令
+- ✅ LTRIM - 裁剪列表
+- ✅ LSET - 设置指定索引元素
+- ✅ LINSERT - 在指定元素前/后插入
+- ✅ RPOPLPUSH - 弹出并推入另一列表
+- ✅ LPOS - 查找元素位置
+
+#### Sorted Set 命令
+- ✅ ZCOUNT - 统计分数范围内的成员数
+- ✅ ZRANK / ZREVRANK - 获取成员排名
+- ✅ ZPOPMIN / ZPOPMAX - 弹出最小/最大分数成员
+- ✅ ZINTER / ZUNION / ZDIFF - 集合运算（支持 WEIGHTS/AGGREGATE/WITHSCORES）
+- ✅ ZINTERSTORE / ZUNIONSTORE / ZDIFFSTORE - 集合运算并存储
+- ✅ ZLEXCOUNT - 字典序范围计数
+
+#### Generic 命令
+- ✅ COPY - 复制键（支持 REPLACE 选项）
+- ✅ UNLINK - 异步删除（简化实现）
+- ✅ TOUCH - 更新访问时间
+- ✅ OBJECT ENCODING - 获取对象编码类型
+
+#### Expire 命令
+- ✅ EXPIREAT - 设置绝对过期时间（Unix 秒）
+- ✅ PEXPIREAT - 设置绝对过期时间（Unix 毫秒）
+- ✅ EXPIRETIME - 获取绝对过期时间（Unix 秒）
+- ✅ PEXPIRETIME - 获取绝对过期时间（Unix 毫秒）
+
+### 测试覆盖
+- 所有新增命令均有对应的集成测试
+- 测试覆盖正常路径、边界条件、错误处理
+
+---
+
+## 🎉 Phase B: HyperLogLog 完成总结（2025-12）
+
+### 已完成功能
+
+- ✅ **HyperLogLog 核心算法**: 16384 个 6-bit 寄存器，标准误差约 0.81%
+- ✅ **PFADD/PFCOUNT/PFMERGE**: 完整的 HyperLogLog 命令支持
+- ✅ **RDB 持久化**: HyperLogLog 类型序列化/反序列化
+- ✅ **WATCH 集成**: PFADD/PFMERGE 触发键版本更新
+- ✅ **性能测试**: 大量元素添加、多键合并、内存占用验证
+
+### 待优化方向
+
+#### 稀疏表示优化（推荐优先实现）
+
+Redis 的 HyperLogLog 使用两种表示方式来优化内存：
+
+**当前问题**：每个 HLL 固定占用 16KB，即使只添加了 1 个元素。
+
+**Redis 的稀疏表示方案**：
+- 小基数时，直接存储 `(寄存器索引, 计数值)` 对
+- 使用变长编码压缩存储：
+  - `ZERO:len` - 连续 len 个零值寄存器
+  - `XZERO:len` - 连续 len 个零值（扩展，支持更长）
+  - `VAL:value,len` - 连续 len 个相同 value 的寄存器
+- 当稀疏表示超过 ~3000 字节时，自动转换为密集表示
+
+**简化实现方案**（推荐）：
+```rust
+enum HllRepr {
+    // 稀疏：存储非零的 (index, value) 对，按 index 排序
+    // 内存占用：entries.len() * 3 bytes (u16 index + u8 value)
+    Sparse { entries: Vec<(u16, u8)> },
+    
+    // 密集：完整的 16384 个寄存器
+    // 内存占用：16384 bytes
+    Dense { registers: Vec<u8> },
+}
+```
+
+**转换阈值**：当 `entries.len() * 3 > 3000` 时转为密集表示（约 1000 个非零寄存器）
+
+**预期收益**：
+- 1 个元素：~3 bytes vs 16KB（节省 99.98%）
+- 100 个元素：~300 bytes vs 16KB（节省 98%）
+- 1000+ 个元素：自动转为密集表示
+
+#### 其他优化
+
+- **AOF 支持**: PFADD/PFMERGE 命令记录到 AOF
+- **紧凑存储**: 使用 6-bit 紧凑存储替代 u8，将内存从 16KB 降至 12KB（密集表示）
+
+---
+
 ## 🎉 Phase A 完成总结（2025-12）
 
 ### 已完成功能
@@ -193,21 +288,24 @@
 
 > 现状：`SCAN`/`KEYS`/`SSCAN`/`HSCAN`/`ZSCAN` 已实现基础功能，`pattern_match` 支持 `*`、`?`、`[abc]`、`[a-z]`、`\` 转义等 glob 语法。
 
-- [ ] **`[^abc]` 取反字符集支持**
+- [x] **`[^abc]` 取反字符集支持** ✅ 已完成（2025-12）
   - Redis 支持 `[^abc]` 表示"不匹配 a/b/c 中任一字符"。
-  - 当前 `pattern_match` 未实现取反逻辑，需在 `match_set` 中增加对 `^` 前缀的处理。
+  - 已在 `match_set` 中增加对 `^` 前缀的处理，支持取反字符集和取反范围。
 
-- [ ] **SCAN TYPE 选项**
+- [x] **SCAN TYPE 选项** ✅ 已完成（2025-12）
   - Redis 6.0+ 支持 `SCAN cursor TYPE string|list|set|hash|zset` 按类型过滤。
-  - 可在 `Command::Scan` 中增加 `type_filter: Option<String>` 字段，并在扫描时调用 `storage.type_of()` 过滤。
+  - 已在 `Command::Scan` 中增加 `type_filter` 字段，扫描时调用 `storage.type_of()` 过滤。
 
-- [ ] **SCAN NOVALUES 选项（HSCAN/ZSCAN）**
+- [x] **SCAN NOVALUES 选项（HSCAN/ZSCAN）** ✅ 已完成（2025-12）
   - Redis 7.4+ 支持 `HSCAN key cursor NOVALUES` 仅返回 field 不返回 value，减少网络开销。
-  - 可作为后续优化点。
+  - 已实现 HSCAN 和 ZSCAN 的 NOVALUES 选项。
 
-- [ ] **SCAN 游标稳定性与性能**
-  - 当前 SCAN 实现基于 key 列表索引作为 cursor，在并发写入/删除时可能出现重复或遗漏。
-  - 后续可考虑引入更稳定的游标机制（如基于 key 排序后的二分查找位置）。
+- [x] **SCAN 游标稳定性优化** ✅ 已完成（2025-12）
+  - 使用键名哈希值作为游标，替代简单的数组索引。
+  - 游标基于 `DefaultHasher` 计算的 u64 哈希值，按哈希值排序后扫描。
+  - 优点：并发写入/删除时不会产生重复键（已扫描的哈希值不会再次返回）。
+  - 限制：新增键如果哈希值小于当前游标可能被跳过（与 Redis 行为一致）。
+  - 支持完整的 u64 游标范围，解析时使用 `parse_u64_from_bulk`。
 
 ---
 
@@ -231,13 +329,12 @@
     ZADD/ZREM/ZSCORE/ZCARD/ZRANGE/ZREVRANGE、TYPE/TTL/PTTL/EXPIRE/PEXPIRE/PERSIST。
   - `redis.call()` 在错误时抛出 Lua 异常，`redis.pcall()` 返回 `{err = "..."}` 表。
 
-- [ ] **事务中 Lua 脚本支持**
-  - 当前 `EVAL`/`EVALSHA` 在事务中不支持（返回错误）。
-  - 后续可考虑支持在事务中执行脚本。
+- [x] **事务中 Lua 脚本支持** ✅ 已完成（2025-12）
+  - 支持 `EVAL`/`EVALSHA`/`SCRIPT LOAD`/`SCRIPT EXISTS`/`SCRIPT FLUSH` 在 MULTI 中执行。
+  - 脚本在事务中正常执行，结果作为事务响应数组的一部分返回。
 
-- [ ] **事务中更多命令支持**
-  - 当前事务中部分命令（如 `TYPE`、`KEYS`、`SCAN` 等）返回错误。
-  - 后续可逐步支持这些命令在事务中执行。
+- [x] **事务中更多命令支持** ✅ 已完成（2025-12）
+  - 已支持 `TYPE`、`KEYS`、`SCAN`、`DBSIZE` 等元命令在事务中执行。
 
 - [ ] **事务错误处理增强**
   - Redis 在 EXEC 时如果队列中有语法错误命令，会中止整个事务。
@@ -262,25 +359,27 @@
   - 已实现 `SLOWLOG RESET` - 重置慢日志。
   - 已实现 `SLOWLOG LEN` - 获取慢日志长度（当前返回 0）。
 
-- [ ] **CONFIG 动态配置支持**
-  - 当前 CONFIG SET 对大多数参数返回错误。
-  - 后续可支持动态修改部分配置（如 maxmemory、timeout、slowlog-log-slower-than 等）。
-  - 需要考虑配置持久化（写入配置文件或环境变量）。
+- [x] **CONFIG 动态配置支持** ✅（部分完成）
+  - 已支持运行时修改：`maxmemory`、`slowlog-log-slower-than`、`slowlog-max-len`、`timeout`、`tcp-keepalive`（timeout/keepalive 当前仅存值，尚未作用于连接行为）。
+  - 待办：
+    - 使 `timeout`/`tcp-keepalive` 实际生效：在连接处理层应用超时和 keepalive 参数。
+    - 考虑配置持久化（写入配置文件或环境变量）。
+    - 评估是否开放更多动态参数（如 maxmemory-policy）。
 
-- [ ] **SLOWLOG 实际实现**
-  - 当前 SLOWLOG 命令只是占位实现，返回空数据。
-  - 后续需要实现：
-    - 记录执行时间超过阈值的命令。
-    - 维护固定大小的慢日志队列。
-    - 支持 SLOWLOG GET/RESET/LEN 的完整语义。
+- [x] **SLOWLOG 实际实现** ✅ 已完成（2025-12）
+  - 已实现完整的慢日志功能：记录超过阈值的命令、维护固定大小队列。
+  - 支持 SLOWLOG GET/RESET/LEN 完整语义。
+  - 环境变量配置：REDUST_SLOWLOG_SLOWER_THAN（微秒）、REDUST_SLOWLOG_MAX_LEN。
 
-- [ ] **CLIENT 命令扩展**
-  - 当前仅支持 LIST/ID/SETNAME/GETNAME。
-  - 后续可支持：
-    - `CLIENT PAUSE timeout` - 暂停所有客户端。
-    - `CLIENT UNBLOCK client-id` - 解除阻塞的客户端。
-    - `CLIENT KILL` - 关闭指定客户端连接。
+- [x] **CLIENT 命令扩展**（部分完成）
+  - 已支持：LIST/ID/SETNAME/GETNAME/PAUSE/UNPAUSE。
+  - 待实现：
+    - `CLIENT UNBLOCK client-id [TIMEOUT|ERROR]` - 解除阻塞的客户端（需要阻塞命令支持，如 BLPOP）。
+    - `CLIENT KILL [ID client-id] [ADDR ip:port] [TYPE normal|master|slave|pubsub]` - 关闭指定客户端连接。
     - `CLIENT REPLY ON|OFF|SKIP` - 控制响应行为。
+    - `CLIENT NO-EVICT ON|OFF` - 标记客户端不被驱逐。
+    - `CLIENT CACHING YES|NO` - 客户端缓存控制。
+    - `CLIENT TRACKINGINFO` - 获取客户端追踪信息。
 
 - [ ] **INFO 命令实现**
   - 实现 `INFO [section]` 命令，返回服务器状态信息。
@@ -295,13 +394,23 @@
 
 ## 列表 / 集合命令增强（V2）
 
-- [ ] **列表高级命令与阻塞语义预研**
-  - 评估并规划 `LINSERT` / `LSET` / `BLPOP` / `BRPOP` 等命令的最小子集实现。
+- [x] **列表高级命令** ✅ 已完成
+  - 已实现 `LINSERT` / `LSET` / `LTRIM` / `RPOPLPUSH` / `LPOS`
+  - 🔄 待实现：`BLPOP` / `BRPOP` 等阻塞语义命令
   - 思考阻塞列表操作在当前 Tokio 并发模型下的实现方式（例如：每 key 的等待队列 vs 全局调度）。
 
-- [ ] **集合命令扩展与性能调优**
-  - 在现有 `SADD` / `SMEMBERS` / `SISMEMBER` / `SCARD` / `SUNION` / `SINTER` / `SDIFF` 基础上，评估是否需要 `SPOP` / `SRANDMEMBER` / `SMOVE` / `*STORE` 等命令。
-  - 对大集合场景下的 `SUNION` / `SINTER` / `SDIFF` 做性能 Profiling，记录潜在优化方向（如减少分配、选择更合适的数据结构）。
+- [x] **集合命令扩展与性能调优** ✅ 已完成（2025-12）
+  - 已实现 `SPOP` / `SRANDMEMBER` / `SMOVE` / `SUNIONSTORE` / `SINTERSTORE` / `SDIFFSTORE` 等命令。
+  - 性能优化：
+    - 移除 `SUNION`/`SINTER`/`SDIFF` 返回结果的不必要排序（Redis 不保证顺序）。
+    - `SUNION`/`SUNIONSTORE` 使用 `extend` 替代循环插入。
+    - `SDIFF`/`SDIFFSTORE` 使用 `retain` 替代遍历后续集合，并添加早期退出优化。
+  - 基准测试提升：`set_union` +17%，`set_difference` +8%。
+
+- [x] **Sorted Set 高级命令** ✅ 已完成
+  - 已实现 `ZCOUNT` / `ZRANK` / `ZREVRANK` / `ZPOPMIN` / `ZPOPMAX`
+  - 已实现 `ZINTER` / `ZUNION` / `ZDIFF` 及其 STORE 变体（支持 WEIGHTS/AGGREGATE）
+  - 已实现 `ZLEXCOUNT` 字典序范围计数
 
 > 后续如果有新的“第二阶段”想法（例如 Hash/List/Stream 的高级特性），可以在本文件中按模块继续追加章节。例如：
 >

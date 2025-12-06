@@ -170,6 +170,39 @@ async fn responds_to_basic_commands() {
 }
 
 #[tokio::test]
+async fn pipeline_roundtrip_is_fast_enough() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 发送一批 PING（pipeline），验证响应顺序与延迟
+    let batch = 200;
+    let mut buf = String::new();
+    for _ in 0..batch {
+        buf.push_str("*1\r\n$4\r\nPING\r\n");
+    }
+    let start = Instant::now();
+    write_half.write_all(buf.as_bytes()).await.unwrap();
+
+    for _ in 0..batch {
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert_eq!(line, "+PONG\r\n");
+    }
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "pipeline roundtrip too slow: {:?}",
+        elapsed
+    );
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn rename_and_flush_commands_behaviour() {
     let (addr, shutdown, handle) = spawn_server().await;
 
@@ -1845,4 +1878,858 @@ async fn performance_ping_round_trips() {
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
+}
+
+// ============ Hash 命令测试 ============
+
+async fn read_line_helper(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> String {
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    line
+}
+
+#[tokio::test]
+async fn test_hsetnx() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // HSETNX 新字段应返回 1
+    send_array(&mut write_half, &["HSETNX", "myhash", "field1", "value1"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":1\r\n");
+
+    // HSETNX 已存在字段应返回 0
+    send_array(&mut write_half, &["HSETNX", "myhash", "field1", "value2"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":0\r\n");
+
+    // 验证值未被覆盖
+    send_array(&mut write_half, &["HGET", "myhash", "field1"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "$6\r\n");
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "value1\r\n");
+
+    // HSETNX 对不存在的 key 应创建 Hash
+    send_array(&mut write_half, &["HSETNX", "newhash", "f", "v"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":1\r\n");
+
+    // 验证类型
+    send_array(&mut write_half, &["TYPE", "newhash"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "+hash\r\n");
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_hstrlen() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 设置字段
+    send_array(&mut write_half, &["HSET", "myhash", "field1", "hello"]).await;
+    let _ = read_line_helper(&mut reader).await;
+
+    // HSTRLEN 返回字段值长度
+    send_array(&mut write_half, &["HSTRLEN", "myhash", "field1"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":5\r\n");
+
+    // HSTRLEN 不存在的字段返回 0
+    send_array(&mut write_half, &["HSTRLEN", "myhash", "nofield"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":0\r\n");
+
+    // HSTRLEN 不存在的 key 返回 0
+    send_array(&mut write_half, &["HSTRLEN", "nokey", "field"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":0\r\n");
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_hmset() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // HMSET 批量设置
+    send_array(
+        &mut write_half,
+        &["HMSET", "myhash", "f1", "v1", "f2", "v2", "f3", "v3"],
+    )
+    .await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "+OK\r\n");
+
+    // 验证所有字段
+    send_array(&mut write_half, &["HGET", "myhash", "f1"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "$2\r\n");
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "v1\r\n");
+
+    send_array(&mut write_half, &["HGET", "myhash", "f2"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "$2\r\n");
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "v2\r\n");
+
+    send_array(&mut write_half, &["HGET", "myhash", "f3"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "$2\r\n");
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "v3\r\n");
+
+    // HMSET 覆盖已有字段
+    send_array(&mut write_half, &["HMSET", "myhash", "f1", "new_v1"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "+OK\r\n");
+
+    send_array(&mut write_half, &["HGET", "myhash", "f1"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "$6\r\n");
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "new_v1\r\n");
+
+    // HLEN 验证字段数量
+    send_array(&mut write_half, &["HLEN", "myhash"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":3\r\n");
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_hash_wrongtype() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 创建 String 类型
+    send_array(&mut write_half, &["SET", "strkey", "value"]).await;
+    let _ = read_line_helper(&mut reader).await;
+
+    // HSETNX 对 String 类型应返回 WRONGTYPE
+    send_array(&mut write_half, &["HSETNX", "strkey", "field", "val"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert!(resp.starts_with("-WRONGTYPE"));
+
+    // HSTRLEN 对 String 类型应返回 WRONGTYPE
+    send_array(&mut write_half, &["HSTRLEN", "strkey", "field"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert!(resp.starts_with("-WRONGTYPE"));
+
+    // HMSET 对 String 类型应返回 WRONGTYPE
+    send_array(&mut write_half, &["HMSET", "strkey", "f", "v"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert!(resp.starts_with("-WRONGTYPE"));
+
+    let _ = shutdown.send(());
+}
+
+// ============ List 命令测试 ============
+
+#[tokio::test]
+async fn test_lset() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 创建列表
+    send_array(&mut write_half, &["RPUSH", "mylist", "a", "b", "c"]).await;
+    let _ = read_line_helper(&mut reader).await;
+
+    // LSET 正常设置
+    send_array(&mut write_half, &["LSET", "mylist", "1", "B"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "+OK\r\n");
+
+    // 验证
+    send_array(&mut write_half, &["LINDEX", "mylist", "1"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "$1\r\n");
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "B\r\n");
+
+    // LSET 负索引
+    send_array(&mut write_half, &["LSET", "mylist", "-1", "C"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "+OK\r\n");
+
+    // LSET 索引越界
+    send_array(&mut write_half, &["LSET", "mylist", "10", "x"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert!(resp.starts_with("-ERR index out of range"));
+
+    // LSET 不存在的 key
+    send_array(&mut write_half, &["LSET", "nokey", "0", "x"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert!(resp.starts_with("-ERR no such key"));
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_linsert() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 创建列表
+    send_array(&mut write_half, &["RPUSH", "mylist", "a", "c"]).await;
+    let _ = read_line_helper(&mut reader).await;
+
+    // LINSERT BEFORE
+    send_array(&mut write_half, &["LINSERT", "mylist", "BEFORE", "c", "b"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":3\r\n");
+
+    // LINSERT AFTER
+    send_array(&mut write_half, &["LINSERT", "mylist", "AFTER", "c", "d"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":4\r\n");
+
+    // 验证顺序 a, b, c, d
+    send_array(&mut write_half, &["LRANGE", "mylist", "0", "-1"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "*4\r\n");
+    // 读取 4 个元素（每个元素 2 行：长度 + 值）
+    for _ in 0..8 {
+        let _ = read_line_helper(&mut reader).await;
+    }
+
+    // LINSERT pivot 不存在返回 -1
+    send_array(&mut write_half, &["LINSERT", "mylist", "BEFORE", "x", "y"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":-1\r\n");
+
+    // LINSERT key 不存在返回 0
+    send_array(&mut write_half, &["LINSERT", "nokey", "BEFORE", "a", "b"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":0\r\n");
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_rpoplpush() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 创建源列表
+    send_array(&mut write_half, &["RPUSH", "src", "a", "b", "c"]).await;
+    let _ = read_line_helper(&mut reader).await;
+
+    // RPOPLPUSH
+    send_array(&mut write_half, &["RPOPLPUSH", "src", "dst"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "$1\r\n");
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "c\r\n");
+
+    // 验证 src 剩余 a, b
+    send_array(&mut write_half, &["LLEN", "src"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":2\r\n");
+
+    // 验证 dst 有 c
+    send_array(&mut write_half, &["LRANGE", "dst", "0", "-1"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "*1\r\n");
+    // 读取 1 个元素
+    let _ = read_line_helper(&mut reader).await; // $1
+    let _ = read_line_helper(&mut reader).await; // c
+
+    // RPOPLPUSH 空列表返回 null
+    send_array(&mut write_half, &["RPOPLPUSH", "empty", "dst"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "$-1\r\n");
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_lpos() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 创建列表
+    send_array(
+        &mut write_half,
+        &["RPUSH", "mylist", "a", "b", "c", "b", "d", "b"],
+    )
+    .await;
+    let _ = read_line_helper(&mut reader).await;
+
+    // LPOS 基本查找
+    send_array(&mut write_half, &["LPOS", "mylist", "b"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":1\r\n");
+
+    // LPOS 元素不存在返回 null
+    send_array(&mut write_half, &["LPOS", "mylist", "x"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "$-1\r\n");
+
+    // LPOS COUNT 返回多个位置
+    send_array(&mut write_half, &["LPOS", "mylist", "b", "COUNT", "2"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "*2\r\n");
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":1\r\n");
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":3\r\n");
+
+    // LPOS key 不存在返回 null
+    send_array(&mut write_half, &["LPOS", "nokey", "a"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "$-1\r\n");
+
+    let _ = shutdown.send(());
+}
+
+// ============ Sorted Set 命令测试 ============
+
+#[tokio::test]
+async fn test_zcount() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 创建 sorted set
+    send_array(
+        &mut write_half,
+        &[
+            "ZADD", "myzset", "1", "a", "2", "b", "3", "c", "4", "d", "5", "e",
+        ],
+    )
+    .await;
+    let _ = read_line_helper(&mut reader).await;
+
+    // ZCOUNT 全范围
+    send_array(&mut write_half, &["ZCOUNT", "myzset", "-inf", "+inf"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":5\r\n");
+
+    // ZCOUNT 指定范围
+    send_array(&mut write_half, &["ZCOUNT", "myzset", "2", "4"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":3\r\n");
+
+    // ZCOUNT exclusive
+    send_array(&mut write_half, &["ZCOUNT", "myzset", "(2", "4"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":2\r\n");
+
+    // ZCOUNT 不存在的 key
+    send_array(&mut write_half, &["ZCOUNT", "nokey", "0", "10"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":0\r\n");
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_zrank_zrevrank() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 创建 sorted set
+    send_array(
+        &mut write_half,
+        &["ZADD", "myzset", "1", "a", "2", "b", "3", "c"],
+    )
+    .await;
+    let _ = read_line_helper(&mut reader).await;
+
+    // ZRANK
+    send_array(&mut write_half, &["ZRANK", "myzset", "a"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":0\r\n");
+
+    send_array(&mut write_half, &["ZRANK", "myzset", "c"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":2\r\n");
+
+    // ZRANK 不存在的成员
+    send_array(&mut write_half, &["ZRANK", "myzset", "x"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "$-1\r\n");
+
+    // ZREVRANK
+    send_array(&mut write_half, &["ZREVRANK", "myzset", "a"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":2\r\n");
+
+    send_array(&mut write_half, &["ZREVRANK", "myzset", "c"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":0\r\n");
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_zpopmin_zpopmax() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 创建 sorted set
+    send_array(
+        &mut write_half,
+        &["ZADD", "myzset", "1", "a", "2", "b", "3", "c"],
+    )
+    .await;
+    let _ = read_line_helper(&mut reader).await;
+
+    // ZPOPMIN
+    send_array(&mut write_half, &["ZPOPMIN", "myzset"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "*2\r\n");
+    let _ = read_line_helper(&mut reader).await; // $1
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "a\r\n");
+    let _ = read_line_helper(&mut reader).await; // $1
+    let _ = read_line_helper(&mut reader).await; // 1
+
+    // ZPOPMAX
+    send_array(&mut write_half, &["ZPOPMAX", "myzset"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "*2\r\n");
+    let _ = read_line_helper(&mut reader).await; // $1
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "c\r\n");
+
+    // 验证剩余只有 b
+    send_array(&mut write_half, &["ZCARD", "myzset"]).await;
+    // 先读取 ZPOPMAX 剩余的响应
+    let _ = read_line_helper(&mut reader).await; // $1
+    let _ = read_line_helper(&mut reader).await; // 3
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":1\r\n");
+
+    // ZPOPMIN 空 set
+    send_array(&mut write_half, &["ZPOPMIN", "empty"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "*0\r\n");
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_zinter_zunion_zdiff() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 创建两个 sorted set
+    send_array(
+        &mut write_half,
+        &["ZADD", "zset1", "1", "a", "2", "b", "3", "c"],
+    )
+    .await;
+    let _ = read_line_helper(&mut reader).await;
+    send_array(
+        &mut write_half,
+        &["ZADD", "zset2", "2", "b", "3", "c", "4", "d"],
+    )
+    .await;
+    let _ = read_line_helper(&mut reader).await;
+
+    // ZINTER - 交集
+    send_array(&mut write_half, &["ZINTER", "2", "zset1", "zset2"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "*2\r\n"); // b, c
+                                // 读取两个成员
+    for _ in 0..4 {
+        let _ = read_line_helper(&mut reader).await;
+    }
+
+    // ZUNION - 并集
+    send_array(&mut write_half, &["ZUNION", "2", "zset1", "zset2"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "*4\r\n"); // a, b, c, d
+    for _ in 0..8 {
+        let _ = read_line_helper(&mut reader).await;
+    }
+
+    // ZDIFF - 差集 (zset1 - zset2)
+    send_array(&mut write_half, &["ZDIFF", "2", "zset1", "zset2"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "*1\r\n"); // 只有 a
+    let _ = read_line_helper(&mut reader).await; // $1
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "a\r\n");
+
+    // ZINTERSTORE
+    send_array(
+        &mut write_half,
+        &["ZINTERSTORE", "out", "2", "zset1", "zset2"],
+    )
+    .await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":2\r\n");
+
+    // ZUNIONSTORE
+    send_array(
+        &mut write_half,
+        &["ZUNIONSTORE", "out2", "2", "zset1", "zset2"],
+    )
+    .await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":4\r\n");
+
+    // ZDIFFSTORE
+    send_array(
+        &mut write_half,
+        &["ZDIFFSTORE", "out3", "2", "zset1", "zset2"],
+    )
+    .await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":1\r\n");
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_zlexcount() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 创建 sorted set，所有成员分数相同
+    send_array(
+        &mut write_half,
+        &[
+            "ZADD", "myzset", "0", "a", "0", "b", "0", "c", "0", "d", "0", "e", "0", "f",
+        ],
+    )
+    .await;
+    let _ = read_line_helper(&mut reader).await;
+
+    // ZLEXCOUNT 全范围
+    send_array(&mut write_half, &["ZLEXCOUNT", "myzset", "-", "+"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":6\r\n");
+
+    // ZLEXCOUNT [b, [e] - inclusive
+    send_array(&mut write_half, &["ZLEXCOUNT", "myzset", "[b", "[e"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":4\r\n"); // b, c, d, e
+
+    // ZLEXCOUNT (b, (e) - exclusive
+    send_array(&mut write_half, &["ZLEXCOUNT", "myzset", "(b", "(e"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":2\r\n"); // c, d
+
+    // ZLEXCOUNT [b, (d) - mixed
+    send_array(&mut write_half, &["ZLEXCOUNT", "myzset", "[b", "(d"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":2\r\n"); // b, c
+
+    // ZLEXCOUNT 不存在的 key
+    send_array(&mut write_half, &["ZLEXCOUNT", "nokey", "-", "+"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":0\r\n");
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_generic_commands() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 创建测试数据
+    send_array(&mut write_half, &["SET", "key1", "value1"]).await;
+    let _ = read_line_helper(&mut reader).await;
+    send_array(&mut write_half, &["LPUSH", "list1", "a", "b", "c"]).await;
+    let _ = read_line_helper(&mut reader).await;
+
+    // UNLINK - 与 DEL 相同
+    send_array(&mut write_half, &["SET", "temp", "val"]).await;
+    let _ = read_line_helper(&mut reader).await;
+    send_array(&mut write_half, &["UNLINK", "temp"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":1\r\n");
+    send_array(&mut write_half, &["EXISTS", "temp"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":0\r\n");
+
+    // COPY - 复制 key
+    send_array(&mut write_half, &["COPY", "key1", "key2"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":1\r\n");
+    send_array(&mut write_half, &["GET", "key2"]).await;
+    let _ = read_line_helper(&mut reader).await; // $6
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "value1\r\n");
+
+    // COPY 不覆盖已存在的 key
+    send_array(&mut write_half, &["COPY", "key1", "key2"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":0\r\n");
+
+    // COPY source == destination 应返回错误
+    send_array(&mut write_half, &["COPY", "key1", "key1"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert!(resp.starts_with("-ERR"));
+
+    // COPY source == destination with REPLACE 也应返回错误
+    send_array(&mut write_half, &["COPY", "key1", "key1", "REPLACE"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert!(resp.starts_with("-ERR"));
+
+    // COPY REPLACE
+    send_array(&mut write_half, &["SET", "key1", "newvalue"]).await;
+    let _ = read_line_helper(&mut reader).await;
+    send_array(&mut write_half, &["COPY", "key1", "key2", "REPLACE"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":1\r\n");
+    send_array(&mut write_half, &["GET", "key2"]).await;
+    let _ = read_line_helper(&mut reader).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "newvalue\r\n");
+
+    // TOUCH
+    send_array(&mut write_half, &["TOUCH", "key1", "key2", "nonexistent"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":2\r\n");
+
+    // OBJECT ENCODING - string
+    send_array(&mut write_half, &["OBJECT", "ENCODING", "key1"]).await;
+    let _ = read_line_helper(&mut reader).await; // $6
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "embstr\r\n");
+
+    // OBJECT ENCODING - list
+    send_array(&mut write_half, &["OBJECT", "ENCODING", "list1"]).await;
+    let _ = read_line_helper(&mut reader).await; // $9
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "quicklist\r\n");
+
+    // OBJECT ENCODING - 不存在的 key
+    send_array(&mut write_half, &["OBJECT", "ENCODING", "nokey"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "$-1\r\n");
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_expire_commands() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 创建测试数据
+    send_array(&mut write_half, &["SET", "mykey", "value"]).await;
+    let _ = read_line_helper(&mut reader).await;
+
+    // EXPIREAT - 设置绝对过期时间（未来 100 秒）
+    let future_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 100;
+    send_array(
+        &mut write_half,
+        &["EXPIREAT", "mykey", &future_ts.to_string()],
+    )
+    .await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":1\r\n");
+
+    // EXPIRETIME - 获取绝对过期时间
+    send_array(&mut write_half, &["EXPIRETIME", "mykey"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    // 应该返回接近 future_ts 的值
+    assert!(resp.starts_with(":"));
+    let ts: i64 = resp.trim_start_matches(':').trim().parse().unwrap();
+    assert!(ts > 0);
+
+    // PEXPIREAT - 设置绝对过期时间（毫秒）
+    send_array(&mut write_half, &["SET", "mykey2", "value2"]).await;
+    let _ = read_line_helper(&mut reader).await;
+    let future_ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 100000;
+    send_array(
+        &mut write_half,
+        &["PEXPIREAT", "mykey2", &future_ts_ms.to_string()],
+    )
+    .await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":1\r\n");
+
+    // PEXPIRETIME - 获取绝对过期时间（毫秒）
+    send_array(&mut write_half, &["PEXPIRETIME", "mykey2"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert!(resp.starts_with(":"));
+    let ts_ms: i64 = resp.trim_start_matches(':').trim().parse().unwrap();
+    assert!(ts_ms > 0);
+
+    // EXPIRETIME 不存在的 key
+    send_array(&mut write_half, &["EXPIRETIME", "nokey"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":-2\r\n");
+
+    // EXPIRETIME 无过期时间的 key
+    send_array(&mut write_half, &["SET", "noexpire", "val"]).await;
+    let _ = read_line_helper(&mut reader).await;
+    send_array(&mut write_half, &["EXPIRETIME", "noexpire"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":-1\r\n");
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_set_commands_extended() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 创建测试集合
+    send_array(&mut write_half, &["SADD", "set1", "a", "b", "c"]).await;
+    let _ = read_line_helper(&mut reader).await;
+    send_array(&mut write_half, &["SADD", "set2", "x", "y"]).await;
+    let _ = read_line_helper(&mut reader).await;
+
+    // SMOVE - 移动元素
+    send_array(&mut write_half, &["SMOVE", "set1", "set2", "a"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":1\r\n");
+
+    // 验证 a 已从 set1 移除
+    send_array(&mut write_half, &["SISMEMBER", "set1", "a"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":0\r\n");
+
+    // 验证 a 已添加到 set2
+    send_array(&mut write_half, &["SISMEMBER", "set2", "a"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":1\r\n");
+
+    // SMOVE - 元素不存在
+    send_array(&mut write_half, &["SMOVE", "set1", "set2", "notexist"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":0\r\n");
+
+    // SMOVE - source 不存在
+    send_array(&mut write_half, &["SMOVE", "noset", "set2", "x"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":0\r\n");
+
+    // SMOVE - destination 不存在（应自动创建）
+    send_array(&mut write_half, &["SMOVE", "set1", "newset", "b"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":1\r\n");
+    send_array(&mut write_half, &["SISMEMBER", "newset", "b"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, ":1\r\n");
+
+    // SPOP - 随机弹出
+    send_array(&mut write_half, &["SADD", "popset", "1", "2", "3"]).await;
+    let _ = read_line_helper(&mut reader).await;
+    send_array(&mut write_half, &["SPOP", "popset"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert!(resp.starts_with("$1\r\n")); // 弹出一个元素
+    let _ = read_line_helper(&mut reader).await; // 读取元素值
+
+    // SRANDMEMBER - 随机获取（不删除）
+    send_array(&mut write_half, &["SRANDMEMBER", "popset"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert!(resp.starts_with("$1\r\n"));
+    let _ = read_line_helper(&mut reader).await;
+
+    // SRANDMEMBER 获取多个
+    send_array(&mut write_half, &["SRANDMEMBER", "popset", "2"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert!(resp.starts_with("*")); // 数组响应
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_blocking_list_commands() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 先创建有数据的列表
+    send_array(&mut write_half, &["RPUSH", "mylist", "a", "b", "c"]).await;
+    let _ = read_line_helper(&mut reader).await;
+
+    // BLPOP - 立即返回（列表有数据）
+    send_array(&mut write_half, &["BLPOP", "mylist", "1"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "*2\r\n"); // 数组响应
+    let _ = read_line_helper(&mut reader).await; // $6
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "mylist\r\n");
+    let _ = read_line_helper(&mut reader).await; // $1
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "a\r\n");
+
+    // BRPOP - 立即返回
+    send_array(&mut write_half, &["BRPOP", "mylist", "1"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "*2\r\n");
+    let _ = read_line_helper(&mut reader).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "mylist\r\n");
+    let _ = read_line_helper(&mut reader).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "c\r\n"); // 从右边弹出
+
+    // BLPOP - 超时返回 null（列表为空后）
+    send_array(&mut write_half, &["LPOP", "mylist"]).await; // 清空列表
+    let _ = read_line_helper(&mut reader).await;
+    let _ = read_line_helper(&mut reader).await;
+
+    send_array(&mut write_half, &["BLPOP", "emptylist", "0.2"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "*-1\r\n"); // null array (Redis 协议规范)
+
+    // BLPOP - 多个 key，返回第一个有数据的
+    send_array(&mut write_half, &["RPUSH", "list2", "x"]).await;
+    let _ = read_line_helper(&mut reader).await;
+    send_array(&mut write_half, &["BLPOP", "emptylist", "list2", "1"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "*2\r\n");
+    let _ = read_line_helper(&mut reader).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "list2\r\n"); // 返回 list2 的数据
+
+    let _ = shutdown.send(());
 }

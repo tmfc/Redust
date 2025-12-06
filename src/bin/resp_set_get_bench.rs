@@ -827,6 +827,72 @@ async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
             println!("[bench] total ops: {}", total_ops as u64);
             println!("[bench] ops/sec: {:.2}", qps);
         }
+        "hyperloglog" => {
+            // 功能校验：PFADD/PFCOUNT/PFMERGE 行为
+            let key = "bench_hll";
+            client.del(&[key]).await;
+
+            // PFADD 测试
+            client.send_array(&["PFADD", key, "a", "b", "c"]).await;
+            let line = client.read_simple_line().await;
+            if line != ":1\r\n" {
+                panic!("unexpected PFADD response: {:?}", line);
+            }
+
+            // PFCOUNT 测试
+            client.send_array(&["PFCOUNT", key]).await;
+            let line = client.read_simple_line().await;
+            if !line.starts_with(':') || !line.ends_with("\r\n") {
+                panic!("unexpected PFCOUNT response: {:?}", line);
+            }
+            let count: i64 = line[1..line.len() - 2].parse().unwrap();
+            if count < 2 || count > 4 {
+                panic!("unexpected PFCOUNT value: {}", count);
+            }
+
+            // PFMERGE 测试
+            client
+                .send_array(&["PFADD", "bench_hll_2", "c", "d", "e"])
+                .await;
+            let _ = client.read_simple_line().await;
+            client
+                .send_array(&["PFMERGE", "bench_hll_merged", key, "bench_hll_2"])
+                .await;
+            let line = client.read_simple_line().await;
+            if line != "+OK\r\n" {
+                panic!("unexpected PFMERGE response: {:?}", line);
+            }
+
+            // HyperLogLog 回环性能测试：PFADD + PFCOUNT
+            let key = "bench_hll_loop";
+            client.del(&[key]).await;
+
+            let start = std::time::Instant::now();
+            for i in 0..iterations {
+                let elem = format!("elem_{}", i);
+                client.send_array(&["PFADD", key, &elem]).await;
+                let _ = client.read_simple_line().await;
+
+                // 每 100 次做一次 PFCOUNT
+                if i % 100 == 99 {
+                    client.send_array(&["PFCOUNT", key]).await;
+                    let _ = client.read_simple_line().await;
+                }
+            }
+            let elapsed = start.elapsed();
+
+            let pfcount_ops = iterations / 100;
+            let total_ops = (iterations + pfcount_ops) as f64;
+            let secs = elapsed.as_secs_f64();
+            let qps = if secs > 0.0 { total_ops / secs } else { 0.0 };
+
+            println!("[bench][hyperloglog] total time: {:?}", elapsed);
+            println!(
+                "[bench][hyperloglog] total ops: {} (PFADD: {}, PFCOUNT: {})",
+                total_ops as u64, iterations, pfcount_ops
+            );
+            println!("[bench][hyperloglog] ops/sec: {:.2}", qps);
+        }
         other => {
             panic!("unknown bench group: {}", other);
         }
@@ -889,6 +955,7 @@ async fn main() {
             "set_union",
             "set_intersection",
             "set_difference",
+            "hyperloglog",
         ] {
             println!("[bench] ==== group: {} ====", g);
             run_group(&mut client, g, iterations).await;

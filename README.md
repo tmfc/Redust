@@ -12,6 +12,7 @@ Redust 是一个使用 Rust 编写的、兼容 Redis 协议的轻量级服务。
     - Sets：`SADD`、`SREM`、`SMEMBERS`、`SCARD`、`SISMEMBER`、`SUNION`、`SINTER`、`SDIFF`，支持 `SPOP` / `SRANDMEMBER` 以及 `SUNIONSTORE` / `SINTERSTORE` / `SDIFFSTORE`。
     - Hashes：`HSET`、`HGET`、`HGETALL`、`HDEL`、`HEXISTS`、`HINCRBY` 等常用命令。
     - Sorted Sets：`ZADD`、`ZCARD`、`ZRANGE`、`ZREVRANGE`、`ZSCORE`、`ZREM`、`ZINCRBY`、`ZSCAN` 等。
+    - HyperLogLog：`PFADD`、`PFCOUNT`、`PFMERGE`（基数估计，标准误差约 0.81%）。
     - Pub/Sub：`PUBLISH`、`SUBSCRIBE`/`PSUBSCRIBE`、`UNSUBSCRIBE`/`PUNSUBSCRIBE`，分片版 `SPUBLISH`/`SSUBSCRIBE`/`SUNSUBSCRIBE`，以及 `PUBSUB CHANNELS|NUMSUB|NUMPAT|SHARDCHANNELS|SHARDNUMSUB`。
     - 事务：`MULTI`、`EXEC`、`DISCARD`、`WATCH`、`UNWATCH`。
     - Lua 脚本：`EVAL`、`EVALSHA`、`SCRIPT LOAD|EXISTS|FLUSH`（基础版，暂不支持 `redis.call`）。
@@ -19,7 +20,7 @@ Redust 是一个使用 Rust 编写的、兼容 Redis 协议的轻量级服务。
   - 协议层基于 RESP2，实现了数组解析与 Bulk String 编解码。
 - **异步高并发**：基于 Tokio 运行时，每个 TCP 连接在独立任务中处理，支持多客户端并发访问同一存储。
 - **内存键值存储 + 过期**：提供内置内存存储引擎，支持字符串、列表、集合和哈希类型，支持 TTL/过期时间与懒删除 + 定期删除策略。
-- **可配置内存上限与 LRU 淘汰（MVP）**：支持通过 `maxmemory`（字节或 MB/GB 后缀）限制内存使用，当逼近上限时采用 `allkeys-lru` 采样淘汰最近最少使用的键（近似实现）。
+- **可配置内存上限与淘汰策略（MVP）**：支持通过 `maxmemory`（字节或 MB/GB 后缀）限制内存使用，可在 `allkeys-lru` / `volatile-lru` / `allkeys-random` / `volatile-random` / `volatile-ttl` / `noeviction` 之间切换（采样实现，`maxmemory-samples` 可调）。
 - **可配置监听地址**：通过 `REDUST_ADDR` 环境变量或 `--bind` 启动参数调整监听地址与端口。
 
 ## 快速开始
@@ -59,6 +60,7 @@ Redust 通过环境变量和少量 CLI 参数进行配置：
   - 纯数字：按字节解析，例如 `104857600`。
   - 或带单位：`64KB` / `100MB` / `1GB`（大小写不敏感）。
   - `0` 或未设置：表示不限制内存使用，不触发 LRU 淘汰。
+- `REDUST_MAXMEMORY_POLICY`：淘汰策略，支持 `allkeys-lru`（默认）、`volatile-lru`、`allkeys-random`、`volatile-ttl`、`noeviction`。
 - `REDUST_MAXVALUE_BYTES`：单个 value 最大字节数（可选）：
   - 纯数字或带单位，解析规则与 `REDUST_MAXMEMORY_BYTES` 一致。
   - 目前会限制字符串/列表/集合/哈希写入中的 value 长度（如 `SET`/`MSET`/`LPUSH`/`SADD`/`HSET` 等），超限时返回 `ERR value exceeds REDUST_MAXVALUE_BYTES` 并拒绝写入。
@@ -69,7 +71,7 @@ Redust 通过环境变量和少量 CLI 参数进行配置：
 CLI 参数（在 `cargo run -- ...` 之后传入）：
 
 - `--bind <addr>`：覆盖 `REDUST_ADDR`。
-- `--maxmemory-bytes <value>`：覆盖 `REDUST_MAXMEMORY_BYTES`，支持与环境变量相同的写法。
+- `--maxmemory-bytes <value>`：覆盖 `REDUST_MAXMEMORY_BYTES`，支持与环境变量相同的写法；淘汰策略可通过 `REDUST_MAXMEMORY_POLICY` 或运行时 `CONFIG SET maxmemory-policy` 设置；采样大小可通过 `REDUST_MAXMEMORY_SAMPLES` 或 `CONFIG SET maxmemory-samples` 调整。
 
 ## 协议示例
 
@@ -112,6 +114,23 @@ redis-cli -h 127.0.0.1 -p 6379 AUTH secret
 redis-cli -h 127.0.0.1 -p 6379 SET k v
 redis-cli -h 127.0.0.1 -p 6379 GET k
 # => "v"
+
+# HyperLogLog 基数估计示例
+redis-cli -h 127.0.0.1 -p 6379 PFADD visitors user1 user2 user3
+# => (integer) 1
+redis-cli -h 127.0.0.1 -p 6379 PFCOUNT visitors
+# => (integer) 3
+redis-cli -h 127.0.0.1 -p 6379 PFADD visitors user1 user4  # user1 已存在
+# => (integer) 1
+redis-cli -h 127.0.0.1 -p 6379 PFCOUNT visitors
+# => (integer) 4
+
+# 合并多个 HyperLogLog
+redis-cli -h 127.0.0.1 -p 6379 PFADD page1 a b c
+redis-cli -h 127.0.0.1 -p 6379 PFADD page2 c d e
+redis-cli -h 127.0.0.1 -p 6379 PFMERGE all_pages page1 page2
+redis-cli -h 127.0.0.1 -p 6379 PFCOUNT all_pages
+# => (integer) 5  (a, b, c, d, e 的并集)
 ```
 
 ## 运行测试
@@ -157,7 +176,7 @@ Redust 当前提供了一版**实验性的 RDB v1 快照格式**，用于在重�
 - `src/resp.rs`：RESP 协议解析与编码实现。
 - `src/command.rs`：命令枚举与从 RESP 到命令的解析逻辑。
 - `src/server.rs`：TCP 监听、连接处理和命令执行调度，以及 Prometheus 指标导出。
-- `src/storage.rs`：内存存储引擎（基于 `DashMap`），支持 String/List/Set/Hash、TTL/过期、RDB 持久化、可选 `maxmemory` 与 `allkeys-lru` 淘汰策略（近似实现）。
+- `src/storage.rs`：内存存储引擎（基于 `DashMap`），支持 String/List/Set/Hash、TTL/过期、RDB 持久化、可选 `maxmemory` 与多种淘汰策略（近似实现）。
 - `tests/server_basic.rs`：端到端集成测试。
 - `Cargo.toml`：依赖与构建配置。
 

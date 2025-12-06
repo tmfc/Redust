@@ -5,6 +5,40 @@ use crate::resp::read_resp_array;
 
 pub type Binary = Vec<u8>;
 
+/// ZINTER/ZUNION 的聚合方式
+#[derive(Debug, Clone, Copy)]
+pub enum ZAggregate {
+    Sum,
+    Min,
+    Max,
+}
+
+/// ZCOUNT/ZRANGEBYSCORE 的分数边界
+#[derive(Debug, Clone)]
+pub enum ZRangeBound {
+    /// 负无穷
+    NegInf,
+    /// 正无穷
+    PosInf,
+    /// 包含该值 (inclusive)
+    Inclusive(f64),
+    /// 不包含该值 (exclusive)
+    Exclusive(f64),
+}
+
+/// ZLEXCOUNT/ZRANGEBYLEX 的字典序边界
+#[derive(Debug, Clone)]
+pub enum ZLexBound {
+    /// 负无穷 (-)
+    NegInf,
+    /// 正无穷 (+)
+    PosInf,
+    /// 包含该值 [value
+    Inclusive(String),
+    /// 不包含该值 (value
+    Exclusive(String),
+}
+
 /// Custom error type for command parsing.
 #[derive(Debug)]
 pub enum CommandError {
@@ -84,6 +118,20 @@ pub enum Command {
     Del {
         keys: Vec<String>,
     },
+    Unlink {
+        keys: Vec<String>,
+    },
+    Copy {
+        source: String,
+        destination: String,
+        replace: bool,
+    },
+    Touch {
+        keys: Vec<String>,
+    },
+    ObjectEncoding {
+        key: String,
+    },
     Exists {
         keys: Vec<String>,
     },
@@ -109,6 +157,7 @@ pub enum Command {
         cursor: u64,
         pattern: Option<String>,
         count: Option<u64>,
+        type_filter: Option<String>,
     },
     Sscan {
         key: String,
@@ -121,12 +170,14 @@ pub enum Command {
         cursor: u64,
         pattern: Option<String>,
         count: Option<u64>,
+        novalues: bool,
     },
     Zscan {
         key: String,
         cursor: u64,
         pattern: Option<String>,
         count: Option<u64>,
+        novalues: bool,
     },
     Type {
         key: String,
@@ -170,6 +221,36 @@ pub enum Command {
         key: String,
         start: isize,
         stop: isize,
+    },
+    Lset {
+        key: String,
+        index: isize,
+        value: String,
+    },
+    Linsert {
+        key: String,
+        before: bool, // true = BEFORE, false = AFTER
+        pivot: String,
+        value: String,
+    },
+    Rpoplpush {
+        source: String,
+        destination: String,
+    },
+    Blpop {
+        keys: Vec<String>,
+        timeout: f64,
+    },
+    Brpop {
+        keys: Vec<String>,
+        timeout: f64,
+    },
+    Lpos {
+        key: String,
+        element: String,
+        rank: Option<isize>,
+        count: Option<isize>,
+        maxlen: Option<isize>,
     },
     Sadd {
         key: String,
@@ -218,6 +299,11 @@ pub enum Command {
         dest: String,
         keys: Vec<String>,
     },
+    Smove {
+        source: String,
+        destination: String,
+        member: String,
+    },
     Hset {
         key: String,
         field: String,
@@ -261,6 +347,19 @@ pub enum Command {
     Hlen {
         key: String,
     },
+    Hsetnx {
+        key: String,
+        field: String,
+        value: String,
+    },
+    Hstrlen {
+        key: String,
+        field: String,
+    },
+    Hmset {
+        key: String,
+        field_values: Vec<(String, String)>,
+    },
     Expire {
         key: String,
         seconds: i64,
@@ -269,10 +368,24 @@ pub enum Command {
         key: String,
         millis: i64,
     },
+    Expireat {
+        key: String,
+        timestamp: i64,
+    },
+    Pexpireat {
+        key: String,
+        timestamp_ms: i64,
+    },
     Ttl {
         key: String,
     },
     Pttl {
+        key: String,
+    },
+    Expiretime {
+        key: String,
+    },
+    Pexpiretime {
         key: String,
     },
     Persist {
@@ -396,6 +509,64 @@ pub enum Command {
         increment: f64,
         member: String,
     },
+    Zcount {
+        key: String,
+        min: ZRangeBound,
+        max: ZRangeBound,
+    },
+    Zrank {
+        key: String,
+        member: String,
+    },
+    Zrevrank {
+        key: String,
+        member: String,
+    },
+    Zpopmin {
+        key: String,
+        count: Option<usize>,
+    },
+    Zpopmax {
+        key: String,
+        count: Option<usize>,
+    },
+    Zinter {
+        keys: Vec<String>,
+        weights: Option<Vec<f64>>,
+        aggregate: Option<ZAggregate>,
+        withscores: bool,
+    },
+    Zunion {
+        keys: Vec<String>,
+        weights: Option<Vec<f64>>,
+        aggregate: Option<ZAggregate>,
+        withscores: bool,
+    },
+    Zdiff {
+        keys: Vec<String>,
+        withscores: bool,
+    },
+    Zinterstore {
+        destination: String,
+        keys: Vec<String>,
+        weights: Option<Vec<f64>>,
+        aggregate: Option<ZAggregate>,
+    },
+    Zunionstore {
+        destination: String,
+        keys: Vec<String>,
+        weights: Option<Vec<f64>>,
+        aggregate: Option<ZAggregate>,
+    },
+    Zdiffstore {
+        destination: String,
+        keys: Vec<String>,
+    },
+    Zlexcount {
+        key: String,
+        min: ZLexBound,
+        max: ZLexBound,
+    },
     // HyperLogLog 命令
     Pfadd {
         key: String,
@@ -440,6 +611,10 @@ pub enum Command {
         name: String,
     },
     ClientGetname,
+    ClientPause {
+        timeout_ms: u64,
+    },
+    ClientUnpause,
     SlowlogGet {
         count: Option<usize>,
     },
@@ -490,6 +665,11 @@ fn parse_i64_from_bulk(bytes: Vec<u8>) -> Result<i64, Command> {
     s.parse::<i64>().map_err(|_| err_not_integer())
 }
 
+fn parse_u64_from_bulk(bytes: Vec<u8>) -> Result<u64, Command> {
+    let s = parse_bulk_string(bytes)?;
+    s.parse::<u64>().map_err(|_| err_not_integer())
+}
+
 fn parse_isize_from_bulk(bytes: Vec<u8>) -> Result<isize, Command> {
     let s = parse_bulk_string(bytes)?;
     s.parse::<isize>().map_err(|_| err_not_integer())
@@ -502,6 +682,133 @@ fn parse_f64_from_bulk(bytes: Vec<u8>) -> Result<f64, Command> {
         return Err(err_not_float());
     }
     Ok(v)
+}
+
+/// 解析 ZCOUNT/ZRANGEBYSCORE 的分数边界
+/// 支持: -inf, +inf, (value (exclusive), value (inclusive)
+fn parse_zrange_bound(bytes: Vec<u8>) -> Result<ZRangeBound, Command> {
+    let s = parse_bulk_string(bytes)?;
+    let s = s.trim();
+
+    if s.eq_ignore_ascii_case("-inf") {
+        return Ok(ZRangeBound::NegInf);
+    }
+    if s.eq_ignore_ascii_case("+inf") || s.eq_ignore_ascii_case("inf") {
+        return Ok(ZRangeBound::PosInf);
+    }
+
+    // 检查是否是 exclusive (以 '(' 开头)
+    if let Some(rest) = s.strip_prefix('(') {
+        let v = rest.parse::<f64>().map_err(|_| err_not_float())?;
+        if !v.is_finite() {
+            return Err(err_not_float());
+        }
+        return Ok(ZRangeBound::Exclusive(v));
+    }
+
+    // 默认是 inclusive
+    let v = s.parse::<f64>().map_err(|_| err_not_float())?;
+    if !v.is_finite() {
+        return Err(err_not_float());
+    }
+    Ok(ZRangeBound::Inclusive(v))
+}
+
+/// 解析 ZLEXCOUNT/ZRANGEBYLEX 的字典序边界
+/// 支持: -, +, [value (inclusive), (value (exclusive)
+fn parse_zlex_bound(bytes: Vec<u8>) -> Result<ZLexBound, Command> {
+    let s = parse_bulk_string(bytes)?;
+    let s = s.trim();
+
+    if s == "-" {
+        return Ok(ZLexBound::NegInf);
+    }
+    if s == "+" {
+        return Ok(ZLexBound::PosInf);
+    }
+
+    // [value - inclusive
+    if let Some(rest) = s.strip_prefix('[') {
+        return Ok(ZLexBound::Inclusive(rest.to_string()));
+    }
+
+    // (value - exclusive
+    if let Some(rest) = s.strip_prefix('(') {
+        return Ok(ZLexBound::Exclusive(rest.to_string()));
+    }
+
+    // 无效格式
+    Err(Command::Error(
+        "ERR min or max not valid string range item".to_string(),
+    ))
+}
+
+/// 解析 ZINTER/ZUNION 的可选参数: WEIGHTS, AGGREGATE, WITHSCORES
+fn parse_zset_options(
+    iter: &mut std::vec::IntoIter<Vec<u8>>,
+    numkeys: usize,
+) -> Result<(Option<Vec<f64>>, Option<ZAggregate>, bool), CommandError> {
+    let mut weights: Option<Vec<f64>> = None;
+    let mut aggregate: Option<ZAggregate> = None;
+    let mut withscores = false;
+
+    // 收集剩余参数
+    let remaining: Vec<Vec<u8>> = iter.collect();
+    let mut i = 0;
+
+    while i < remaining.len() {
+        let opt = match parse_bulk_string(remaining[i].clone()) {
+            Ok(o) => o.to_uppercase(),
+            Err(_) => return Err(CommandError::RedisError("ERR syntax error".to_string())),
+        };
+
+        match opt.as_str() {
+            "WEIGHTS" => {
+                i += 1;
+                let mut w = Vec::with_capacity(numkeys);
+                for _ in 0..numkeys {
+                    if i >= remaining.len() {
+                        return Err(CommandError::RedisError("ERR syntax error".to_string()));
+                    }
+                    let weight = match parse_f64_from_bulk(remaining[i].clone()) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            return Err(CommandError::RedisError(
+                                "ERR weight value is not a float".to_string(),
+                            ))
+                        }
+                    };
+                    w.push(weight);
+                    i += 1;
+                }
+                weights = Some(w);
+            }
+            "AGGREGATE" => {
+                i += 1;
+                if i >= remaining.len() {
+                    return Err(CommandError::RedisError("ERR syntax error".to_string()));
+                }
+                let agg = match parse_bulk_string(remaining[i].clone()) {
+                    Ok(a) => a.to_uppercase(),
+                    Err(_) => return Err(CommandError::RedisError("ERR syntax error".to_string())),
+                };
+                aggregate = Some(match agg.as_str() {
+                    "SUM" => ZAggregate::Sum,
+                    "MIN" => ZAggregate::Min,
+                    "MAX" => ZAggregate::Max,
+                    _ => return Err(CommandError::RedisError("ERR syntax error".to_string())),
+                });
+                i += 1;
+            }
+            "WITHSCORES" => {
+                withscores = true;
+                i += 1;
+            }
+            _ => return Err(CommandError::RedisError("ERR syntax error".to_string())),
+        }
+    }
+
+    Ok((weights, aggregate, withscores))
 }
 
 pub async fn read_command(
@@ -977,6 +1284,98 @@ pub async fn read_command(
             }
             Command::Del { keys }
         }
+        "UNLINK" => {
+            let mut keys = Vec::new();
+            for b in iter {
+                match parse_bulk_string(b) {
+                    Ok(k) => keys.push(k),
+                    Err(e) => return Ok(Some(e)),
+                }
+            }
+            if keys.is_empty() {
+                return Ok(Some(err_wrong_args("unlink")));
+            }
+            Command::Unlink { keys }
+        }
+        "COPY" => {
+            let Some(src_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("copy")));
+            };
+            let source = match parse_bulk_string(src_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(dst_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("copy")));
+            };
+            let destination = match parse_bulk_string(dst_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let mut replace = false;
+            for opt_bytes in iter {
+                let opt = match parse_bulk_string(opt_bytes) {
+                    Ok(o) => o.to_uppercase(),
+                    Err(e) => return Ok(Some(e)),
+                };
+                if opt == "REPLACE" {
+                    replace = true;
+                } else if opt == "DB" {
+                    // 跳过 DB 参数（不支持跨 DB 复制）
+                    return Ok(Some(Command::Error(
+                        "ERR COPY with DB option is not supported".to_string(),
+                    )));
+                } else {
+                    return Ok(Some(err_wrong_args("copy")));
+                }
+            }
+            Command::Copy {
+                source,
+                destination,
+                replace,
+            }
+        }
+        "TOUCH" => {
+            let mut keys = Vec::new();
+            for b in iter {
+                match parse_bulk_string(b) {
+                    Ok(k) => keys.push(k),
+                    Err(e) => return Ok(Some(e)),
+                }
+            }
+            if keys.is_empty() {
+                return Ok(Some(err_wrong_args("touch")));
+            }
+            Command::Touch { keys }
+        }
+        "OBJECT" => {
+            let Some(subcmd_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("object")));
+            };
+            let subcmd = match parse_bulk_string(subcmd_bytes) {
+                Ok(s) => s.to_uppercase(),
+                Err(e) => return Ok(Some(e)),
+            };
+            match subcmd.as_str() {
+                "ENCODING" => {
+                    let Some(key_bytes) = iter.next() else {
+                        return Ok(Some(err_wrong_args("object")));
+                    };
+                    let key = match parse_bulk_string(key_bytes) {
+                        Ok(k) => k,
+                        Err(e) => return Ok(Some(e)),
+                    };
+                    if iter.next().is_some() {
+                        return Ok(Some(err_wrong_args("object")));
+                    }
+                    Command::ObjectEncoding { key }
+                }
+                _ => Command::Error(format!(
+                    "ERR Unknown subcommand or wrong number of arguments for '{}'",
+                    subcmd
+                )),
+            }
+        }
         "EXISTS" => {
             let mut keys = Vec::new();
             for b in iter {
@@ -1013,15 +1412,13 @@ pub async fn read_command(
             let Some(cursor_bytes) = iter.next() else {
                 return Ok(Some(err_wrong_args("scan")));
             };
-            let cursor_i64 = match parse_i64_from_bulk(cursor_bytes) {
+            let cursor = match parse_u64_from_bulk(cursor_bytes) {
                 Ok(v) => v,
                 Err(e) => return Ok(Some(e)),
             };
-            if cursor_i64 < 0 {
-                return Ok(Some(err_not_integer()));
-            }
             let mut pattern: Option<String> = None;
             let mut count: Option<u64> = None;
+            let mut type_filter: Option<String> = None;
 
             while let Some(opt) = iter.next() {
                 let opt_upper = match std::str::from_utf8(&opt) {
@@ -1058,6 +1455,19 @@ pub async fn read_command(
                         }
                         count = Some(c_i64 as u64);
                     }
+                    "TYPE" => {
+                        if type_filter.is_some() {
+                            return Ok(Some(err_syntax()));
+                        }
+                        let Some(type_bytes) = iter.next() else {
+                            return Ok(Some(err_syntax()));
+                        };
+                        let t = match parse_bulk_string(type_bytes) {
+                            Ok(t) => t.to_ascii_lowercase(),
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        type_filter = Some(t);
+                    }
                     _ => {
                         return Ok(Some(err_syntax()));
                     }
@@ -1065,9 +1475,10 @@ pub async fn read_command(
             }
 
             Command::Scan {
-                cursor: cursor_i64 as u64,
+                cursor,
                 pattern,
                 count,
+                type_filter,
             }
         }
         "SSCAN" => {
@@ -1159,6 +1570,7 @@ pub async fn read_command(
             }
             let mut pattern: Option<String> = None;
             let mut count: Option<u64> = None;
+            let mut novalues = false;
 
             while let Some(opt) = iter.next() {
                 let opt_upper = match std::str::from_utf8(&opt) {
@@ -1195,6 +1607,9 @@ pub async fn read_command(
                         }
                         count = Some(c_i64 as u64);
                     }
+                    "NOVALUES" => {
+                        novalues = true;
+                    }
                     _ => {
                         return Ok(Some(err_syntax()));
                     }
@@ -1206,6 +1621,7 @@ pub async fn read_command(
                 cursor: cursor_i64 as u64,
                 pattern,
                 count,
+                novalues,
             }
         }
         "ZSCAN" => {
@@ -1228,6 +1644,7 @@ pub async fn read_command(
             }
             let mut pattern: Option<String> = None;
             let mut count: Option<u64> = None;
+            let mut novalues = false;
 
             while let Some(opt) = iter.next() {
                 let opt_upper = match std::str::from_utf8(&opt) {
@@ -1264,6 +1681,9 @@ pub async fn read_command(
                         }
                         count = Some(c_i64 as u64);
                     }
+                    "NOVALUES" => {
+                        novalues = true;
+                    }
                     _ => {
                         return Ok(Some(err_syntax()));
                     }
@@ -1275,6 +1695,7 @@ pub async fn read_command(
                 cursor: cursor_i64 as u64,
                 pattern,
                 count,
+                novalues,
             }
         }
         "ZADD" => {
@@ -1450,6 +1871,333 @@ pub async fn read_command(
                 increment,
                 member,
             }
+        }
+        "ZCOUNT" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zcount")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(min_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zcount")));
+            };
+            let min = match parse_zrange_bound(min_bytes) {
+                Ok(b) => b,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(max_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zcount")));
+            };
+            let max = match parse_zrange_bound(max_bytes) {
+                Ok(b) => b,
+                Err(e) => return Ok(Some(e)),
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("zcount")));
+            }
+            Command::Zcount { key, min, max }
+        }
+        "ZRANK" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zrank")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(member_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zrank")));
+            };
+            let member = match parse_bulk_string(member_bytes) {
+                Ok(m) => m,
+                Err(e) => return Ok(Some(e)),
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("zrank")));
+            }
+            Command::Zrank { key, member }
+        }
+        "ZREVRANK" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zrevrank")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(member_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zrevrank")));
+            };
+            let member = match parse_bulk_string(member_bytes) {
+                Ok(m) => m,
+                Err(e) => return Ok(Some(e)),
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("zrevrank")));
+            }
+            Command::Zrevrank { key, member }
+        }
+        "ZPOPMIN" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zpopmin")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let count = if let Some(count_bytes) = iter.next() {
+                Some(match parse_isize_from_bulk(count_bytes) {
+                    Ok(v) if v > 0 => v as usize,
+                    Ok(_) => {
+                        return Ok(Some(Command::Error(
+                            "ERR value is out of range, must be positive".to_string(),
+                        )))
+                    }
+                    Err(e) => return Ok(Some(e)),
+                })
+            } else {
+                None
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("zpopmin")));
+            }
+            Command::Zpopmin { key, count }
+        }
+        "ZPOPMAX" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zpopmax")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let count = if let Some(count_bytes) = iter.next() {
+                Some(match parse_isize_from_bulk(count_bytes) {
+                    Ok(v) if v > 0 => v as usize,
+                    Ok(_) => {
+                        return Ok(Some(Command::Error(
+                            "ERR value is out of range, must be positive".to_string(),
+                        )))
+                    }
+                    Err(e) => return Ok(Some(e)),
+                })
+            } else {
+                None
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("zpopmax")));
+            }
+            Command::Zpopmax { key, count }
+        }
+        "ZINTER" => {
+            // ZINTER numkeys key [key ...] [WEIGHTS weight [weight ...]] [AGGREGATE SUM|MIN|MAX] [WITHSCORES]
+            let Some(numkeys_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zinter")));
+            };
+            let numkeys = match parse_isize_from_bulk(numkeys_bytes) {
+                Ok(n) if n > 0 => n as usize,
+                _ => return Ok(Some(err_wrong_args("zinter"))),
+            };
+            let mut keys = Vec::with_capacity(numkeys);
+            for _ in 0..numkeys {
+                let Some(key_bytes) = iter.next() else {
+                    return Ok(Some(err_wrong_args("zinter")));
+                };
+                keys.push(match parse_bulk_string(key_bytes) {
+                    Ok(k) => k,
+                    Err(e) => return Ok(Some(e)),
+                });
+            }
+            let (weights, aggregate, withscores) = parse_zset_options(&mut iter, numkeys)?;
+            Command::Zinter {
+                keys,
+                weights,
+                aggregate,
+                withscores,
+            }
+        }
+        "ZUNION" => {
+            let Some(numkeys_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zunion")));
+            };
+            let numkeys = match parse_isize_from_bulk(numkeys_bytes) {
+                Ok(n) if n > 0 => n as usize,
+                _ => return Ok(Some(err_wrong_args("zunion"))),
+            };
+            let mut keys = Vec::with_capacity(numkeys);
+            for _ in 0..numkeys {
+                let Some(key_bytes) = iter.next() else {
+                    return Ok(Some(err_wrong_args("zunion")));
+                };
+                keys.push(match parse_bulk_string(key_bytes) {
+                    Ok(k) => k,
+                    Err(e) => return Ok(Some(e)),
+                });
+            }
+            let (weights, aggregate, withscores) = parse_zset_options(&mut iter, numkeys)?;
+            Command::Zunion {
+                keys,
+                weights,
+                aggregate,
+                withscores,
+            }
+        }
+        "ZDIFF" => {
+            let Some(numkeys_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zdiff")));
+            };
+            let numkeys = match parse_isize_from_bulk(numkeys_bytes) {
+                Ok(n) if n > 0 => n as usize,
+                _ => return Ok(Some(err_wrong_args("zdiff"))),
+            };
+            let mut keys = Vec::with_capacity(numkeys);
+            for _ in 0..numkeys {
+                let Some(key_bytes) = iter.next() else {
+                    return Ok(Some(err_wrong_args("zdiff")));
+                };
+                keys.push(match parse_bulk_string(key_bytes) {
+                    Ok(k) => k,
+                    Err(e) => return Ok(Some(e)),
+                });
+            }
+            let mut withscores = false;
+            while let Some(opt_bytes) = iter.next() {
+                let opt = match parse_bulk_string(opt_bytes) {
+                    Ok(o) => o.to_uppercase(),
+                    Err(e) => return Ok(Some(e)),
+                };
+                if opt == "WITHSCORES" {
+                    withscores = true;
+                } else {
+                    return Ok(Some(err_syntax()));
+                }
+            }
+            Command::Zdiff { keys, withscores }
+        }
+        "ZINTERSTORE" => {
+            let Some(dest_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zinterstore")));
+            };
+            let destination = match parse_bulk_string(dest_bytes) {
+                Ok(d) => d,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(numkeys_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zinterstore")));
+            };
+            let numkeys = match parse_isize_from_bulk(numkeys_bytes) {
+                Ok(n) if n > 0 => n as usize,
+                _ => return Ok(Some(err_wrong_args("zinterstore"))),
+            };
+            let mut keys = Vec::with_capacity(numkeys);
+            for _ in 0..numkeys {
+                let Some(key_bytes) = iter.next() else {
+                    return Ok(Some(err_wrong_args("zinterstore")));
+                };
+                keys.push(match parse_bulk_string(key_bytes) {
+                    Ok(k) => k,
+                    Err(e) => return Ok(Some(e)),
+                });
+            }
+            let (weights, aggregate, _) = parse_zset_options(&mut iter, numkeys)?;
+            Command::Zinterstore {
+                destination,
+                keys,
+                weights,
+                aggregate,
+            }
+        }
+        "ZUNIONSTORE" => {
+            let Some(dest_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zunionstore")));
+            };
+            let destination = match parse_bulk_string(dest_bytes) {
+                Ok(d) => d,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(numkeys_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zunionstore")));
+            };
+            let numkeys = match parse_isize_from_bulk(numkeys_bytes) {
+                Ok(n) if n > 0 => n as usize,
+                _ => return Ok(Some(err_wrong_args("zunionstore"))),
+            };
+            let mut keys = Vec::with_capacity(numkeys);
+            for _ in 0..numkeys {
+                let Some(key_bytes) = iter.next() else {
+                    return Ok(Some(err_wrong_args("zunionstore")));
+                };
+                keys.push(match parse_bulk_string(key_bytes) {
+                    Ok(k) => k,
+                    Err(e) => return Ok(Some(e)),
+                });
+            }
+            let (weights, aggregate, _) = parse_zset_options(&mut iter, numkeys)?;
+            Command::Zunionstore {
+                destination,
+                keys,
+                weights,
+                aggregate,
+            }
+        }
+        "ZDIFFSTORE" => {
+            let Some(dest_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zdiffstore")));
+            };
+            let destination = match parse_bulk_string(dest_bytes) {
+                Ok(d) => d,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(numkeys_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zdiffstore")));
+            };
+            let numkeys = match parse_isize_from_bulk(numkeys_bytes) {
+                Ok(n) if n > 0 => n as usize,
+                _ => return Ok(Some(err_wrong_args("zdiffstore"))),
+            };
+            let mut keys = Vec::with_capacity(numkeys);
+            for _ in 0..numkeys {
+                let Some(key_bytes) = iter.next() else {
+                    return Ok(Some(err_wrong_args("zdiffstore")));
+                };
+                keys.push(match parse_bulk_string(key_bytes) {
+                    Ok(k) => k,
+                    Err(e) => return Ok(Some(e)),
+                });
+            }
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("zdiffstore")));
+            }
+            Command::Zdiffstore { destination, keys }
+        }
+        "ZLEXCOUNT" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zlexcount")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(min_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zlexcount")));
+            };
+            let min = match parse_zlex_bound(min_bytes) {
+                Ok(b) => b,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(max_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zlexcount")));
+            };
+            let max = match parse_zlex_bound(max_bytes) {
+                Ok(b) => b,
+                Err(e) => return Ok(Some(e)),
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("zlexcount")));
+            }
+            Command::Zlexcount { key, min, max }
         }
         "PFADD" => {
             let Some(key_bytes) = iter.next() else {
@@ -1763,6 +2511,226 @@ pub async fn read_command(
             };
             Command::Ltrim { key, start, stop }
         }
+        "LSET" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("lset")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(index_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("lset")));
+            };
+            let index = match parse_isize_from_bulk(index_bytes) {
+                Ok(v) => v,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(value_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("lset")));
+            };
+            let value = match parse_bulk_string(value_bytes) {
+                Ok(v) => v,
+                Err(e) => return Ok(Some(e)),
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("lset")));
+            }
+            Command::Lset { key, index, value }
+        }
+        "LINSERT" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("linsert")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(pos_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("linsert")));
+            };
+            let pos = match parse_bulk_string(pos_bytes) {
+                Ok(p) => p.to_uppercase(),
+                Err(e) => return Ok(Some(e)),
+            };
+            let before = match pos.as_str() {
+                "BEFORE" => true,
+                "AFTER" => false,
+                _ => return Ok(Some(err_syntax())),
+            };
+            let Some(pivot_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("linsert")));
+            };
+            let pivot = match parse_bulk_string(pivot_bytes) {
+                Ok(p) => p,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(value_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("linsert")));
+            };
+            let value = match parse_bulk_string(value_bytes) {
+                Ok(v) => v,
+                Err(e) => return Ok(Some(e)),
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("linsert")));
+            }
+            Command::Linsert {
+                key,
+                before,
+                pivot,
+                value,
+            }
+        }
+        "RPOPLPUSH" => {
+            let Some(src_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("rpoplpush")));
+            };
+            let source = match parse_bulk_string(src_bytes) {
+                Ok(s) => s,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(dst_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("rpoplpush")));
+            };
+            let destination = match parse_bulk_string(dst_bytes) {
+                Ok(d) => d,
+                Err(e) => return Ok(Some(e)),
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("rpoplpush")));
+            }
+            Command::Rpoplpush {
+                source,
+                destination,
+            }
+        }
+        "BLPOP" => {
+            // BLPOP key [key ...] timeout
+            let mut keys = Vec::new();
+            let mut last_bytes: Option<Vec<u8>> = None;
+            for b in iter.by_ref() {
+                if let Some(prev) = last_bytes.take() {
+                    match parse_bulk_string(prev) {
+                        Ok(k) => keys.push(k),
+                        Err(e) => return Ok(Some(e)),
+                    }
+                }
+                last_bytes = Some(b);
+            }
+            let Some(timeout_bytes) = last_bytes else {
+                return Ok(Some(err_wrong_args("blpop")));
+            };
+            if keys.is_empty() {
+                return Ok(Some(err_wrong_args("blpop")));
+            }
+            let timeout = match parse_bulk_string(timeout_bytes.clone()) {
+                Ok(s) => match s.parse::<f64>() {
+                    Ok(t) if t >= 0.0 => t,
+                    _ => {
+                        return Ok(Some(Command::Error(
+                            "ERR timeout is not a float or out of range".to_string(),
+                        )))
+                    }
+                },
+                Err(e) => return Ok(Some(e)),
+            };
+            Command::Blpop { keys, timeout }
+        }
+        "BRPOP" => {
+            // BRPOP key [key ...] timeout
+            let mut keys = Vec::new();
+            let mut last_bytes: Option<Vec<u8>> = None;
+            for b in iter.by_ref() {
+                if let Some(prev) = last_bytes.take() {
+                    match parse_bulk_string(prev) {
+                        Ok(k) => keys.push(k),
+                        Err(e) => return Ok(Some(e)),
+                    }
+                }
+                last_bytes = Some(b);
+            }
+            let Some(timeout_bytes) = last_bytes else {
+                return Ok(Some(err_wrong_args("brpop")));
+            };
+            if keys.is_empty() {
+                return Ok(Some(err_wrong_args("brpop")));
+            }
+            let timeout = match parse_bulk_string(timeout_bytes.clone()) {
+                Ok(s) => match s.parse::<f64>() {
+                    Ok(t) if t >= 0.0 => t,
+                    _ => {
+                        return Ok(Some(Command::Error(
+                            "ERR timeout is not a float or out of range".to_string(),
+                        )))
+                    }
+                },
+                Err(e) => return Ok(Some(e)),
+            };
+            Command::Brpop { keys, timeout }
+        }
+        "LPOS" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("lpos")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(elem_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("lpos")));
+            };
+            let element = match parse_bulk_string(elem_bytes) {
+                Ok(e) => e,
+                Err(e) => return Ok(Some(e)),
+            };
+            let mut rank: Option<isize> = None;
+            let mut count: Option<isize> = None;
+            let mut maxlen: Option<isize> = None;
+            while let Some(opt_bytes) = iter.next() {
+                let opt = match parse_bulk_string(opt_bytes) {
+                    Ok(o) => o.to_uppercase(),
+                    Err(e) => return Ok(Some(e)),
+                };
+                match opt.as_str() {
+                    "RANK" => {
+                        let Some(val_bytes) = iter.next() else {
+                            return Ok(Some(err_wrong_args("lpos")));
+                        };
+                        rank = Some(match parse_isize_from_bulk(val_bytes) {
+                            Ok(v) => v,
+                            Err(e) => return Ok(Some(e)),
+                        });
+                    }
+                    "COUNT" => {
+                        let Some(val_bytes) = iter.next() else {
+                            return Ok(Some(err_wrong_args("lpos")));
+                        };
+                        count = Some(match parse_isize_from_bulk(val_bytes) {
+                            Ok(v) => v,
+                            Err(e) => return Ok(Some(e)),
+                        });
+                    }
+                    "MAXLEN" => {
+                        let Some(val_bytes) = iter.next() else {
+                            return Ok(Some(err_wrong_args("lpos")));
+                        };
+                        maxlen = Some(match parse_isize_from_bulk(val_bytes) {
+                            Ok(v) => v,
+                            Err(e) => return Ok(Some(e)),
+                        });
+                    }
+                    _ => return Ok(Some(err_syntax())),
+                }
+            }
+            Command::Lpos {
+                key,
+                element,
+                rank,
+                count,
+                maxlen,
+            }
+        }
         "SADD" => {
             let Some(key_bytes) = iter.next() else {
                 return Ok(Some(err_wrong_args("sadd")));
@@ -1995,6 +2963,37 @@ pub async fn read_command(
             }
             Command::Sdiffstore { dest, keys }
         }
+        "SMOVE" => {
+            let Some(src_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("smove")));
+            };
+            let source = match parse_bulk_string(src_bytes) {
+                Ok(s) => s,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(dst_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("smove")));
+            };
+            let destination = match parse_bulk_string(dst_bytes) {
+                Ok(d) => d,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(member_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("smove")));
+            };
+            let member = match parse_bulk_string(member_bytes) {
+                Ok(m) => m,
+                Err(e) => return Ok(Some(e)),
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("smove")));
+            }
+            Command::Smove {
+                source,
+                destination,
+                member,
+            }
+        }
         "HSET" => {
             let Some(key_bytes) = iter.next() else {
                 return Ok(Some(err_wrong_args("hset")));
@@ -2208,6 +3207,81 @@ pub async fn read_command(
             }
             Command::Hlen { key }
         }
+        "HSETNX" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("hsetnx")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(field_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("hsetnx")));
+            };
+            let field = match parse_bulk_string(field_bytes) {
+                Ok(f) => f,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(value_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("hsetnx")));
+            };
+            let value = match parse_bulk_string(value_bytes) {
+                Ok(v) => v,
+                Err(e) => return Ok(Some(e)),
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("hsetnx")));
+            }
+            Command::Hsetnx { key, field, value }
+        }
+        "HSTRLEN" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("hstrlen")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(field_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("hstrlen")));
+            };
+            let field = match parse_bulk_string(field_bytes) {
+                Ok(f) => f,
+                Err(e) => return Ok(Some(e)),
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("hstrlen")));
+            }
+            Command::Hstrlen { key, field }
+        }
+        "HMSET" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("hmset")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let mut field_values = Vec::new();
+            while let Some(field_bytes) = iter.next() {
+                let field = match parse_bulk_string(field_bytes) {
+                    Ok(f) => f,
+                    Err(e) => return Ok(Some(e)),
+                };
+                let Some(value_bytes) = iter.next() else {
+                    return Ok(Some(err_wrong_args("hmset")));
+                };
+                let value = match parse_bulk_string(value_bytes) {
+                    Ok(v) => v,
+                    Err(e) => return Ok(Some(e)),
+                };
+                field_values.push((field, value));
+            }
+            if field_values.is_empty() {
+                return Ok(Some(err_wrong_args("hmset")));
+            }
+            Command::Hmset { key, field_values }
+        }
         "EXPIRE" => {
             let Some(key_bytes) = iter.next() else {
                 return Ok(Some(err_wrong_args("expire")));
@@ -2248,6 +3322,46 @@ pub async fn read_command(
             };
             Command::Pexpire { key, millis }
         }
+        "EXPIREAT" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("expireat")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(ts_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("expireat")));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("expireat")));
+            }
+            let timestamp = match parse_i64_from_bulk(ts_bytes) {
+                Ok(v) => v,
+                Err(e) => return Ok(Some(e)),
+            };
+            Command::Expireat { key, timestamp }
+        }
+        "PEXPIREAT" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("pexpireat")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(ts_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("pexpireat")));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("pexpireat")));
+            }
+            let timestamp_ms = match parse_i64_from_bulk(ts_bytes) {
+                Ok(v) => v,
+                Err(e) => return Ok(Some(e)),
+            };
+            Command::Pexpireat { key, timestamp_ms }
+        }
         "TTL" => {
             let Some(key_bytes) = iter.next() else {
                 return Ok(Some(err_wrong_args("ttl")));
@@ -2273,6 +3387,32 @@ pub async fn read_command(
                 return Ok(Some(err_wrong_args("pttl")));
             }
             Command::Pttl { key }
+        }
+        "EXPIRETIME" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("expiretime")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("expiretime")));
+            }
+            Command::Expiretime { key }
+        }
+        "PEXPIRETIME" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("pexpiretime")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("pexpiretime")));
+            }
+            Command::Pexpiretime { key }
         }
         "PERSIST" => {
             let Some(key_bytes) = iter.next() else {
@@ -2810,9 +3950,10 @@ pub async fn read_command(
                     // 忽略可选的 ASYNC/SYNC 参数
                     Command::ScriptFlush
                 }
-                _ => {
-                    Command::Error(format!("ERR Unknown SCRIPT subcommand or wrong number of arguments for '{}'", subcmd))
-                }
+                _ => Command::Error(format!(
+                    "ERR Unknown SCRIPT subcommand or wrong number of arguments for '{}'",
+                    subcmd
+                )),
             }
         }
         "CONFIG" => {
@@ -2857,9 +3998,10 @@ pub async fn read_command(
                     }
                     Command::ConfigSet { parameter, value }
                 }
-                _ => {
-                    Command::Error(format!("ERR Unknown subcommand or wrong number of arguments for 'config|{}'", subcmd.to_lowercase()))
-                }
+                _ => Command::Error(format!(
+                    "ERR Unknown subcommand or wrong number of arguments for 'config|{}'",
+                    subcmd.to_lowercase()
+                )),
             }
         }
         "CLIENT" => {
@@ -2875,9 +4017,7 @@ pub async fn read_command(
                     // CLIENT LIST 可能有可选参数，但我们简化处理
                     Command::ClientList
                 }
-                "ID" => {
-                    Command::ClientId
-                }
+                "ID" => Command::ClientId,
                 "SETNAME" => {
                     let Some(name_bytes) = iter.next() else {
                         return Ok(Some(err_wrong_args("client|setname")));
@@ -2888,12 +4028,26 @@ pub async fn read_command(
                     };
                     Command::ClientSetname { name }
                 }
-                "GETNAME" => {
-                    Command::ClientGetname
+                "GETNAME" => Command::ClientGetname,
+                "PAUSE" => {
+                    let Some(timeout_bytes) = iter.next() else {
+                        return Ok(Some(err_wrong_args("client|pause")));
+                    };
+                    let timeout_ms = match parse_i64_from_bulk(timeout_bytes) {
+                        Ok(v) if v >= 0 => v as u64,
+                        _ => {
+                            return Ok(Some(Command::Error(
+                                "ERR timeout is not an integer or out of range".to_string(),
+                            )))
+                        }
+                    };
+                    Command::ClientPause { timeout_ms }
                 }
-                _ => {
-                    Command::Error(format!("ERR Unknown subcommand or wrong number of arguments for 'client|{}'", subcmd.to_lowercase()))
-                }
+                "UNPAUSE" => Command::ClientUnpause,
+                _ => Command::Error(format!(
+                    "ERR Unknown subcommand or wrong number of arguments for 'client|{}'",
+                    subcmd.to_lowercase()
+                )),
             }
         }
         "SLOWLOG" => {
@@ -2920,15 +4074,12 @@ pub async fn read_command(
                     };
                     Command::SlowlogGet { count }
                 }
-                "RESET" => {
-                    Command::SlowlogReset
-                }
-                "LEN" => {
-                    Command::SlowlogLen
-                }
-                _ => {
-                    Command::Error(format!("ERR Unknown subcommand or wrong number of arguments for 'slowlog|{}'", subcmd.to_lowercase()))
-                }
+                "RESET" => Command::SlowlogReset,
+                "LEN" => Command::SlowlogLen,
+                _ => Command::Error(format!(
+                    "ERR Unknown subcommand or wrong number of arguments for 'slowlog|{}'",
+                    subcmd.to_lowercase()
+                )),
             }
         }
         _ => Command::Unknown(std::iter::once(command_bytes).chain(iter).collect()),

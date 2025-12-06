@@ -105,10 +105,7 @@ pub struct ScriptContext {
 }
 
 /// Execute a Lua script with redis.call/pcall support
-pub fn execute_script(
-    script: &str,
-    ctx: ScriptContext,
-) -> Result<ScriptResult, String> {
+pub fn execute_script(script: &str, ctx: ScriptContext) -> Result<ScriptResult, String> {
     let lua = Lua::new();
 
     // Set up KEYS and ARGV tables
@@ -117,44 +114,62 @@ pub fn execute_script(
     // Create KEYS table (1-indexed)
     let keys_table = lua.create_table().map_err(|e| format!("ERR {}", e))?;
     for (i, key) in ctx.keys.iter().enumerate() {
-        keys_table.set(i + 1, key.as_str()).map_err(|e| format!("ERR {}", e))?;
+        keys_table
+            .set(i + 1, key.as_str())
+            .map_err(|e| format!("ERR {}", e))?;
     }
-    globals.set("KEYS", keys_table).map_err(|e| format!("ERR {}", e))?;
+    globals
+        .set("KEYS", keys_table)
+        .map_err(|e| format!("ERR {}", e))?;
 
     // Create ARGV table (1-indexed)
     let argv_table = lua.create_table().map_err(|e| format!("ERR {}", e))?;
     for (i, arg) in ctx.args.iter().enumerate() {
-        argv_table.set(i + 1, arg.as_str()).map_err(|e| format!("ERR {}", e))?;
+        argv_table
+            .set(i + 1, arg.as_str())
+            .map_err(|e| format!("ERR {}", e))?;
     }
-    globals.set("ARGV", argv_table).map_err(|e| format!("ERR {}", e))?;
+    globals
+        .set("ARGV", argv_table)
+        .map_err(|e| format!("ERR {}", e))?;
 
     // Create redis table with call/pcall
     let redis_table = lua.create_table().map_err(|e| format!("ERR {}", e))?;
-    
+
     // Shared context for redis.call/pcall
     let storage = ctx.storage.clone();
     let current_db = ctx.current_db;
-    
+
     // Wrap storage in Rc<RefCell> for sharing between closures
     let storage_rc = Rc::new(RefCell::new(storage));
-    
+
     // redis.call - executes command and raises error on failure
     let storage_call = storage_rc.clone();
-    let call_fn = lua.create_function(move |lua, args: mlua::MultiValue| -> mlua::Result<Value> {
-        let storage = storage_call.borrow();
-        execute_redis_command(lua, &storage, current_db, args, false)
-    }).map_err(|e| format!("ERR {}", e))?;
-    redis_table.set("call", call_fn).map_err(|e| format!("ERR {}", e))?;
-    
+    let call_fn = lua
+        .create_function(move |lua, args: mlua::MultiValue| -> mlua::Result<Value> {
+            let storage = storage_call.borrow();
+            execute_redis_command(lua, &storage, current_db, args, false)
+        })
+        .map_err(|e| format!("ERR {}", e))?;
+    redis_table
+        .set("call", call_fn)
+        .map_err(|e| format!("ERR {}", e))?;
+
     // redis.pcall - executes command and returns error as table on failure
     let storage_pcall = storage_rc.clone();
-    let pcall_fn = lua.create_function(move |lua, args: mlua::MultiValue| -> mlua::Result<Value> {
-        let storage = storage_pcall.borrow();
-        execute_redis_command(lua, &storage, current_db, args, true)
-    }).map_err(|e| format!("ERR {}", e))?;
-    redis_table.set("pcall", pcall_fn).map_err(|e| format!("ERR {}", e))?;
-    
-    globals.set("redis", redis_table).map_err(|e| format!("ERR {}", e))?;
+    let pcall_fn = lua
+        .create_function(move |lua, args: mlua::MultiValue| -> mlua::Result<Value> {
+            let storage = storage_pcall.borrow();
+            execute_redis_command(lua, &storage, current_db, args, true)
+        })
+        .map_err(|e| format!("ERR {}", e))?;
+    redis_table
+        .set("pcall", pcall_fn)
+        .map_err(|e| format!("ERR {}", e))?;
+
+    globals
+        .set("redis", redis_table)
+        .map_err(|e| format!("ERR {}", e))?;
 
     // Execute the script
     let result: Value = lua.load(script).eval().map_err(|e| format!("ERR {}", e))?;
@@ -375,16 +390,12 @@ fn script_result_to_lua<'lua>(lua: &'lua Lua, result: ScriptResult) -> mlua::Res
 
 /// Helper: convert bytes to String (for keys that must be UTF-8)
 fn bytes_to_string(bytes: &[u8]) -> Result<String, String> {
-    String::from_utf8(bytes.to_vec())
-        .map_err(|_| "ERR invalid UTF-8 in key".to_string())
+    String::from_utf8(bytes.to_vec()).map_err(|_| "ERR invalid UTF-8 in key".to_string())
 }
 
 /// Helper: convert bytes slice to Vec<String> (for keys)
 fn bytes_vec_to_strings(bytes_vec: &[Vec<u8>]) -> Result<Vec<String>, String> {
-    bytes_vec
-        .iter()
-        .map(|b| bytes_to_string(b))
-        .collect()
+    bytes_vec.iter().map(|b| bytes_to_string(b)).collect()
 }
 
 fn cmd_get(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<ScriptResult, String> {
@@ -406,8 +417,15 @@ fn cmd_set(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<ScriptRe
     let key_str = bytes_to_string(&args[0])?;
     let key = prefix_key(db, &key_str);
     let value = args[1].clone(); // Value is binary-safe
-    storage.set(key, value);
-    Ok(ScriptResult::Status("OK".to_string()))
+    match storage.set(key, value) {
+        Ok(()) => Ok(ScriptResult::Status("OK".to_string())),
+        Err(crate::storage::StorageError::Oom) => {
+            Err("OOM command not allowed when used memory > 'maxmemory'.".to_string())
+        }
+        Err(crate::storage::StorageError::WrongType) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
+    }
 }
 
 fn cmd_del(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<ScriptResult, String> {
@@ -438,7 +456,15 @@ fn cmd_incr(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<ScriptR
     let key = prefix_key(db, &key_str);
     match storage.incr(&key) {
         Ok(v) => Ok(ScriptResult::Integer(v)),
-        Err(()) => Err("ERR value is not an integer or out of range".to_string()),
+        Err(crate::storage::IncrError::Oom) => {
+            Err("OOM command not allowed when used memory > 'maxmemory'.".to_string())
+        }
+        Err(crate::storage::IncrError::WrongType) => {
+            Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
+        Err(crate::storage::IncrError::NotInteger) => {
+            Err("ERR value is not an integer or out of range".to_string())
+        }
     }
 }
 
@@ -450,7 +476,15 @@ fn cmd_decr(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<ScriptR
     let key = prefix_key(db, &key_str);
     match storage.decr(&key) {
         Ok(v) => Ok(ScriptResult::Integer(v)),
-        Err(()) => Err("ERR value is not an integer or out of range".to_string()),
+        Err(crate::storage::IncrError::Oom) => {
+            Err("OOM command not allowed when used memory > 'maxmemory'.".to_string())
+        }
+        Err(crate::storage::IncrError::WrongType) => {
+            Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
+        Err(crate::storage::IncrError::NotInteger) => {
+            Err("ERR value is not an integer or out of range".to_string())
+        }
     }
 }
 
@@ -461,10 +495,20 @@ fn cmd_incrby(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Scrip
     let key_str = bytes_to_string(&args[0])?;
     let key = prefix_key(db, &key_str);
     let delta_str = bytes_to_string(&args[1])?;
-    let delta: i64 = delta_str.parse().map_err(|_| "ERR value is not an integer or out of range".to_string())?;
+    let delta: i64 = delta_str
+        .parse()
+        .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
     match storage.incr_by(&key, delta) {
         Ok(v) => Ok(ScriptResult::Integer(v)),
-        Err(()) => Err("ERR value is not an integer or out of range".to_string()),
+        Err(crate::storage::IncrError::Oom) => {
+            Err("OOM command not allowed when used memory > 'maxmemory'.".to_string())
+        }
+        Err(crate::storage::IncrError::WrongType) => {
+            Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
+        Err(crate::storage::IncrError::NotInteger) => {
+            Err("ERR value is not an integer or out of range".to_string())
+        }
     }
 }
 
@@ -475,10 +519,20 @@ fn cmd_decrby(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Scrip
     let key_str = bytes_to_string(&args[0])?;
     let key = prefix_key(db, &key_str);
     let delta_str = bytes_to_string(&args[1])?;
-    let delta: i64 = delta_str.parse().map_err(|_| "ERR value is not an integer or out of range".to_string())?;
+    let delta: i64 = delta_str
+        .parse()
+        .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
     match storage.incr_by(&key, -delta) {
         Ok(v) => Ok(ScriptResult::Integer(v)),
-        Err(()) => Err("ERR value is not an integer or out of range".to_string()),
+        Err(crate::storage::IncrError::Oom) => {
+            Err("OOM command not allowed when used memory > 'maxmemory'.".to_string())
+        }
+        Err(crate::storage::IncrError::WrongType) => {
+            Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
+        Err(crate::storage::IncrError::NotInteger) => {
+            Err("ERR value is not an integer or out of range".to_string())
+        }
     }
 }
 
@@ -491,7 +545,12 @@ fn cmd_append(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Scrip
     let value = args[1].clone(); // Binary-safe
     match storage.append(&key, &value) {
         Ok(len) => Ok(ScriptResult::Integer(len as i64)),
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(crate::storage::StorageError::Oom) => {
+            Err("OOM command not allowed when used memory > 'maxmemory'.".to_string())
+        }
+        Err(crate::storage::StorageError::WrongType) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -503,7 +562,9 @@ fn cmd_strlen(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Scrip
     let key = prefix_key(db, &key_str);
     match storage.strlen(&key) {
         Ok(len) => Ok(ScriptResult::Integer(len as i64)),
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(()) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -531,7 +592,18 @@ fn cmd_mset(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<ScriptR
         let key_str = bytes_to_string(&args[i])?;
         let key = prefix_key(db, &key_str);
         let value = args[i + 1].clone(); // Binary-safe
-        storage.set(key, value);
+        match storage.set(key, value) {
+            Ok(()) => {}
+            Err(crate::storage::StorageError::Oom) => {
+                return Err("OOM command not allowed when used memory > 'maxmemory'.".to_string())
+            }
+            Err(crate::storage::StorageError::WrongType) => {
+                return Err(
+                    "ERR WRONGTYPE Operation against a key holding the wrong kind of value"
+                        .to_string(),
+                )
+            }
+        }
     }
     Ok(ScriptResult::Status("OK".to_string()))
 }
@@ -547,7 +619,9 @@ fn cmd_hget(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<ScriptR
     match storage.hget(&key, &field) {
         Ok(Some(v)) => Ok(ScriptResult::String(v)),
         Ok(None) => Ok(ScriptResult::Nil),
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(()) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -564,7 +638,15 @@ fn cmd_hset(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<ScriptR
         let value = String::from_utf8_lossy(value_bytes).to_string(); // Convert to String for storage
         match storage.hset(&key, &field, value) {
             Ok(added) => total_added += added as i64,
-            Err(()) => return Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+            Err(crate::storage::StorageError::Oom) => {
+                return Err("OOM command not allowed when used memory > 'maxmemory'.".to_string())
+            }
+            Err(crate::storage::StorageError::WrongType) => {
+                return Err(
+                    "ERR WRONGTYPE Operation against a key holding the wrong kind of value"
+                        .to_string(),
+                )
+            }
         }
     }
     Ok(ScriptResult::Integer(total_added))
@@ -579,7 +661,9 @@ fn cmd_hdel(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<ScriptR
     let fields = bytes_vec_to_strings(&args[1..])?;
     match storage.hdel(&key, &fields) {
         Ok(count) => Ok(ScriptResult::Integer(count as i64)),
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(()) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -592,7 +676,9 @@ fn cmd_hexists(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Scri
     let field = bytes_to_string(&args[1])?;
     match storage.hexists(&key, &field) {
         Ok(exists) => Ok(ScriptResult::Integer(if exists { 1 } else { 0 })),
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(()) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -611,7 +697,9 @@ fn cmd_hgetall(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Scri
             }
             Ok(ScriptResult::Array(results))
         }
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(()) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -623,13 +711,13 @@ fn cmd_hkeys(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Script
     let key = prefix_key(db, &key_str);
     match storage.hkeys(&key) {
         Ok(keys) => {
-            let results: Vec<ScriptResult> = keys
-                .into_iter()
-                .map(|k| ScriptResult::String(k))
-                .collect();
+            let results: Vec<ScriptResult> =
+                keys.into_iter().map(|k| ScriptResult::String(k)).collect();
             Ok(ScriptResult::Array(results))
         }
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(()) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -641,13 +729,13 @@ fn cmd_hvals(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Script
     let key = prefix_key(db, &key_str);
     match storage.hvals(&key) {
         Ok(vals) => {
-            let results: Vec<ScriptResult> = vals
-                .into_iter()
-                .map(|v| ScriptResult::String(v))
-                .collect();
+            let results: Vec<ScriptResult> =
+                vals.into_iter().map(|v| ScriptResult::String(v)).collect();
             Ok(ScriptResult::Array(results))
         }
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(()) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -659,7 +747,9 @@ fn cmd_hlen(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<ScriptR
     let key = prefix_key(db, &key_str);
     match storage.hlen(&key) {
         Ok(len) => Ok(ScriptResult::Integer(len as i64)),
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(()) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -681,7 +771,9 @@ fn cmd_hmget(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Script
                 .collect();
             Ok(ScriptResult::Array(results))
         }
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(()) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -708,7 +800,9 @@ fn cmd_hincrby(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Scri
     let key = prefix_key(db, &key_str);
     let field = bytes_to_string(&args[1])?;
     let delta_str = bytes_to_string(&args[2])?;
-    let delta: i64 = delta_str.parse().map_err(|_| "ERR value is not an integer or out of range".to_string())?;
+    let delta: i64 = delta_str
+        .parse()
+        .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
     match storage.hincr_by(&key, &field, delta, None) {
         Ok(new_val) => Ok(ScriptResult::Integer(new_val)),
         Err(_) => Err("ERR hash value is not an integer".to_string()),
@@ -722,10 +816,18 @@ fn cmd_lpush(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Script
     }
     let key_str = bytes_to_string(&args[0])?;
     let key = prefix_key(db, &key_str);
-    let values: Vec<String> = args[1..].iter().map(|v| String::from_utf8_lossy(v).to_string()).collect();
+    let values: Vec<String> = args[1..]
+        .iter()
+        .map(|v| String::from_utf8_lossy(v).to_string())
+        .collect();
     match storage.lpush(&key, &values) {
         Ok(len) => Ok(ScriptResult::Integer(len as i64)),
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(crate::storage::StorageError::Oom) => {
+            Err("OOM command not allowed when used memory > 'maxmemory'.".to_string())
+        }
+        Err(crate::storage::StorageError::WrongType) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -735,10 +837,18 @@ fn cmd_rpush(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Script
     }
     let key_str = bytes_to_string(&args[0])?;
     let key = prefix_key(db, &key_str);
-    let values: Vec<String> = args[1..].iter().map(|v| String::from_utf8_lossy(v).to_string()).collect();
+    let values: Vec<String> = args[1..]
+        .iter()
+        .map(|v| String::from_utf8_lossy(v).to_string())
+        .collect();
     match storage.rpush(&key, &values) {
         Ok(len) => Ok(ScriptResult::Integer(len as i64)),
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(crate::storage::StorageError::Oom) => {
+            Err("OOM command not allowed when used memory > 'maxmemory'.".to_string())
+        }
+        Err(crate::storage::StorageError::WrongType) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -751,7 +861,9 @@ fn cmd_lpop(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<ScriptR
     match storage.lpop(&key) {
         Ok(Some(v)) => Ok(ScriptResult::String(v)),
         Ok(None) => Ok(ScriptResult::Nil),
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(()) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -764,7 +876,9 @@ fn cmd_rpop(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<ScriptR
     match storage.rpop(&key) {
         Ok(Some(v)) => Ok(ScriptResult::String(v)),
         Ok(None) => Ok(ScriptResult::Nil),
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(()) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -776,7 +890,9 @@ fn cmd_llen(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<ScriptR
     let key = prefix_key(db, &key_str);
     match storage.llen(&key) {
         Ok(len) => Ok(ScriptResult::Integer(len as i64)),
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(()) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -788,8 +904,12 @@ fn cmd_lrange(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Scrip
     let key = prefix_key(db, &key_str);
     let start_str = bytes_to_string(&args[1])?;
     let stop_str = bytes_to_string(&args[2])?;
-    let start: isize = start_str.parse().map_err(|_| "ERR value is not an integer or out of range".to_string())?;
-    let stop: isize = stop_str.parse().map_err(|_| "ERR value is not an integer or out of range".to_string())?;
+    let start: isize = start_str
+        .parse()
+        .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
+    let stop: isize = stop_str
+        .parse()
+        .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
     match storage.lrange(&key, start, stop) {
         Ok(values) => {
             let results: Vec<ScriptResult> = values
@@ -798,7 +918,9 @@ fn cmd_lrange(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Scrip
                 .collect();
             Ok(ScriptResult::Array(results))
         }
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(()) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -809,11 +931,15 @@ fn cmd_lindex(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Scrip
     let key_str = bytes_to_string(&args[0])?;
     let key = prefix_key(db, &key_str);
     let index_str = bytes_to_string(&args[1])?;
-    let index: isize = index_str.parse().map_err(|_| "ERR value is not an integer or out of range".to_string())?;
+    let index: isize = index_str
+        .parse()
+        .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
     match storage.lindex(&key, index) {
         Ok(Some(v)) => Ok(ScriptResult::String(v)),
         Ok(None) => Ok(ScriptResult::Nil),
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(()) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -824,10 +950,18 @@ fn cmd_sadd(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<ScriptR
     }
     let key_str = bytes_to_string(&args[0])?;
     let key = prefix_key(db, &key_str);
-    let members: Vec<String> = args[1..].iter().map(|v| String::from_utf8_lossy(v).to_string()).collect();
+    let members: Vec<String> = args[1..]
+        .iter()
+        .map(|v| String::from_utf8_lossy(v).to_string())
+        .collect();
     match storage.sadd(&key, &members) {
         Ok(count) => Ok(ScriptResult::Integer(count as i64)),
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(crate::storage::StorageError::Oom) => {
+            Err("OOM command not allowed when used memory > 'maxmemory'.".to_string())
+        }
+        Err(crate::storage::StorageError::WrongType) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -837,10 +971,15 @@ fn cmd_srem(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<ScriptR
     }
     let key_str = bytes_to_string(&args[0])?;
     let key = prefix_key(db, &key_str);
-    let members: Vec<String> = args[1..].iter().map(|v| String::from_utf8_lossy(v).to_string()).collect();
+    let members: Vec<String> = args[1..]
+        .iter()
+        .map(|v| String::from_utf8_lossy(v).to_string())
+        .collect();
     match storage.srem(&key, &members) {
         Ok(count) => Ok(ScriptResult::Integer(count as i64)),
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(()) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -858,11 +997,17 @@ fn cmd_smembers(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Scr
                 .collect();
             Ok(ScriptResult::Array(results))
         }
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(()) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
-fn cmd_sismember(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<ScriptResult, String> {
+fn cmd_sismember(
+    storage: &Arc<Storage>,
+    db: u32,
+    args: &[Vec<u8>],
+) -> Result<ScriptResult, String> {
     if args.len() != 2 {
         return Err("ERR wrong number of arguments for 'sismember' command".to_string());
     }
@@ -871,7 +1016,9 @@ fn cmd_sismember(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Sc
     let member = String::from_utf8_lossy(&args[1]).to_string();
     match storage.sismember(&key, &member) {
         Ok(is_member) => Ok(ScriptResult::Integer(if is_member { 1 } else { 0 })),
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(()) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -883,7 +1030,9 @@ fn cmd_scard(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Script
     let key = prefix_key(db, &key_str);
     match storage.scard(&key) {
         Ok(count) => Ok(ScriptResult::Integer(count as i64)),
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(()) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -897,13 +1046,17 @@ fn cmd_zadd(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<ScriptR
     let mut members = Vec::new();
     for i in (1..args.len()).step_by(2) {
         let score_str = bytes_to_string(&args[i])?;
-        let score: f64 = score_str.parse().map_err(|_| "ERR value is not a valid float".to_string())?;
+        let score: f64 = score_str
+            .parse()
+            .map_err(|_| "ERR value is not a valid float".to_string())?;
         let member = String::from_utf8_lossy(&args[i + 1]).to_string();
         members.push((score, member));
     }
     match storage.zadd(&key, &members) {
         Ok(added) => Ok(ScriptResult::Integer(added as i64)),
-        Err(_) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(_) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -913,10 +1066,15 @@ fn cmd_zrem(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<ScriptR
     }
     let key_str = bytes_to_string(&args[0])?;
     let key = prefix_key(db, &key_str);
-    let members: Vec<String> = args[1..].iter().map(|v| String::from_utf8_lossy(v).to_string()).collect();
+    let members: Vec<String> = args[1..]
+        .iter()
+        .map(|v| String::from_utf8_lossy(v).to_string())
+        .collect();
     match storage.zrem(&key, &members) {
         Ok(count) => Ok(ScriptResult::Integer(count as i64)),
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(()) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -930,7 +1088,9 @@ fn cmd_zscore(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Scrip
     match storage.zscore(&key, &member) {
         Ok(Some(score)) => Ok(ScriptResult::String(score.to_string())),
         Ok(None) => Ok(ScriptResult::Nil),
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(()) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -942,7 +1102,9 @@ fn cmd_zcard(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Script
     let key = prefix_key(db, &key_str);
     match storage.zcard(&key) {
         Ok(count) => Ok(ScriptResult::Integer(count as i64)),
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(()) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -954,10 +1116,17 @@ fn cmd_zrange(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Scrip
     let key = prefix_key(db, &key_str);
     let start_str = bytes_to_string(&args[1])?;
     let stop_str = bytes_to_string(&args[2])?;
-    let start: isize = start_str.parse().map_err(|_| "ERR value is not an integer or out of range".to_string())?;
-    let stop: isize = stop_str.parse().map_err(|_| "ERR value is not an integer or out of range".to_string())?;
-    let withscores = args.len() > 3 && bytes_to_string(&args[3]).map(|s| s.to_uppercase() == "WITHSCORES").unwrap_or(false);
-    
+    let start: isize = start_str
+        .parse()
+        .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
+    let stop: isize = stop_str
+        .parse()
+        .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
+    let withscores = args.len() > 3
+        && bytes_to_string(&args[3])
+            .map(|s| s.to_uppercase() == "WITHSCORES")
+            .unwrap_or(false);
+
     match storage.zrange(&key, start, stop, false) {
         Ok(results) => {
             let mut script_results = Vec::new();
@@ -969,11 +1138,17 @@ fn cmd_zrange(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Scrip
             }
             Ok(ScriptResult::Array(script_results))
         }
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(()) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
-fn cmd_zrevrange(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<ScriptResult, String> {
+fn cmd_zrevrange(
+    storage: &Arc<Storage>,
+    db: u32,
+    args: &[Vec<u8>],
+) -> Result<ScriptResult, String> {
     if args.len() < 3 {
         return Err("ERR wrong number of arguments for 'zrevrange' command".to_string());
     }
@@ -981,10 +1156,17 @@ fn cmd_zrevrange(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Sc
     let key = prefix_key(db, &key_str);
     let start_str = bytes_to_string(&args[1])?;
     let stop_str = bytes_to_string(&args[2])?;
-    let start: isize = start_str.parse().map_err(|_| "ERR value is not an integer or out of range".to_string())?;
-    let stop: isize = stop_str.parse().map_err(|_| "ERR value is not an integer or out of range".to_string())?;
-    let withscores = args.len() > 3 && bytes_to_string(&args[3]).map(|s| s.to_uppercase() == "WITHSCORES").unwrap_or(false);
-    
+    let start: isize = start_str
+        .parse()
+        .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
+    let stop: isize = stop_str
+        .parse()
+        .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
+    let withscores = args.len() > 3
+        && bytes_to_string(&args[3])
+            .map(|s| s.to_uppercase() == "WITHSCORES")
+            .unwrap_or(false);
+
     // Use zrange with rev=true for zrevrange
     match storage.zrange(&key, start, stop, true) {
         Ok(results) => {
@@ -997,7 +1179,9 @@ fn cmd_zrevrange(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Sc
             }
             Ok(ScriptResult::Array(script_results))
         }
-        Err(()) => Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+        Err(()) => {
+            Err("ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        }
     }
 }
 
@@ -1039,7 +1223,9 @@ fn cmd_expire(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Scrip
     let key_str = bytes_to_string(&args[0])?;
     let key = prefix_key(db, &key_str);
     let seconds_str = bytes_to_string(&args[1])?;
-    let seconds: i64 = seconds_str.parse().map_err(|_| "ERR value is not an integer or out of range".to_string())?;
+    let seconds: i64 = seconds_str
+        .parse()
+        .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
     let success = storage.expire_seconds(&key, seconds);
     Ok(ScriptResult::Integer(if success { 1 } else { 0 }))
 }
@@ -1051,7 +1237,9 @@ fn cmd_pexpire(storage: &Arc<Storage>, db: u32, args: &[Vec<u8>]) -> Result<Scri
     let key_str = bytes_to_string(&args[0])?;
     let key = prefix_key(db, &key_str);
     let millis_str = bytes_to_string(&args[1])?;
-    let millis: i64 = millis_str.parse().map_err(|_| "ERR value is not an integer or out of range".to_string())?;
+    let millis: i64 = millis_str
+        .parse()
+        .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
     let success = storage.expire_millis(&key, millis);
     Ok(ScriptResult::Integer(if success { 1 } else { 0 }))
 }
@@ -1084,25 +1272,25 @@ mod tests {
         let cache = ScriptCache::new();
         let script = "return KEYS[1]";
         let sha1 = cache.load(script);
-        
+
         assert!(cache.get(&sha1).is_some());
         assert_eq!(cache.get(&sha1).unwrap(), script);
         assert_eq!(cache.exists(&[sha1.clone()]), vec![true]);
-        
+
         cache.flush();
         assert!(cache.get(&sha1).is_none());
     }
 
     #[test]
     fn test_simple_script_execution() {
-        let storage = Arc::new(Storage::new(None));
+        let storage = Arc::new(Storage::new(None, None));
         let ctx = ScriptContext {
             storage,
             current_db: 0,
             keys: vec!["key1".to_string()],
             args: vec!["arg1".to_string()],
         };
-        
+
         // Test returning integer
         let result = execute_script("return 42", ctx).unwrap();
         match result {
@@ -1113,14 +1301,14 @@ mod tests {
 
     #[test]
     fn test_script_with_keys_and_args() {
-        let storage = Arc::new(Storage::new(None));
+        let storage = Arc::new(Storage::new(None, None));
         let ctx = ScriptContext {
             storage,
             current_db: 0,
             keys: vec!["mykey".to_string()],
             args: vec!["myarg".to_string()],
         };
-        
+
         // Test accessing KEYS
         let result = execute_script("return KEYS[1]", ctx).unwrap();
         match result {
@@ -1131,14 +1319,14 @@ mod tests {
 
     #[test]
     fn test_script_returning_array() {
-        let storage = Arc::new(Storage::new(None));
+        let storage = Arc::new(Storage::new(None, None));
         let ctx = ScriptContext {
             storage,
             current_db: 0,
             keys: vec![],
             args: vec![],
         };
-        
+
         let result = execute_script("return {1, 2, 3}", ctx).unwrap();
         match result {
             ScriptResult::Array(arr) => {
