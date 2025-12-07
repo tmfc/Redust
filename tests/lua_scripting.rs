@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 
+use serial_test::serial;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -290,6 +291,86 @@ async fn test_eval_boolean_conversion() {
     client.send_command(&["EVAL", "return false", "0"]).await;
     let result = client.read_bulk_string().await;
     assert_eq!(result, None);
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+#[serial]
+async fn test_eval_timeout_limit() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // 设置一个很短的超时时间（100ms）
+    client.send_command(&["CONFIG", "SET", "lua-time-limit", "100"]).await;
+    let _ = client.read_simple_string().await;
+
+    // 执行一个无限循环脚本，应该超时
+    client.send_command(&["EVAL", "while true do end", "0"]).await;
+    let err = client.read_error().await;
+    assert!(err.contains("BUSY") || err.contains("maximum execution time"), 
+            "Expected timeout error, got: {}", err);
+
+    // 恢复默认超时
+    client.send_command(&["CONFIG", "SET", "lua-time-limit", "5000"]).await;
+    let _ = client.read_simple_string().await;
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+#[serial]
+async fn test_config_lua_limits() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // 先重置为默认值（因为其他测试可能修改了全局状态）
+    client.send_command(&["CONFIG", "SET", "lua-time-limit", "5000"]).await;
+    let _ = client.read_simple_string().await;
+    client.send_command(&["CONFIG", "SET", "lua-max-memory", "10485760"]).await;
+    let _ = client.read_simple_string().await;
+
+    // 获取 lua-time-limit 配置
+    client.send_command(&["CONFIG", "GET", "lua-time-limit"]).await;
+    let len = client.read_array_len().await;
+    assert_eq!(len, 2);
+    let key = client.read_bulk_string().await;
+    assert_eq!(key, Some("lua-time-limit".to_string()));
+    let value = client.read_bulk_string().await;
+    assert!(value.is_some());
+
+    // 获取 lua-max-memory 配置
+    client.send_command(&["CONFIG", "GET", "lua-max-memory"]).await;
+    let len = client.read_array_len().await;
+    assert_eq!(len, 2);
+    let key = client.read_bulk_string().await;
+    assert_eq!(key, Some("lua-max-memory".to_string()));
+    let value = client.read_bulk_string().await;
+    assert!(value.is_some());
+
+    // 设置 lua-time-limit 为一个特定值
+    client.send_command(&["CONFIG", "SET", "lua-time-limit", "2000"]).await;
+    let result = client.read_simple_string().await;
+    assert_eq!(result, "OK");
+
+    // 验证设置生效
+    client.send_command(&["CONFIG", "GET", "lua-time-limit"]).await;
+    let _ = client.read_array_len().await;
+    let _ = client.read_bulk_string().await;
+    let value = client.read_bulk_string().await;
+    assert_eq!(value, Some("2000".to_string()));
+
+    // 设置 lua-max-memory 为一个特定值
+    client.send_command(&["CONFIG", "SET", "lua-max-memory", "8388608"]).await;
+    let result = client.read_simple_string().await;
+    assert_eq!(result, "OK");
+
+    // 验证设置生效（立即读取刚设置的值）
+    client.send_command(&["CONFIG", "GET", "lua-max-memory"]).await;
+    let _ = client.read_array_len().await;
+    let _ = client.read_bulk_string().await;
+    let value = client.read_bulk_string().await;
+    assert_eq!(value, Some("8388608".to_string()));
 
     let _ = shutdown.send(());
 }

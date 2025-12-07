@@ -806,6 +806,7 @@ dependencies = [
  "log",
  "mlua",
  "ordered-float",
+ "parking_lot",
  "rand",
  "redis",
  "serial_test",

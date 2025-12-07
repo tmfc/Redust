@@ -1,13 +1,94 @@
 //! Lua scripting support for Redis-compatible EVAL/EVALSHA commands.
 
 use dashmap::DashMap;
-use mlua::{Lua, Value};
+use mlua::{Lua, Value, HookTriggers};
 use sha1::{Digest, Sha1};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use crate::storage::Storage;
+
+/// Lua 脚本资源限制配置
+pub struct ScriptLimits {
+    /// 最大执行时间（毫秒），0 表示不限制
+    pub timeout_ms: u64,
+    /// 最大内存使用（字节），0 表示不限制
+    pub max_memory: usize,
+}
+
+impl Default for ScriptLimits {
+    fn default() -> Self {
+        Self {
+            // 默认 5 秒超时（Redis 默认也是 5 秒）
+            timeout_ms: 5000,
+            // 默认 10MB 内存限制
+            max_memory: 10 * 1024 * 1024,
+        }
+    }
+}
+
+impl ScriptLimits {
+    /// 从环境变量加载配置
+    pub fn from_env() -> Self {
+        let timeout_ms = std::env::var("REDUST_LUA_TIME_LIMIT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5000);
+        let max_memory = std::env::var("REDUST_LUA_MAX_MEMORY")
+            .ok()
+            .and_then(|s| parse_memory_size(&s))
+            .unwrap_or(10 * 1024 * 1024);
+        Self { timeout_ms, max_memory }
+    }
+}
+
+/// 解析内存大小字符串（支持 KB/MB/GB 后缀）
+fn parse_memory_size(s: &str) -> Option<usize> {
+    let s = s.trim().to_uppercase();
+    if let Some(num) = s.strip_suffix("GB") {
+        num.trim().parse::<usize>().ok().map(|n| n * 1024 * 1024 * 1024)
+    } else if let Some(num) = s.strip_suffix("MB") {
+        num.trim().parse::<usize>().ok().map(|n| n * 1024 * 1024)
+    } else if let Some(num) = s.strip_suffix("KB") {
+        num.trim().parse::<usize>().ok().map(|n| n * 1024)
+    } else {
+        s.parse().ok()
+    }
+}
+
+/// 全局脚本限制配置
+static LUA_TIMEOUT_MS: AtomicU64 = AtomicU64::new(5000);
+static LUA_MAX_MEMORY: AtomicUsize = AtomicUsize::new(10 * 1024 * 1024);
+
+/// 初始化全局脚本限制（从环境变量读取）
+pub fn init_script_limits() {
+    let limits = ScriptLimits::from_env();
+    LUA_TIMEOUT_MS.store(limits.timeout_ms, Ordering::Relaxed);
+    LUA_MAX_MEMORY.store(limits.max_memory, Ordering::Relaxed);
+}
+
+/// 设置脚本超时时间（毫秒）
+pub fn set_lua_timeout_ms(ms: u64) {
+    LUA_TIMEOUT_MS.store(ms, Ordering::Relaxed);
+}
+
+/// 获取脚本超时时间（毫秒）
+pub fn get_lua_timeout_ms() -> u64 {
+    LUA_TIMEOUT_MS.load(Ordering::Relaxed)
+}
+
+/// 设置脚本最大内存（字节）
+pub fn set_lua_max_memory(bytes: usize) {
+    LUA_MAX_MEMORY.store(bytes, Ordering::Relaxed);
+}
+
+/// 获取脚本最大内存（字节）
+pub fn get_lua_max_memory() -> usize {
+    LUA_MAX_MEMORY.load(Ordering::Relaxed)
+}
 
 /// Script cache: SHA1 -> script source
 pub struct ScriptCache {
@@ -105,11 +186,40 @@ pub struct ScriptContext {
 }
 
 /// Execute a Lua script with redis.call/pcall support
+/// 支持超时和内存限制，防止恶意脚本耗尽资源
 pub fn execute_script(
     script: &str,
     ctx: ScriptContext,
 ) -> Result<ScriptResult, String> {
     let lua = Lua::new();
+
+    // 设置内存限制
+    let max_memory = LUA_MAX_MEMORY.load(Ordering::Relaxed);
+    if max_memory > 0 {
+        lua.set_memory_limit(max_memory)
+            .map_err(|e| format!("ERR failed to set memory limit: {}", e))?;
+    }
+
+    // 设置超时 hook
+    let timeout_ms = LUA_TIMEOUT_MS.load(Ordering::Relaxed);
+    if timeout_ms > 0 {
+        let start_time = Instant::now();
+        let timeout_duration = std::time::Duration::from_millis(timeout_ms);
+        
+        // 每执行 10000 条指令检查一次超时
+        lua.set_hook(
+            HookTriggers::new().every_nth_instruction(10000),
+            move |_lua, _debug| {
+                if start_time.elapsed() > timeout_duration {
+                    Err(mlua::Error::RuntimeError(
+                        "ERR BUSY script exceeded maximum execution time".to_string()
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+    }
 
     // Set up KEYS and ARGV tables
     let globals = lua.globals();
@@ -157,7 +267,17 @@ pub fn execute_script(
     globals.set("redis", redis_table).map_err(|e| format!("ERR {}", e))?;
 
     // Execute the script
-    let result: Value = lua.load(script).eval().map_err(|e| format!("ERR {}", e))?;
+    let result: Value = lua.load(script).eval().map_err(|e| {
+        let err_str = e.to_string();
+        // 检查是否是超时或内存错误
+        if err_str.contains("BUSY") || err_str.contains("maximum execution time") {
+            "ERR BUSY script exceeded maximum execution time".to_string()
+        } else if err_str.contains("not enough memory") || err_str.contains("memory allocation") {
+            "ERR script exceeded memory limit".to_string()
+        } else {
+            format!("ERR {}", e)
+        }
+    })?;
 
     // Convert Lua value to ScriptResult
     lua_value_to_result(result)

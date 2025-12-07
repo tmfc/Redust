@@ -1,65 +1,37 @@
 # TODO
 
-## 高优先级（小改动，高收益）
+## 高优先级（需立即修复）
 
-- [x] **SCAN TYPE 选项** ✅
-  - `SCAN cursor TYPE string|list|set|hash|zset` 按类型过滤
-  - 预估：小（已完成）
+- [x] **慢日志锁竞争优化** (src/server.rs) ✅
+  - 已使用 parking_lot::Mutex 替代 std::sync::Mutex
+  - parking_lot 性能更好、不会 panic、占用空间更小
 
-- [x] **SLOWLOG 实际实现** ✅
-  - 记录执行时间超过阈值的命令
-  - 维护固定大小的慢日志队列
-  - 完善 SLOWLOG GET/RESET/LEN 语义
-  - 环境变量：REDUST_SLOWLOG_SLOWER_THAN（微秒）、REDUST_SLOWLOG_MAX_LEN
+- [x] **Lua 脚本资源限制** (src/scripting.rs) ✅
+  - 已添加执行超时限制（lua-time-limit，默认 5000ms）
+  - 已添加内存使用限制（lua-max-memory，默认 10MB）
+  - 支持环境变量配置：REDUST_LUA_TIME_LIMIT_MS、REDUST_LUA_MAX_MEMORY
+  - 支持 CONFIG GET/SET 动态调整
 
-- [x] **HSCAN/ZSCAN NOVALUES 选项** ✅
-  - 仅返回 field/member 不返回 value，减少网络开销
-  - 预估：小（已完成）
+## 中优先级
 
-## 中优先级（中等改动）
+- [x] **RDB 文件损坏处理优化** (src/storage.rs:load_rdb) ✅
+  - 已改进错误处理：魔数/版本不匹配、UTF-8 解析失败等情况现在返回明确错误
+  - 添加了详细的错误日志（eprintln! 输出）
+  - 返回 io::Error 而非静默忽略，让调用方可以决定如何处理
 
-- [x] **事务中更多命令支持** ✅
-  - 支持 TYPE/KEYS/SCAN 等命令在事务中执行
-  - 预估：中（已完成）
+- [ ] **错误信息规范化** (src/command.rs, src/server.rs)
+  - 问题：某些错误响应可能暴露内部实现细节（如环境变量名）
+  - 建议：统一错误响应格式，隐藏内部细节
+  - 预估：小
 
-- [x] **CONFIG 动态配置支持** ✅
-  - 支持运行时修改 maxmemory、timeout、slowlog-log-slower-than 等配置
-  - 预估：中（已完成）
+## 低优先级（代码质量改进）
 
-- [x] **CLIENT 命令扩展** ✅
-  - CLIENT PAUSE/UNPAUSE（全局暂停/恢复）
-  - 预估：中（已完成）
+- [ ] **参数验证逻辑重构** (src/command.rs)
+  - 问题：参数验证逻辑存在重复代码
+  - 建议：提取公共验证函数，减少代码重复
+  - 预估：中
 
-## 低优先级（较大改动或探索性）
-
-- [x] **SCAN 游标稳定性优化** ✅
-  - 改进游标机制，使用键名哈希作为游标，避免并发写入时的重复
-  - 预估：大（已完成）
-
-- [x] **事务中 Lua 脚本支持** ✅
-  - 支持 EVAL/EVALSHA/SCRIPT 在 MULTI 中执行
-  - 预估：大（已完成）
-
-- [x] **集合性能优化** ✅
-  - SUNION/SINTER/SDIFF 性能优化
-  - 移除不必要的排序、使用 extend/retain、添加早期退出
-  - 预估：中（已完成）
-
----
-
-## 已完成（2025-12）
-
-### 高优先级功能
-- ✅ Set 命令补全：SMOVE（SPOP/SRANDMEMBER 已存在）
-- ✅ 阻塞列表命令：BLPOP、BRPOP（轮询实现）
-- ✅ HyperLogLog 稀疏表示优化：节省 90%+ 内存（小基数场景）
-
-### 模式匹配增强
-- ✅ `[^abc]` 取反字符集支持（KEYS/SCAN 命令）
-
-### 命令补全批次
-- ✅ Hash 命令：HSETNX、HSTRLEN、HMSET
-- ✅ List 命令：LTRIM、LSET、LINSERT、RPOPLPUSH、LPOS
-- ✅ Sorted Set 命令：ZCOUNT、ZRANK/ZREVRANK、ZPOPMIN/ZPOPMAX、ZINTER/ZUNION/ZDIFF 及 STORE 变体、ZLEXCOUNT
-- ✅ Generic 命令：COPY、UNLINK、TOUCH、OBJECT ENCODING
-- ✅ Expire 命令：EXPIREAT、PEXPIREAT、EXPIRETIME、PEXPIRETIME
+- [ ] **Prometheus 指标完善**
+  - 问题：可能缺少某些关键性能指标
+  - 建议：增加命令延迟分布、内存使用详情等指标
+  - 预估：小

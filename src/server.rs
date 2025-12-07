@@ -62,9 +62,10 @@ struct SlowLogEntry {
 }
 
 /// 慢日志管理器
+/// 使用 parking_lot::Mutex 替代 std::sync::Mutex，性能更好且不会 panic
 struct SlowLog {
     /// 慢日志条目队列
-    entries: std::sync::Mutex<std::collections::VecDeque<SlowLogEntry>>,
+    entries: parking_lot::Mutex<std::collections::VecDeque<SlowLogEntry>>,
     /// 下一个条目 ID
     next_id: AtomicU64,
     /// 慢查询阈值（微秒），超过此值的命令会被记录
@@ -86,7 +87,7 @@ impl SlowLog {
             .unwrap_or(128usize);
         
         SlowLog {
-            entries: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            entries: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             next_id: AtomicU64::new(0),
             threshold_us: AtomicU64::new(threshold),
             max_len: AtomicUsize::new(max_len),
@@ -119,7 +120,7 @@ impl SlowLog {
         };
         
         let max_len = self.max_len.load(Ordering::Relaxed);
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock();
         entries.push_front(entry);
         while entries.len() > max_len {
             entries.pop_back();
@@ -128,20 +129,20 @@ impl SlowLog {
     
     /// 获取最近的 N 条慢日志
     fn get(&self, count: Option<usize>) -> Vec<SlowLogEntry> {
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.lock();
         let n = count.unwrap_or(10).min(entries.len());
         entries.iter().take(n).cloned().collect()
     }
     
     /// 重置慢日志
     fn reset(&self) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock();
         entries.clear();
     }
     
     /// 获取慢日志长度
     fn len(&self) -> usize {
-        self.entries.lock().unwrap().len()
+        self.entries.lock().len()
     }
 
     fn set_threshold_us(&self, threshold: u64) {
@@ -151,7 +152,7 @@ impl SlowLog {
     fn set_max_len(&self, len: usize) {
         self.max_len.store(len, Ordering::Relaxed);
         // 立即裁剪队列以匹配新限制
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock();
         while entries.len() > len {
             entries.pop_back();
         }
@@ -4607,6 +4608,9 @@ pub async fn serve(
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send,
 ) -> io::Result<()> {
+    // 初始化 Lua 脚本资源限制
+    crate::scripting::init_script_limits();
+    
     let local_addr = listener.local_addr()?;
     let port = local_addr.port();
     let maxmemory_bytes = env::var("REDUST_MAXMEMORY_BYTES")
@@ -4843,6 +4847,8 @@ fn get_config_values(pattern: &str, storage: &Storage, slowlog: &SlowLog) -> Vec
         ("loglevel", "notice".to_string()),
         ("slowlog-log-slower-than", slowlog.threshold_us().to_string()),
         ("slowlog-max-len", slowlog.max_len().to_string()),
+        ("lua-time-limit", crate::scripting::get_lua_timeout_ms().to_string()),
+        ("lua-max-memory", crate::scripting::get_lua_max_memory().to_string()),
     ];
     
     for (key, value) in configs {
@@ -4897,6 +4903,20 @@ fn set_config_value(
                 return Err("ERR slowlog-max-len must be positive".to_string());
             }
             slowlog.set_max_len(len);
+            Ok(())
+        }
+        "lua-time-limit" => {
+            let ms: u64 = value
+                .parse()
+                .map_err(|_| "ERR invalid lua-time-limit value".to_string())?;
+            crate::scripting::set_lua_timeout_ms(ms);
+            Ok(())
+        }
+        "lua-max-memory" => {
+            let bytes: usize = value
+                .parse()
+                .map_err(|_| "ERR invalid lua-max-memory value".to_string())?;
+            crate::scripting::set_lua_max_memory(bytes);
             Ok(())
         }
         _ => Err(format!("ERR Unsupported CONFIG parameter: {}", parameter)),

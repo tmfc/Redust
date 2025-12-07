@@ -370,6 +370,26 @@ enum HllRepr {
   - 已实现完整的慢日志功能：记录超过阈值的命令、维护固定大小队列。
   - 支持 SLOWLOG GET/RESET/LEN 完整语义。
   - 环境变量配置：REDUST_SLOWLOG_SLOWER_THAN（微秒）、REDUST_SLOWLOG_MAX_LEN。
+  - 🔧 **性能优化**：使用 `parking_lot::Mutex` 替代 `std::sync::Mutex`，减少锁竞争开销。
+
+- [x] **Lua 脚本资源限制** ✅ 已完成（2025-12）
+  - 已添加执行超时限制，使用 mlua hook 机制每 10000 条指令检查一次。
+  - 已添加内存使用限制，使用 mlua set_memory_limit API。
+  - 环境变量配置：REDUST_LUA_TIME_LIMIT_MS（默认 5000ms）、REDUST_LUA_MAX_MEMORY（默认 10MB）。
+  - 支持 CONFIG GET/SET 动态调整：lua-time-limit、lua-max-memory。
+  - 🔮 **未来改进**：
+    - 添加 SCRIPT KILL 命令支持，允许终止正在运行的脚本。
+    - 考虑更细粒度的资源监控（如 CPU 时间 vs 墙钟时间）。
+    - 添加脚本执行统计指标到 Prometheus。
+
+- [x] **RDB 文件损坏处理优化** ✅ 已完成（2025-12）
+  - 改进了 `load_rdb` 函数的错误处理，不再静默忽略损坏的文件。
+  - 魔数不匹配、版本不支持、UTF-8 解析失败等情况现在返回 `io::Error`。
+  - 添加了详细的错误日志输出（`eprintln!`），便于问题诊断。
+  - 🔮 **未来改进**：
+    - 添加 RDB 文件校验和验证。
+    - 实现损坏文件的自动备份机制。
+    - 考虑部分恢复策略（跳过损坏的键，恢复可读的数据）。
 
 - [x] **CLIENT 命令扩展**（部分完成）
   - 已支持：LIST/ID/SETNAME/GETNAME/PAUSE/UNPAUSE。

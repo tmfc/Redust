@@ -3079,20 +3079,43 @@ impl Storage {
         let mut file = File::open(path_ref)?;
 
         let mut magic = [0u8; 8];
-        if file.read_exact(&mut magic).is_err() {
-            return Ok(());
+        if let Err(e) = file.read_exact(&mut magic) {
+            eprintln!("[rdb] warning: failed to read magic header from {:?}: {}", path_ref, e);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("RDB file {:?} is corrupted: cannot read magic header", path_ref),
+            ));
         }
         if &magic != b"REDUSTDB" {
-            return Ok(());
+            eprintln!(
+                "[rdb] warning: invalid magic header in {:?}, expected REDUSTDB, got {:?}",
+                path_ref,
+                String::from_utf8_lossy(&magic)
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("RDB file {:?} has invalid magic header", path_ref),
+            ));
         }
 
         let mut version_bytes = [0u8; 4];
-        if file.read_exact(&mut version_bytes).is_err() {
-            return Ok(());
+        if let Err(e) = file.read_exact(&mut version_bytes) {
+            eprintln!("[rdb] warning: failed to read version from {:?}: {}", path_ref, e);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("RDB file {:?} is corrupted: cannot read version", path_ref),
+            ));
         }
         let version = u32::from_le_bytes(version_bytes);
         if version != 1 {
-            return Ok(());
+            eprintln!(
+                "[rdb] warning: unsupported RDB version {} in {:?}, expected version 1",
+                version, path_ref
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("RDB file {:?} has unsupported version {}", path_ref, version),
+            ));
         }
 
         self.data.clear();
@@ -3128,8 +3151,12 @@ impl Storage {
             }
             let key = match String::from_utf8(key_bytes) {
                 Ok(s) => s,
-                Err(_) => {
-                    return Ok(());
+                Err(e) => {
+                    eprintln!("[rdb] warning: invalid UTF-8 key in {:?}: {}", path_ref, e);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("RDB file {:?} contains invalid UTF-8 key", path_ref),
+                    ));
                 }
             };
 
@@ -3178,8 +3205,12 @@ impl Storage {
                         }
                         let s = match String::from_utf8(item) {
                             Ok(s) => s,
-                            Err(_) => {
-                                return Ok(());
+                            Err(e) => {
+                                eprintln!("[rdb] warning: invalid UTF-8 in list item: {}", e);
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "RDB file contains invalid UTF-8 in list",
+                                ));
                             }
                         };
                         list.push_back(s);
@@ -3208,8 +3239,12 @@ impl Storage {
                         }
                         let s = match String::from_utf8(member) {
                             Ok(s) => s,
-                            Err(_) => {
-                                return Ok(());
+                            Err(e) => {
+                                eprintln!("[rdb] warning: invalid UTF-8 in set member: {}", e);
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "RDB file contains invalid UTF-8 in set",
+                                ));
                             }
                         };
                         set.insert(s);
@@ -3238,8 +3273,12 @@ impl Storage {
                         }
                         let field_str = match String::from_utf8(field) {
                             Ok(s) => s,
-                            Err(_) => {
-                                return Ok(());
+                            Err(e) => {
+                                eprintln!("[rdb] warning: invalid UTF-8 in hash field: {}", e);
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "RDB file contains invalid UTF-8 in hash field",
+                                ));
                             }
                         };
 
@@ -3254,8 +3293,12 @@ impl Storage {
                         }
                         let val_str = match String::from_utf8(val) {
                             Ok(s) => s,
-                            Err(_) => {
-                                return Ok(());
+                            Err(e) => {
+                                eprintln!("[rdb] warning: invalid UTF-8 in hash value: {}", e);
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "RDB file contains invalid UTF-8 in hash value",
+                                ));
                             }
                         };
 
@@ -3295,8 +3338,12 @@ impl Storage {
                         }
                         let member_str = match String::from_utf8(member) {
                             Ok(s) => s,
-                            Err(_) => {
-                                return Ok(());
+                            Err(e) => {
+                                eprintln!("[rdb] warning: invalid UTF-8 in zset member: {}", e);
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "RDB file contains invalid UTF-8 in zset",
+                                ));
                             }
                         };
 
@@ -3317,7 +3364,11 @@ impl Storage {
                     let hll = match HyperLogLog::from_registers(registers) {
                         Some(h) => h,
                         None => {
-                            return Ok(());
+                            eprintln!("[rdb] warning: invalid HyperLogLog registers");
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "RDB file contains invalid HyperLogLog data",
+                            ));
                         }
                     };
                     StorageValue::HyperLogLog {
@@ -3326,7 +3377,11 @@ impl Storage {
                     }
                 }
                 _ => {
-                    return Ok(());
+                    eprintln!("[rdb] warning: unknown data type {} in RDB file", t);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("RDB file contains unknown data type: {}", t),
+                    ));
                 }
             };
 
