@@ -88,6 +88,7 @@ async fn rejects_value_exceeding_limit() {
 async fn hincrby_respects_limit() {
     let _lock = ENV_LOCK.lock().unwrap();
     let _guard = set_env("REDUST_MAXVALUE_BYTES", "4");
+    let _guard2 = set_env("REDUST_DISABLE_PERSISTENCE", "1");
 
     let (addr, shutdown, handle) = spawn_server().await;
     let mut client = TestClient::connect(addr).await;
@@ -112,6 +113,7 @@ async fn hincrby_respects_limit() {
 async fn mset_respects_limit() {
     let _lock = ENV_LOCK.lock().unwrap();
     let _guard = set_env("REDUST_MAXVALUE_BYTES", "8");
+    let _guard2 = set_env("REDUST_DISABLE_PERSISTENCE", "1");
 
     let (addr, shutdown, handle) = spawn_server().await;
     let mut client = TestClient::connect(addr).await;
