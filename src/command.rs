@@ -749,14 +749,14 @@ fn parse_f64_from_bulk(bytes: Vec<u8>) -> Result<f64, Command> {
 fn parse_zrange_bound(bytes: Vec<u8>) -> Result<ZRangeBound, Command> {
     let s = parse_bulk_string(bytes)?;
     let s = s.trim();
-    
+
     if s.eq_ignore_ascii_case("-inf") {
         return Ok(ZRangeBound::NegInf);
     }
     if s.eq_ignore_ascii_case("+inf") || s.eq_ignore_ascii_case("inf") {
         return Ok(ZRangeBound::PosInf);
     }
-    
+
     // 检查是否是 exclusive (以 '(' 开头)
     if let Some(rest) = s.strip_prefix('(') {
         let v = rest.parse::<f64>().map_err(|_| err_not_float())?;
@@ -765,7 +765,7 @@ fn parse_zrange_bound(bytes: Vec<u8>) -> Result<ZRangeBound, Command> {
         }
         return Ok(ZRangeBound::Exclusive(v));
     }
-    
+
     // 默认是 inclusive
     let v = s.parse::<f64>().map_err(|_| err_not_float())?;
     if !v.is_finite() {
@@ -779,26 +779,28 @@ fn parse_zrange_bound(bytes: Vec<u8>) -> Result<ZRangeBound, Command> {
 fn parse_zlex_bound(bytes: Vec<u8>) -> Result<ZLexBound, Command> {
     let s = parse_bulk_string(bytes)?;
     let s = s.trim();
-    
+
     if s == "-" {
         return Ok(ZLexBound::NegInf);
     }
     if s == "+" {
         return Ok(ZLexBound::PosInf);
     }
-    
+
     // [value - inclusive
     if let Some(rest) = s.strip_prefix('[') {
         return Ok(ZLexBound::Inclusive(rest.to_string()));
     }
-    
+
     // (value - exclusive
     if let Some(rest) = s.strip_prefix('(') {
         return Ok(ZLexBound::Exclusive(rest.to_string()));
     }
-    
+
     // 无效格式
-    Err(Command::Error("ERR min or max not valid string range item".to_string()))
+    Err(Command::Error(
+        "ERR min or max not valid string range item".to_string(),
+    ))
 }
 
 /// 解析 ZINTER/ZUNION 的可选参数: WEIGHTS, AGGREGATE, WITHSCORES
@@ -809,17 +811,17 @@ fn parse_zset_options(
     let mut weights: Option<Vec<f64>> = None;
     let mut aggregate: Option<ZAggregate> = None;
     let mut withscores = false;
-    
+
     // 收集剩余参数
     let remaining: Vec<Vec<u8>> = iter.collect();
     let mut i = 0;
-    
+
     while i < remaining.len() {
         let opt = match parse_bulk_string(remaining[i].clone()) {
             Ok(o) => o.to_uppercase(),
             Err(_) => return Err(CommandError::RedisError("ERR syntax error".to_string())),
         };
-        
+
         match opt.as_str() {
             "WEIGHTS" => {
                 i += 1;
@@ -830,7 +832,11 @@ fn parse_zset_options(
                     }
                     let weight = match parse_f64_from_bulk(remaining[i].clone()) {
                         Ok(v) => v,
-                        Err(_) => return Err(CommandError::RedisError("ERR weight value is not a float".to_string())),
+                        Err(_) => {
+                            return Err(CommandError::RedisError(
+                                "ERR weight value is not a float".to_string(),
+                            ))
+                        }
                     };
                     w.push(weight);
                     i += 1;
@@ -861,7 +867,7 @@ fn parse_zset_options(
             _ => return Err(CommandError::RedisError("ERR syntax error".to_string())),
         }
     }
-    
+
     Ok((weights, aggregate, withscores))
 }
 
@@ -1294,12 +1300,18 @@ pub async fn read_command(
                     replace = true;
                 } else if opt == "DB" {
                     // 跳过 DB 参数（不支持跨 DB 复制）
-                    return Ok(Some(Command::Error("ERR COPY with DB option is not supported".to_string())));
+                    return Ok(Some(Command::Error(
+                        "ERR COPY with DB option is not supported".to_string(),
+                    )));
                 } else {
                     return Ok(Some(err_wrong_args("copy")));
                 }
             }
-            Command::Copy { source, destination, replace }
+            Command::Copy {
+                source,
+                destination,
+                replace,
+            }
         }
         "TOUCH" => {
             let mut keys = Vec::new();
@@ -1336,7 +1348,10 @@ pub async fn read_command(
                     }
                     Command::ObjectEncoding { key }
                 }
-                _ => Command::Error(format!("ERR Unknown subcommand or wrong number of arguments for '{}'", subcmd)),
+                _ => Command::Error(format!(
+                    "ERR Unknown subcommand or wrong number of arguments for '{}'",
+                    subcmd
+                )),
             }
         }
         "EXISTS" => {
@@ -1937,7 +1952,11 @@ pub async fn read_command(
             let count = if let Some(count_bytes) = iter.next() {
                 Some(match parse_isize_from_bulk(count_bytes) {
                     Ok(v) if v > 0 => v as usize,
-                    Ok(_) => return Ok(Some(Command::Error("ERR value is out of range, must be positive".to_string()))),
+                    Ok(_) => {
+                        return Ok(Some(Command::Error(
+                            "ERR value is out of range, must be positive".to_string(),
+                        )))
+                    }
                     Err(e) => return Ok(Some(e)),
                 })
             } else {
@@ -1959,7 +1978,11 @@ pub async fn read_command(
             let count = if let Some(count_bytes) = iter.next() {
                 Some(match parse_isize_from_bulk(count_bytes) {
                     Ok(v) if v > 0 => v as usize,
-                    Ok(_) => return Ok(Some(Command::Error("ERR value is out of range, must be positive".to_string()))),
+                    Ok(_) => {
+                        return Ok(Some(Command::Error(
+                            "ERR value is out of range, must be positive".to_string(),
+                        )))
+                    }
                     Err(e) => return Ok(Some(e)),
                 })
             } else {
@@ -1990,7 +2013,12 @@ pub async fn read_command(
                 });
             }
             let (weights, aggregate, withscores) = parse_zset_options(&mut iter, numkeys)?;
-            Command::Zinter { keys, weights, aggregate, withscores }
+            Command::Zinter {
+                keys,
+                weights,
+                aggregate,
+                withscores,
+            }
         }
         "ZUNION" => {
             let Some(numkeys_bytes) = iter.next() else {
@@ -2011,7 +2039,12 @@ pub async fn read_command(
                 });
             }
             let (weights, aggregate, withscores) = parse_zset_options(&mut iter, numkeys)?;
-            Command::Zunion { keys, weights, aggregate, withscores }
+            Command::Zunion {
+                keys,
+                weights,
+                aggregate,
+                withscores,
+            }
         }
         "ZDIFF" => {
             let Some(numkeys_bytes) = iter.next() else {
@@ -2071,7 +2104,12 @@ pub async fn read_command(
                 });
             }
             let (weights, aggregate, _) = parse_zset_options(&mut iter, numkeys)?;
-            Command::Zinterstore { destination, keys, weights, aggregate }
+            Command::Zinterstore {
+                destination,
+                keys,
+                weights,
+                aggregate,
+            }
         }
         "ZUNIONSTORE" => {
             let Some(dest_bytes) = iter.next() else {
@@ -2099,7 +2137,12 @@ pub async fn read_command(
                 });
             }
             let (weights, aggregate, _) = parse_zset_options(&mut iter, numkeys)?;
-            Command::Zunionstore { destination, keys, weights, aggregate }
+            Command::Zunionstore {
+                destination,
+                keys,
+                weights,
+                aggregate,
+            }
         }
         "ZDIFFSTORE" => {
             let Some(dest_bytes) = iter.next() else {
@@ -2534,7 +2577,12 @@ pub async fn read_command(
             if iter.next().is_some() {
                 return Ok(Some(err_wrong_args("linsert")));
             }
-            Command::Linsert { key, before, pivot, value }
+            Command::Linsert {
+                key,
+                before,
+                pivot,
+                value,
+            }
         }
         "RPOPLPUSH" => {
             let Some(src_bytes) = iter.next() else {
@@ -2554,7 +2602,10 @@ pub async fn read_command(
             if iter.next().is_some() {
                 return Ok(Some(err_wrong_args("rpoplpush")));
             }
-            Command::Rpoplpush { source, destination }
+            Command::Rpoplpush {
+                source,
+                destination,
+            }
         }
         "BLPOP" => {
             // BLPOP key [key ...] timeout
@@ -2578,7 +2629,11 @@ pub async fn read_command(
             let timeout = match parse_bulk_string(timeout_bytes.clone()) {
                 Ok(s) => match s.parse::<f64>() {
                     Ok(t) if t >= 0.0 => t,
-                    _ => return Ok(Some(Command::Error("ERR timeout is not a float or out of range".to_string()))),
+                    _ => {
+                        return Ok(Some(Command::Error(
+                            "ERR timeout is not a float or out of range".to_string(),
+                        )))
+                    }
                 },
                 Err(e) => return Ok(Some(e)),
             };
@@ -2606,7 +2661,11 @@ pub async fn read_command(
             let timeout = match parse_bulk_string(timeout_bytes.clone()) {
                 Ok(s) => match s.parse::<f64>() {
                     Ok(t) if t >= 0.0 => t,
-                    _ => return Ok(Some(Command::Error("ERR timeout is not a float or out of range".to_string()))),
+                    _ => {
+                        return Ok(Some(Command::Error(
+                            "ERR timeout is not a float or out of range".to_string(),
+                        )))
+                    }
                 },
                 Err(e) => return Ok(Some(e)),
             };
@@ -2666,7 +2725,13 @@ pub async fn read_command(
                     _ => return Ok(Some(err_syntax())),
                 }
             }
-            Command::Lpos { key, element, rank, count, maxlen }
+            Command::Lpos {
+                key,
+                element,
+                rank,
+                count,
+                maxlen,
+            }
         }
         "SADD" => {
             let Some(key_bytes) = iter.next() else {
@@ -2925,7 +2990,11 @@ pub async fn read_command(
             if iter.next().is_some() {
                 return Ok(Some(err_wrong_args("smove")));
             }
-            Command::Smove { source, destination, member }
+            Command::Smove {
+                source,
+                destination,
+                member,
+            }
         }
         "HSET" => {
             let Some(key_bytes) = iter.next() else {
@@ -3869,9 +3938,10 @@ pub async fn read_command(
                     // 忽略可选的 ASYNC/SYNC 参数
                     Command::ScriptFlush
                 }
-                _ => {
-                    Command::Error(format!("ERR Unknown SCRIPT subcommand or wrong number of arguments for '{}'", subcmd))
-                }
+                _ => Command::Error(format!(
+                    "ERR Unknown SCRIPT subcommand or wrong number of arguments for '{}'",
+                    subcmd
+                )),
             }
         }
         "CONFIG" => {
@@ -3916,9 +3986,10 @@ pub async fn read_command(
                     }
                     Command::ConfigSet { parameter, value }
                 }
-                _ => {
-                    Command::Error(format!("ERR Unknown subcommand or wrong number of arguments for 'config|{}'", subcmd.to_lowercase()))
-                }
+                _ => Command::Error(format!(
+                    "ERR Unknown subcommand or wrong number of arguments for 'config|{}'",
+                    subcmd.to_lowercase()
+                )),
             }
         }
         "CLIENT" => {
@@ -3934,9 +4005,7 @@ pub async fn read_command(
                     // CLIENT LIST 可能有可选参数，但我们简化处理
                     Command::ClientList
                 }
-                "ID" => {
-                    Command::ClientId
-                }
+                "ID" => Command::ClientId,
                 "SETNAME" => {
                     let Some(name_bytes) = iter.next() else {
                         return Ok(Some(err_wrong_args("client|setname")));
@@ -3947,25 +4016,26 @@ pub async fn read_command(
                     };
                     Command::ClientSetname { name }
                 }
-                "GETNAME" => {
-                    Command::ClientGetname
-                }
+                "GETNAME" => Command::ClientGetname,
                 "PAUSE" => {
                     let Some(timeout_bytes) = iter.next() else {
                         return Ok(Some(err_wrong_args("client|pause")));
                     };
                     let timeout_ms = match parse_i64_from_bulk(timeout_bytes) {
                         Ok(v) if v >= 0 => v as u64,
-                        _ => return Ok(Some(Command::Error("ERR timeout is not an integer or out of range".to_string()))),
+                        _ => {
+                            return Ok(Some(Command::Error(
+                                "ERR timeout is not an integer or out of range".to_string(),
+                            )))
+                        }
                     };
                     Command::ClientPause { timeout_ms }
                 }
-                "UNPAUSE" => {
-                    Command::ClientUnpause
-                }
-                _ => {
-                    Command::Error(format!("ERR Unknown subcommand or wrong number of arguments for 'client|{}'", subcmd.to_lowercase()))
-                }
+                "UNPAUSE" => Command::ClientUnpause,
+                _ => Command::Error(format!(
+                    "ERR Unknown subcommand or wrong number of arguments for 'client|{}'",
+                    subcmd.to_lowercase()
+                )),
             }
         }
         "SLOWLOG" => {
@@ -3992,15 +4062,12 @@ pub async fn read_command(
                     };
                     Command::SlowlogGet { count }
                 }
-                "RESET" => {
-                    Command::SlowlogReset
-                }
-                "LEN" => {
-                    Command::SlowlogLen
-                }
-                _ => {
-                    Command::Error(format!("ERR Unknown subcommand or wrong number of arguments for 'slowlog|{}'", subcmd.to_lowercase()))
-                }
+                "RESET" => Command::SlowlogReset,
+                "LEN" => Command::SlowlogLen,
+                _ => Command::Error(format!(
+                    "ERR Unknown subcommand or wrong number of arguments for 'slowlog|{}'",
+                    subcmd.to_lowercase()
+                )),
             }
         }
         _ => Command::Unknown(std::iter::once(command_bytes).chain(iter).collect()),

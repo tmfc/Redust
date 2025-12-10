@@ -151,7 +151,9 @@ async fn test_eval_with_keys() {
     let mut client = TestClient::connect(addr).await;
 
     // EVAL "return KEYS[1]" 1 mykey
-    client.send_command(&["EVAL", "return KEYS[1]", "1", "mykey"]).await;
+    client
+        .send_command(&["EVAL", "return KEYS[1]", "1", "mykey"])
+        .await;
     let result = client.read_bulk_string().await;
     assert_eq!(result, Some("mykey".to_string()));
 
@@ -164,7 +166,9 @@ async fn test_eval_with_argv() {
     let mut client = TestClient::connect(addr).await;
 
     // EVAL "return ARGV[1]" 0 myarg
-    client.send_command(&["EVAL", "return ARGV[1]", "0", "myarg"]).await;
+    client
+        .send_command(&["EVAL", "return ARGV[1]", "0", "myarg"])
+        .await;
     let result = client.read_bulk_string().await;
     assert_eq!(result, Some("myarg".to_string()));
 
@@ -177,7 +181,9 @@ async fn test_eval_return_array() {
     let mut client = TestClient::connect(addr).await;
 
     // EVAL "return {1, 2, 3}" 0
-    client.send_command(&["EVAL", "return {1, 2, 3}", "0"]).await;
+    client
+        .send_command(&["EVAL", "return {1, 2, 3}", "0"])
+        .await;
     let len = client.read_array_len().await;
     assert_eq!(len, 3);
     assert_eq!(client.read_integer().await, 1);
@@ -193,7 +199,9 @@ async fn test_eval_syntax_error() {
     let mut client = TestClient::connect(addr).await;
 
     // EVAL with syntax error
-    client.send_command(&["EVAL", "return invalid syntax here", "0"]).await;
+    client
+        .send_command(&["EVAL", "return invalid syntax here", "0"])
+        .await;
     let err = client.read_error().await;
     assert!(err.contains("ERR"));
 
@@ -224,7 +232,9 @@ async fn test_evalsha_noscript() {
     let mut client = TestClient::connect(addr).await;
 
     // EVALSHA with non-existent script
-    client.send_command(&["EVALSHA", "0000000000000000000000000000000000000000", "0"]).await;
+    client
+        .send_command(&["EVALSHA", "0000000000000000000000000000000000000000", "0"])
+        .await;
     let err = client.read_error().await;
     assert!(err.contains("NOSCRIPT"));
 
@@ -241,7 +251,14 @@ async fn test_script_exists() {
     let sha1 = client.read_bulk_string().await.unwrap();
 
     // SCRIPT EXISTS <sha1> <nonexistent>
-    client.send_command(&["SCRIPT", "EXISTS", &sha1, "0000000000000000000000000000000000000000"]).await;
+    client
+        .send_command(&[
+            "SCRIPT",
+            "EXISTS",
+            &sha1,
+            "0000000000000000000000000000000000000000",
+        ])
+        .await;
     let len = client.read_array_len().await;
     assert_eq!(len, 2);
     assert_eq!(client.read_integer().await, 1); // exists

@@ -16,7 +16,9 @@ fn temp_path(name: &str) -> PathBuf {
 async fn rdb_basic_roundtrip_via_storage() {
     let storage = Storage::default();
 
-    storage.set("foo".to_string(), b"bar".to_vec());
+    storage
+        .set("foo".to_string(), b"bar".to_vec())
+        .expect("set foo");
     storage
         .lpush("mylist", &vec!["a".to_string(), "b".to_string()])
         .unwrap();
@@ -25,7 +27,9 @@ async fn rdb_basic_roundtrip_via_storage() {
         .unwrap();
     storage.hset("myhash", "field", "val".to_string()).unwrap();
 
-    storage.set("ttl_key".to_string(), b"tv".to_vec());
+    storage
+        .set("ttl_key".to_string(), b"tv".to_vec())
+        .expect("set ttl_key");
     let _ = storage.expire_seconds("ttl_key", 10);
 
     let path = temp_path("roundtrip");
@@ -56,7 +60,7 @@ async fn rdb_basic_roundtrip_via_storage() {
 #[tokio::test]
 async fn rdb_does_not_restore_expired_keys() {
     let storage = Storage::default();
-    storage.set("k".to_string(), b"v".to_vec());
+    storage.set("k".to_string(), b"v".to_vec()).expect("set k");
     let _ = storage.expire_millis("k", 1);
 
     std::thread::sleep(std::time::Duration::from_millis(5));

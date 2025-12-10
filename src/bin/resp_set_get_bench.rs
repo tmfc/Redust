@@ -851,9 +851,13 @@ async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
             }
 
             // PFMERGE 测试
-            client.send_array(&["PFADD", "bench_hll_2", "c", "d", "e"]).await;
+            client
+                .send_array(&["PFADD", "bench_hll_2", "c", "d", "e"])
+                .await;
             let _ = client.read_simple_line().await;
-            client.send_array(&["PFMERGE", "bench_hll_merged", key, "bench_hll_2"]).await;
+            client
+                .send_array(&["PFMERGE", "bench_hll_merged", key, "bench_hll_2"])
+                .await;
             let line = client.read_simple_line().await;
             if line != "+OK\r\n" {
                 panic!("unexpected PFMERGE response: {:?}", line);
@@ -883,7 +887,10 @@ async fn run_group(client: &mut RespClient, group: &str, iterations: usize) {
             let qps = if secs > 0.0 { total_ops / secs } else { 0.0 };
 
             println!("[bench][hyperloglog] total time: {:?}", elapsed);
-            println!("[bench][hyperloglog] total ops: {} (PFADD: {}, PFCOUNT: {})", total_ops as u64, iterations, pfcount_ops);
+            println!(
+                "[bench][hyperloglog] total ops: {} (PFADD: {}, PFCOUNT: {})",
+                total_ops as u64, iterations, pfcount_ops
+            );
             println!("[bench][hyperloglog] ops/sec: {:.2}", qps);
         }
         other => {
