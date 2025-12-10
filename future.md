@@ -391,6 +391,30 @@ enum HllRepr {
     - 实现损坏文件的自动备份机制。
     - 考虑部分恢复策略（跳过损坏的键，恢复可读的数据）。
 
+- [x] **错误信息规范化** ✅ 已完成（2025-12）
+  - 将暴露内部实现细节的错误信息改为通用描述。
+  - 例如：`ERR value exceeds REDUST_MAXVALUE_BYTES` → `ERR value exceeds maximum allowed size`
+  - 🔮 **未来改进**：
+    - 审查所有错误信息，确保不泄露敏感信息。
+    - 考虑添加错误码系统，便于客户端程序化处理。
+
+- [x] **参数验证逻辑重构** ✅ 已完成（2025-12）
+  - 添加辅助函数：`require_key`, `require_i64`, `require_f64`, `ensure_no_more_args`, `collect_keys`
+  - 添加 `try_cmd!` 宏简化从 `Result<T, Command>` 到 `Ok(Some(Command))` 的错误处理
+  - 重构了多个命令的解析代码，减少了约 100 行重复代码
+  - 🔮 **未来改进**：
+    - 继续重构更多命令（如 GETEX, GETRANGE, SETRANGE, APPEND, GETSET 等）
+    - 考虑使用过程宏进一步简化命令定义
+
+- [x] **Prometheus 指标完善** ✅ 已完成（2025-12）
+  - 新增 `redust_used_memory_bytes`（内存使用量）
+  - 新增 `redust_maxmemory_bytes`（最大内存限制，仅在配置时导出）
+  - 新增 `redust_slowlog_entries_total`（慢日志条目总数计数器）
+  - 🔮 **未来改进**：
+    - 添加命令延迟直方图（histogram）
+    - 添加按命令类型分类的计数器
+    - 添加过期键删除计数器
+
 - [x] **CLIENT 命令扩展**（部分完成）
   - 已支持：LIST/ID/SETNAME/GETNAME/PAUSE/UNPAUSE。
   - 待实现：

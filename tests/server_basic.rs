@@ -1972,6 +1972,51 @@ async fn test_hmset() {
 }
 
 #[tokio::test]
+async fn test_hincrbyfloat() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // HINCRBYFLOAT 对不存在的 key 应创建 Hash 并设置 field 为增量值
+    send_array(&mut write_half, &["HINCRBYFLOAT", "myhash", "field1", "10.5"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "$4\r\n");
+    let val = read_line_helper(&mut reader).await;
+    assert_eq!(val, "10.5\r\n");
+
+    // HINCRBYFLOAT 对已存在的 field 应累加
+    send_array(&mut write_half, &["HINCRBYFLOAT", "myhash", "field1", "0.1"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "$4\r\n");
+    let val = read_line_helper(&mut reader).await;
+    assert_eq!(val, "10.6\r\n");
+
+    // HINCRBYFLOAT 支持负数
+    send_array(&mut write_half, &["HINCRBYFLOAT", "myhash", "field1", "-5.5"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "$3\r\n");
+    let val = read_line_helper(&mut reader).await;
+    assert_eq!(val, "5.1\r\n");
+
+    // HINCRBYFLOAT 对非数值 field 应返回错误
+    send_array(&mut write_half, &["HSET", "myhash", "strfield", "hello"]).await;
+    let _ = read_line_helper(&mut reader).await;
+    send_array(&mut write_half, &["HINCRBYFLOAT", "myhash", "strfield", "1.0"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert!(resp.starts_with("-ERR"));
+
+    // HINCRBYFLOAT 对 String 类型 key 应返回 WRONGTYPE
+    send_array(&mut write_half, &["SET", "strkey", "value"]).await;
+    let _ = read_line_helper(&mut reader).await;
+    send_array(&mut write_half, &["HINCRBYFLOAT", "strkey", "field", "1.0"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert!(resp.starts_with("-WRONGTYPE"));
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
 async fn test_hash_wrongtype() {
     let (addr, shutdown, _handle) = spawn_server().await;
     let stream = TcpStream::connect(addr).await.unwrap();
@@ -2639,6 +2684,117 @@ async fn test_blocking_list_commands() {
     let _ = read_line_helper(&mut reader).await;
     let resp = read_line_helper(&mut reader).await;
     assert_eq!(resp, "list2\r\n"); // 返回 list2 的数据
+
+    let _ = shutdown.send(());
+}
+
+// ============ ZMSCORE 测试 ============
+
+#[tokio::test]
+async fn test_zmscore() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 创建 ZSet
+    send_array(&mut write_half, &["ZADD", "myzset", "1", "a", "2", "b", "3", "c"]).await;
+    let _ = read_line_helper(&mut reader).await;
+
+    // ZMSCORE 获取多个成员的分数
+    send_array(&mut write_half, &["ZMSCORE", "myzset", "a", "b", "c", "d"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "*4\r\n"); // 4 个元素的数组
+
+    // a 的分数是 1
+    let _ = read_line_helper(&mut reader).await; // $1
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "1\r\n");
+
+    // b 的分数是 2
+    let _ = read_line_helper(&mut reader).await; // $1
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "2\r\n");
+
+    // c 的分数是 3
+    let _ = read_line_helper(&mut reader).await; // $1
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "3\r\n");
+
+    // d 不存在，返回 null
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "$-1\r\n");
+
+    // ZMSCORE 对不存在的 key 返回全部 null
+    send_array(&mut write_half, &["ZMSCORE", "nokey", "a", "b"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "*2\r\n");
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "$-1\r\n");
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "$-1\r\n");
+
+    // ZMSCORE 对 String 类型返回 WRONGTYPE
+    send_array(&mut write_half, &["SET", "strkey", "value"]).await;
+    let _ = read_line_helper(&mut reader).await;
+    send_array(&mut write_half, &["ZMSCORE", "strkey", "a"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert!(resp.starts_with("-WRONGTYPE"));
+
+    let _ = shutdown.send(());
+}
+
+// ============ TIME 测试 ============
+
+#[tokio::test]
+async fn test_time() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // TIME 返回两个元素的数组
+    send_array(&mut write_half, &["TIME"]).await;
+    let resp = read_line_helper(&mut reader).await;
+    assert_eq!(resp, "*2\r\n");
+
+    // 第一个元素是秒数（bulk string）
+    let len_line = read_line_helper(&mut reader).await;
+    assert!(len_line.starts_with("$"));
+    let secs_str = read_line_helper(&mut reader).await;
+    let secs: u64 = secs_str.trim().parse().expect("should be a number");
+    // 检查秒数是合理的（2020年之后）
+    assert!(secs > 1577836800);
+
+    // 第二个元素是微秒数
+    let len_line = read_line_helper(&mut reader).await;
+    assert!(len_line.starts_with("$"));
+    let micros_str = read_line_helper(&mut reader).await;
+    let micros: u32 = micros_str.trim().parse().expect("should be a number");
+    assert!(micros < 1_000_000);
+
+    let _ = shutdown.send(());
+}
+
+// ============ RANDOMKEY 测试 ============
+
+#[tokio::test]
+async fn test_randomkey() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 添加一个 key
+    send_array(&mut write_half, &["SET", "testkey", "v1"]).await;
+    let _ = read_line_helper(&mut reader).await;
+
+    // RANDOMKEY 应该返回这个 key
+    send_array(&mut write_half, &["RANDOMKEY"]).await;
+    let len_line = read_line_helper(&mut reader).await;
+    assert!(len_line.starts_with("$"), "expected bulk string, got: {}", len_line);
+    let key = read_line_helper(&mut reader).await;
+    assert_eq!(key.trim(), "testkey");
 
     let _ = shutdown.send(());
 }

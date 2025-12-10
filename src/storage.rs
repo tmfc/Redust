@@ -1308,6 +1308,44 @@ impl Storage {
         all
     }
 
+    /// RANDOMKEY: 随机返回一个 key（逻辑 key，去掉 db 前缀）
+    pub fn random_key(&self, current_db: u8) -> Option<String> {
+        use rand::seq::SliceRandom;
+        use rand::thread_rng;
+        let now = Instant::now();
+        let prefix = format!("{}:", current_db);
+
+        // 先收集当前 db 的所有 key
+        // 注意：不能在迭代中调用任何可能获取写锁的方法
+        let mut candidates: Vec<String> = Vec::new();
+        for entry in self.data.iter() {
+            let k = entry.key();
+            if !k.starts_with(&prefix) {
+                continue;
+            }
+            // 检查是否过期（只读检查，不删除）
+            let expired = match entry.value() {
+                StorageValue::String { expires_at, .. }
+                | StorageValue::List { expires_at, .. }
+                | StorageValue::Set { expires_at, .. }
+                | StorageValue::Hash { expires_at, .. }
+                | StorageValue::Zset { expires_at, .. }
+                | StorageValue::HyperLogLog { expires_at, .. } => {
+                    expires_at.map_or(false, |exp| exp <= now)
+                }
+            };
+            if !expired {
+                candidates.push(k.clone());
+            }
+        }
+
+        // 随机选一个
+        candidates.choose(&mut thread_rng()).map(|k| {
+            // 去掉 "N:" 前缀，返回逻辑 key
+            k.strip_prefix(&prefix).unwrap_or(k).to_string()
+        })
+    }
+
     pub fn lpush(&self, key: &str, values: &[String]) -> Result<usize, ()> {
         self.push_internal(key, values, true)
     }
@@ -2306,6 +2344,25 @@ impl Storage {
 
         match entry.value() {
             StorageValue::Zset { value, .. } => Ok(value.by_member.get(member).cloned()),
+            _ => Err(()),
+        }
+    }
+
+    /// ZMSCORE: 批量获取多个成员的分数
+    pub fn zmscore(&self, key: &str, members: &[String]) -> Result<Vec<Option<f64>>, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(members.iter().map(|_| None).collect());
+        }
+
+        let Some(entry) = self.data.get(key) else {
+            return Ok(members.iter().map(|_| None).collect());
+        };
+
+        match entry.value() {
+            StorageValue::Zset { value, .. } => {
+                Ok(members.iter().map(|m| value.by_member.get(m).cloned()).collect())
+            }
             _ => Err(()),
         }
     }

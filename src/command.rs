@@ -71,6 +71,8 @@ pub enum Command {
     PingWithPayload(Binary),
     Echo(Binary),
     Quit,
+    Time,
+    Randomkey,
     Set {
         key: String,
         value: Binary,
@@ -500,6 +502,10 @@ pub enum Command {
         key: String,
         member: String,
     },
+    Zmscore {
+        key: String,
+        members: Vec<String>,
+    },
     Zrem {
         key: String,
         members: Vec<String>,
@@ -658,6 +664,60 @@ fn err_pubsub_args() -> Command {
 
 fn parse_bulk_string(bytes: Vec<u8>) -> Result<String, Command> {
     String::from_utf8(bytes).map_err(|_| err_invalid_bulk())
+}
+
+/// 从迭代器中提取必需的 key 参数
+fn require_key(
+    iter: &mut impl Iterator<Item = Vec<u8>>,
+    cmd: &str,
+) -> Result<String, Command> {
+    let key_bytes = iter.next().ok_or_else(|| err_wrong_args(cmd))?;
+    parse_bulk_string(key_bytes)
+}
+
+/// 从迭代器中提取必需的 i64 参数
+fn require_i64(
+    iter: &mut impl Iterator<Item = Vec<u8>>,
+    cmd: &str,
+) -> Result<i64, Command> {
+    let bytes = iter.next().ok_or_else(|| err_wrong_args(cmd))?;
+    parse_i64_from_bulk(bytes)
+}
+
+/// 从迭代器中提取必需的 f64 参数
+fn require_f64(
+    iter: &mut impl Iterator<Item = Vec<u8>>,
+    cmd: &str,
+) -> Result<f64, Command> {
+    let bytes = iter.next().ok_or_else(|| err_wrong_args(cmd))?;
+    parse_f64_from_bulk(bytes)
+}
+
+/// 确保迭代器中没有多余参数
+fn ensure_no_more_args(
+    iter: &mut impl Iterator<Item = Vec<u8>>,
+    cmd: &str,
+) -> Result<(), Command> {
+    if iter.next().is_some() {
+        Err(err_wrong_args(cmd))
+    } else {
+        Ok(())
+    }
+}
+
+/// 收集所有剩余参数为字符串列表
+fn collect_keys(iter: impl Iterator<Item = Vec<u8>>) -> Result<Vec<String>, Command> {
+    iter.map(parse_bulk_string).collect()
+}
+
+/// 宏：简化从 Result<T, Command> 到 Ok(Some(Command)) 的错误处理
+macro_rules! try_cmd {
+    ($expr:expr) => {
+        match $expr {
+            Ok(v) => v,
+            Err(e) => return Ok(Some(e)),
+        }
+    };
 }
 
 fn parse_i64_from_bulk(bytes: Vec<u8>) -> Result<i64, Command> {
@@ -847,6 +907,18 @@ pub async fn read_command(
             }
             Command::Quit
         }
+        "TIME" => {
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("time")));
+            }
+            Command::Time
+        }
+        "RANDOMKEY" => {
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("randomkey")));
+            }
+            Command::Randomkey
+        }
         "SET" => {
             let Some(key_bytes) = iter.next() else {
                 return Ok(Some(err_wrong_args("set")));
@@ -981,29 +1053,13 @@ pub async fn read_command(
             }
         }
         "GET" => {
-            let Some(key_bytes) = iter.next() else {
-                return Ok(Some(err_wrong_args("get")));
-            };
-            let key = match parse_bulk_string(key_bytes) {
-                Ok(k) => k,
-                Err(e) => return Ok(Some(e)),
-            };
-            if iter.next().is_some() {
-                return Ok(Some(err_wrong_args("get")));
-            }
+            let key = try_cmd!(require_key(&mut iter, "get"));
+            try_cmd!(ensure_no_more_args(&mut iter, "get"));
             Command::Get { key }
         }
         "GETDEL" => {
-            let Some(key_bytes) = iter.next() else {
-                return Ok(Some(err_wrong_args("getdel")));
-            };
-            let key = match parse_bulk_string(key_bytes) {
-                Ok(k) => k,
-                Err(e) => return Ok(Some(e)),
-            };
-            if iter.next().is_some() {
-                return Ok(Some(err_wrong_args("getdel")));
-            }
+            let key = try_cmd!(require_key(&mut iter, "getdel"));
+            try_cmd!(ensure_no_more_args(&mut iter, "getdel"));
             Command::Getdel { key }
         }
         "GETEX" => {
@@ -1151,16 +1207,8 @@ pub async fn read_command(
             Command::Append { key, value }
         }
         "STRLEN" => {
-            let Some(key_bytes) = iter.next() else {
-                return Ok(Some(err_wrong_args("strlen")));
-            };
-            let key = match parse_bulk_string(key_bytes) {
-                Ok(k) => k,
-                Err(e) => return Ok(Some(e)),
-            };
-            if iter.next().is_some() {
-                return Ok(Some(err_wrong_args("strlen")));
-            }
+            let key = try_cmd!(require_key(&mut iter, "strlen"));
+            try_cmd!(ensure_no_more_args(&mut iter, "strlen"));
             Command::Strlen { key }
         }
         "GETSET" => {
@@ -1180,112 +1228,42 @@ pub async fn read_command(
             Command::Getset { key, value }
         }
         "INCR" => {
-            let Some(key_bytes) = iter.next() else {
-                return Ok(Some(err_wrong_args("incr")));
-            };
-            let key = match parse_bulk_string(key_bytes) {
-                Ok(k) => k,
-                Err(e) => return Ok(Some(e)),
-            };
-            if iter.next().is_some() {
-                return Ok(Some(err_wrong_args("incr")));
-            }
+            let key = try_cmd!(require_key(&mut iter, "incr"));
+            try_cmd!(ensure_no_more_args(&mut iter, "incr"));
             Command::Incr { key }
         }
         "DECR" => {
-            let Some(key_bytes) = iter.next() else {
-                return Ok(Some(err_wrong_args("decr")));
-            };
-            let key = match parse_bulk_string(key_bytes) {
-                Ok(k) => k,
-                Err(e) => return Ok(Some(e)),
-            };
-            if iter.next().is_some() {
-                return Ok(Some(err_wrong_args("decr")));
-            }
+            let key = try_cmd!(require_key(&mut iter, "decr"));
+            try_cmd!(ensure_no_more_args(&mut iter, "decr"));
             Command::Decr { key }
         }
         "INCRBY" => {
-            let Some(key_bytes) = iter.next() else {
-                return Ok(Some(err_wrong_args("incrby")));
-            };
-            let key = match parse_bulk_string(key_bytes) {
-                Ok(k) => k,
-                Err(e) => return Ok(Some(e)),
-            };
-            let Some(delta_bytes) = iter.next() else {
-                return Ok(Some(err_wrong_args("incrby")));
-            };
-            if iter.next().is_some() {
-                return Ok(Some(err_wrong_args("incrby")));
-            }
-            let delta = match parse_i64_from_bulk(delta_bytes) {
-                Ok(v) => v,
-                Err(e) => return Ok(Some(e)),
-            };
+            let key = try_cmd!(require_key(&mut iter, "incrby"));
+            let delta = try_cmd!(require_i64(&mut iter, "incrby"));
+            try_cmd!(ensure_no_more_args(&mut iter, "incrby"));
             Command::Incrby { key, delta }
         }
         "INCRBYFLOAT" => {
-            let Some(key_bytes) = iter.next() else {
-                return Ok(Some(err_wrong_args("incrbyfloat")));
-            };
-            let key = match parse_bulk_string(key_bytes) {
-                Ok(k) => k,
-                Err(e) => return Ok(Some(e)),
-            };
-            let Some(delta_bytes) = iter.next() else {
-                return Ok(Some(err_wrong_args("incrbyfloat")));
-            };
-            if iter.next().is_some() {
-                return Ok(Some(err_wrong_args("incrbyfloat")));
-            }
-            let delta = match parse_f64_from_bulk(delta_bytes) {
-                Ok(v) => v,
-                Err(e) => return Ok(Some(e)),
-            };
+            let key = try_cmd!(require_key(&mut iter, "incrbyfloat"));
+            let delta = try_cmd!(require_f64(&mut iter, "incrbyfloat"));
+            try_cmd!(ensure_no_more_args(&mut iter, "incrbyfloat"));
             Command::Incrbyfloat { key, delta }
         }
         "DECRBY" => {
-            let Some(key_bytes) = iter.next() else {
-                return Ok(Some(err_wrong_args("decrby")));
-            };
-            let key = match parse_bulk_string(key_bytes) {
-                Ok(k) => k,
-                Err(e) => return Ok(Some(e)),
-            };
-            let Some(delta_bytes) = iter.next() else {
-                return Ok(Some(err_wrong_args("decrby")));
-            };
-            if iter.next().is_some() {
-                return Ok(Some(err_wrong_args("decrby")));
-            }
-            let delta = match parse_i64_from_bulk(delta_bytes) {
-                Ok(v) => v,
-                Err(e) => return Ok(Some(e)),
-            };
+            let key = try_cmd!(require_key(&mut iter, "decrby"));
+            let delta = try_cmd!(require_i64(&mut iter, "decrby"));
+            try_cmd!(ensure_no_more_args(&mut iter, "decrby"));
             Command::Decrby { key, delta }
         }
         "DEL" => {
-            let mut keys = Vec::new();
-            for b in iter {
-                match parse_bulk_string(b) {
-                    Ok(k) => keys.push(k),
-                    Err(e) => return Ok(Some(e)),
-                }
-            }
+            let keys = try_cmd!(collect_keys(iter));
             if keys.is_empty() {
                 return Ok(Some(err_wrong_args("del")));
             }
             Command::Del { keys }
         }
         "UNLINK" => {
-            let mut keys = Vec::new();
-            for b in iter {
-                match parse_bulk_string(b) {
-                    Ok(k) => keys.push(k),
-                    Err(e) => return Ok(Some(e)),
-                }
-            }
+            let keys = try_cmd!(collect_keys(iter));
             if keys.is_empty() {
                 return Ok(Some(err_wrong_args("unlink")));
             }
@@ -1799,6 +1777,30 @@ pub async fn read_command(
             }
 
             Command::Zscore { key, member }
+        }
+        "ZMSCORE" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("zmscore")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+
+            let mut members: Vec<String> = Vec::new();
+            for member_bytes in iter {
+                let m = match parse_bulk_string(member_bytes) {
+                    Ok(v) => v,
+                    Err(e) => return Ok(Some(e)),
+                };
+                members.push(m);
+            }
+
+            if members.is_empty() {
+                return Ok(Some(err_wrong_args("zmscore")));
+            }
+
+            Command::Zmscore { key, members }
         }
         "ZREM" => {
             let Some(key_bytes) = iter.next() else {
@@ -3166,23 +3168,9 @@ pub async fn read_command(
             Command::Hsetnx { key, field, value }
         }
         "HSTRLEN" => {
-            let Some(key_bytes) = iter.next() else {
-                return Ok(Some(err_wrong_args("hstrlen")));
-            };
-            let key = match parse_bulk_string(key_bytes) {
-                Ok(k) => k,
-                Err(e) => return Ok(Some(e)),
-            };
-            let Some(field_bytes) = iter.next() else {
-                return Ok(Some(err_wrong_args("hstrlen")));
-            };
-            let field = match parse_bulk_string(field_bytes) {
-                Ok(f) => f,
-                Err(e) => return Ok(Some(e)),
-            };
-            if iter.next().is_some() {
-                return Ok(Some(err_wrong_args("hstrlen")));
-            }
+            let key = try_cmd!(require_key(&mut iter, "hstrlen"));
+            let field = try_cmd!(require_key(&mut iter, "hstrlen"));
+            try_cmd!(ensure_no_more_args(&mut iter, "hstrlen"));
             Command::Hstrlen { key, field }
         }
         "HMSET" => {

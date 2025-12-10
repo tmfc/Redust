@@ -19,19 +19,58 @@
   - 添加了详细的错误日志（eprintln! 输出）
   - 返回 io::Error 而非静默忽略，让调用方可以决定如何处理
 
-- [ ] **错误信息规范化** (src/command.rs, src/server.rs)
-  - 问题：某些错误响应可能暴露内部实现细节（如环境变量名）
-  - 建议：统一错误响应格式，隐藏内部细节
-  - 预估：小
+- [x] **错误信息规范化** (src/command.rs, src/server.rs) ✅
+  - 已将 "ERR value exceeds REDUST_MAXVALUE_BYTES" 改为 "ERR value exceeds maximum allowed size"
+  - 隐藏了内部环境变量名，使用通用错误描述
 
 ## 低优先级（代码质量改进）
 
-- [ ] **参数验证逻辑重构** (src/command.rs)
-  - 问题：参数验证逻辑存在重复代码
-  - 建议：提取公共验证函数，减少代码重复
-  - 预估：中
+- [x] **参数验证逻辑重构** (src/command.rs) ✅
+  - 添加辅助函数：require_key, require_i64, require_f64, ensure_no_more_args, collect_keys
+  - 添加 try_cmd! 宏简化错误处理
+  - 重构了 GET, GETDEL, STRLEN, INCR, DECR, INCRBY, INCRBYFLOAT, DECRBY, DEL, UNLINK, HSTRLEN 等命令
 
-- [ ] **Prometheus 指标完善**
-  - 问题：可能缺少某些关键性能指标
-  - 建议：增加命令延迟分布、内存使用详情等指标
-  - 预估：小
+- [x] **Prometheus 指标完善** ✅
+  - 新增 redust_used_memory_bytes（内存使用量）
+  - 新增 redust_maxmemory_bytes（最大内存限制）
+  - 新增 redust_slowlog_entries_total（慢日志条目总数）
+
+## 进行中
+
+- [x] **Hash 命令补全** (src/command.rs, src/server.rs, src/storage.rs) ✅
+  - [x] HINCRBY - 对 hash field 做整数自增
+  - [x] HINCRBYFLOAT - 对 hash field 做浮点自增
+  - [x] HSETNX - 仅当 field 不存在时设置
+  - [x] HSTRLEN - 获取 field 值的字符串长度
+  - [x] HMGET - 批量获取多个 field
+  - [x] HMSET - 批量设置多个 field（已废弃但仍需支持）
+  - [x] HKEYS - 获取所有 field 名
+  - [x] HVALS - 获取所有 field 值
+  - [x] HLEN - 获取 hash 的 field 数量
+  - [x] HSCAN - 增量迭代 hash 的 field
+
+- [x] **List 命令补全** (src/command.rs, src/server.rs, src/storage.rs) ✅
+  - [x] LSET - 设置指定索引的元素
+  - [x] LINSERT - 在指定元素前/后插入
+  - [x] RPOPLPUSH - 从源列表弹出并推入目标列表
+  - [x] BLPOP - 阻塞式左弹出
+  - [x] BRPOP - 阻塞式右弹出
+  - 注：BRPOPLPUSH 已废弃，推荐使用 BLMOVE
+
+- [x] **Set 命令补全** ✅
+  - [x] SSCAN - 增量迭代集合成员
+
+- [x] **ZSet 命令补全** ✅
+  - [x] ZCOUNT - 统计分数范围内的成员数
+  - [x] ZINTER / ZINTERSTORE - 交集运算
+  - [x] ZUNION / ZUNIONSTORE - 并集运算
+  - [x] ZDIFF / ZDIFFSTORE - 差集运算
+  - [x] ZPOPMIN / ZPOPMAX - 弹出最小/最大分数成员
+  - [x] ZLEXCOUNT - 统计字典序范围内的成员数
+  - [x] ZRANK / ZREVRANK - 获取成员排名
+  - [x] ZMSCORE - 批量获取分数
+  - 待实现：BZPOPMIN/BZPOPMAX（阻塞式）
+
+- [x] **简单命令补全** ✅
+  - [x] TIME - 返回服务器时间
+  - [x] RANDOMKEY - 随机返回一个 key

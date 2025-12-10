@@ -42,6 +42,7 @@ struct Metrics {
     pubsub_shard_subs: AtomicU64,
     pubsub_messages_delivered: AtomicU64,
     pubsub_messages_dropped: AtomicU64,
+    slowlog_entries_total: AtomicU64,
 }
 
 /// 慢日志条目
@@ -95,16 +96,18 @@ impl SlowLog {
     }
     
     /// 记录一条慢日志（如果耗时超过阈值）
+    /// 如果命令执行时间超过阈值，记录到慢日志
+    /// 返回 true 表示记录了慢日志
     fn log_if_slow(
         &self,
         duration_us: u64,
         command: Vec<String>,
         client_addr: &str,
         client_name: &str,
-    ) {
+    ) -> bool {
         let threshold = self.threshold_us.load(Ordering::Relaxed);
         if duration_us < threshold {
-            return;
+            return false;
         }
         
         let entry = SlowLogEntry {
@@ -125,6 +128,7 @@ impl SlowLog {
         while entries.len() > max_len {
             entries.pop_back();
         }
+        true
     }
     
     /// 获取最近的 N 条慢日志
@@ -433,6 +437,9 @@ fn command_to_strings(cmd: &Command) -> Vec<String> {
             }
             v
         }
+        Command::Zmscore { key, members } => std::iter::once("ZMSCORE".to_string()).chain(std::iter::once(key.clone())).chain(members.iter().cloned()).collect(),
+        Command::Time => vec!["TIME".to_string()],
+        Command::Randomkey => vec!["RANDOMKEY".to_string()],
         // 对于其他命令，使用 Debug 格式的简化表示
         _ => vec![format!("{:?}", cmd).chars().take(100).collect()],
     }
@@ -625,6 +632,22 @@ fn build_prometheus_metrics(storage: &Storage, metrics: &Metrics) -> String {
         pubsub_dropped
     ));
 
+    // 内存使用指标
+    let used_memory = storage.approximate_used_memory();
+    buf.push_str("# TYPE redust_used_memory_bytes gauge\n");
+    buf.push_str(&format!("redust_used_memory_bytes {}\n", used_memory));
+
+    // 最大内存限制
+    if let Some(maxmemory) = storage.maxmemory_bytes() {
+        buf.push_str("# TYPE redust_maxmemory_bytes gauge\n");
+        buf.push_str(&format!("redust_maxmemory_bytes {}\n", maxmemory));
+    }
+
+    // 慢日志条目总数
+    let slowlog_total = metrics.slowlog_entries_total.load(Ordering::Relaxed);
+    buf.push_str("# TYPE redust_slowlog_entries_total counter\n");
+    buf.push_str(&format!("redust_slowlog_entries_total {}\n", slowlog_total));
+
     buf
 }
 
@@ -767,6 +790,25 @@ async fn handle_string_command(
         Command::Quit => {
             respond_simple_string(writer, "OK").await?;
         }
+        Command::Time => {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
+            let secs = now.as_secs();
+            let micros = now.subsec_micros();
+            // 返回两个元素的数组: [秒, 微秒]
+            writer.write_all(b"*2\r\n").await?;
+            respond_bulk_string(writer, &secs.to_string()).await?;
+            respond_bulk_string(writer, &micros.to_string()).await?;
+        }
+        Command::Randomkey => {
+            if let Some(key) = storage.random_key(current_db) {
+                respond_bulk_string(writer, &key).await?;
+            } else {
+                respond_null_bulk(writer).await?;
+            }
+        }
         Command::Set {
             key,
             value,
@@ -782,7 +824,7 @@ async fn handle_string_command(
             // 长度限制
             if let Some(limit) = current_max_value_bytes() {
                 if (value.len() as u64) > limit {
-                    respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                    respond_error(writer, "ERR value exceeds maximum allowed size").await?;
                     return Ok(());
                 }
             }
@@ -953,7 +995,7 @@ async fn handle_string_command(
             let physical = prefix_key(current_db, &key);
             if let Some(limit) = current_max_value_bytes() {
                 if (value.len() as u64) > limit {
-                    respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                    respond_error(writer, "ERR value exceeds maximum allowed size").await?;
                     return Ok(());
                 }
             }
@@ -975,7 +1017,7 @@ async fn handle_string_command(
             let physical = prefix_key(current_db, &key);
             if let Some(limit) = current_max_value_bytes() {
                 if (value.len() as u64) > limit {
-                    respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                    respond_error(writer, "ERR value exceeds maximum allowed size").await?;
                     return Ok(());
                 }
             }
@@ -1012,7 +1054,7 @@ async fn handle_string_command(
             let physical = prefix_key(current_db, &key);
             if let Some(limit) = current_max_value_bytes() {
                 if (value.len() as u64) > limit {
-                    respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                    respond_error(writer, "ERR value exceeds maximum allowed size").await?;
                     return Ok(());
                 }
             }
@@ -1153,7 +1195,7 @@ async fn handle_string_command(
             if let Some(limit) = current_max_value_bytes() {
                 for (_k, v) in pairs.iter() {
                     if (v.len() as u64) > limit {
-                        respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                        respond_error(writer, "ERR value exceeds maximum allowed size").await?;
                         return Ok(());
                     }
                 }
@@ -1170,7 +1212,7 @@ async fn handle_string_command(
             if let Some(limit) = current_max_value_bytes() {
                 for (_k, v) in pairs.iter() {
                     if (v.len() as u64) > limit {
-                        respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                        respond_error(writer, "ERR value exceeds maximum allowed size").await?;
                         return Ok(());
                     }
                 }
@@ -1189,7 +1231,7 @@ async fn handle_string_command(
             let physical = prefix_key(current_db, &key);
             if let Some(limit) = current_max_value_bytes() {
                 if (value.len() as u64) > limit {
-                    respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                    respond_error(writer, "ERR value exceeds maximum allowed size").await?;
                     return Ok(());
                 }
             }
@@ -1205,7 +1247,7 @@ async fn handle_string_command(
             let physical = prefix_key(current_db, &key);
             if let Some(limit) = current_max_value_bytes() {
                 if (value.len() as u64) > limit {
-                    respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                    respond_error(writer, "ERR value exceeds maximum allowed size").await?;
                     return Ok(());
                 }
             }
@@ -1216,7 +1258,7 @@ async fn handle_string_command(
             let physical = prefix_key(current_db, &key);
             if let Some(limit) = current_max_value_bytes() {
                 if (value.len() as u64) > limit {
-                    respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                    respond_error(writer, "ERR value exceeds maximum allowed size").await?;
                     return Ok(());
                 }
             }
@@ -1429,7 +1471,7 @@ async fn handle_list_command(
             if let Some(limit) = current_max_value_bytes() {
                 for v in &values {
                     if (v.as_bytes().len() as u64) > limit {
-                        respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                        respond_error(writer, "ERR value exceeds maximum allowed size").await?;
                         return Ok(());
                     }
                 }
@@ -1516,7 +1558,7 @@ async fn handle_list_command(
             if let Some(limit) = current_max_value_bytes() {
                 for v in &values {
                     if (v.as_bytes().len() as u64) > limit {
-                        respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                        respond_error(writer, "ERR value exceeds maximum allowed size").await?;
                         return Ok(());
                     }
                 }
@@ -1953,7 +1995,7 @@ async fn handle_set_command(
             if let Some(limit) = current_max_value_bytes() {
                 for m in &members {
                     if (m.as_bytes().len() as u64) > limit {
-                        respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                        respond_error(writer, "ERR value exceeds maximum allowed size").await?;
                         return Ok(());
                     }
                 }
@@ -2296,7 +2338,7 @@ async fn handle_hash_command(
             let physical = prefix_key(current_db, &key);
             if let Some(limit) = current_max_value_bytes() {
                 if (value.as_bytes().len() as u64) > limit {
-                    respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                    respond_error(writer, "ERR value exceeds maximum allowed size").await?;
                     return Ok(());
                 }
             }
@@ -2468,7 +2510,7 @@ async fn handle_hash_command(
                     respond_error(writer, "ERR increment or decrement would overflow").await?;
                 }
                 Err(crate::storage::HincrError::MaxValueExceeded) => {
-                    respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                    respond_error(writer, "ERR value exceeds maximum allowed size").await?;
                 }
             }
         }
@@ -2499,7 +2541,7 @@ async fn handle_hash_command(
                     respond_error(writer, "ERR hash value is not a valid float").await?;
                 }
                 Err(crate::storage::HincrFloatError::MaxValueExceeded) => {
-                    respond_error(writer, "ERR value exceeds REDUST_MAXVALUE_BYTES").await?;
+                    respond_error(writer, "ERR value exceeds maximum allowed size").await?;
                 }
             }
         }
@@ -2737,6 +2779,34 @@ async fn handle_zset_command(
                 }
                 Ok(None) => {
                     respond_null_bulk(writer).await?;
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Zmscore { key, members } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.zmscore(&physical, &members) {
+                Ok(scores) => {
+                    writer
+                        .write_all(format!("*{}\r\n", scores.len()).as_bytes())
+                        .await?;
+                    for score in scores {
+                        match score {
+                            Some(s) => {
+                                let s_str = format_score(s);
+                                respond_bulk_string(writer, &s_str).await?;
+                            }
+                            None => {
+                                respond_null_bulk(writer).await?;
+                            }
+                        }
+                    }
                 }
                 Err(()) => {
                     respond_error(
@@ -3407,7 +3477,9 @@ async fn execute_command_in_transaction(
         | Command::Setnx { .. }
         | Command::Setex { .. }
         | Command::Psetex { .. }
-        | Command::Quit => {
+        | Command::Quit
+        | Command::Time
+        | Command::Randomkey => {
             handle_string_command(cmd, storage, writer, current_db).await?;
         }
 
@@ -3476,6 +3548,7 @@ async fn execute_command_in_transaction(
         | Command::Zcard { .. }
         | Command::Zrange { .. }
         | Command::Zscore { .. }
+        | Command::Zmscore { .. }
         | Command::Zrem { .. }
         | Command::Zincrby { .. }
         | Command::Zcount { .. }
@@ -3939,7 +4012,9 @@ async fn handle_connection(
             | Command::Msetnx { .. }
             | Command::Setnx { .. }
             | Command::Setex { .. }
-            | Command::Psetex { .. } => {
+            | Command::Psetex { .. }
+            | Command::Time
+            | Command::Randomkey => {
                 // Quit 需要在外面单独处理连接关闭语义
                 handle_string_command(cmd, &storage, &mut write_half, current_db).await?;
             }
@@ -4010,6 +4085,7 @@ async fn handle_connection(
             | Command::Zcard { .. }
             | Command::Zrange { .. }
             | Command::Zscore { .. }
+            | Command::Zmscore { .. }
             | Command::Zrem { .. }
             | Command::Zincrby { .. }
             | Command::Zcount { .. }
@@ -4074,7 +4150,7 @@ async fn handle_connection(
             Command::Publish { channel, message } => {
                 if let Some(limit) = current_max_value_bytes() {
                     if (message.len() as u64) > limit {
-                        respond_error(&mut write_half, "ERR value exceeds REDUST_MAXVALUE_BYTES")
+                        respond_error(&mut write_half, "ERR value exceeds maximum allowed size")
                             .await?;
                         continue;
                     }
@@ -4088,7 +4164,7 @@ async fn handle_connection(
             Command::Spublish { channel, message } => {
                 if let Some(limit) = current_max_value_bytes() {
                     if (message.len() as u64) > limit {
-                        respond_error(&mut write_half, "ERR value exceeds REDUST_MAXVALUE_BYTES")
+                        respond_error(&mut write_half, "ERR value exceeds maximum allowed size")
                             .await?;
                         continue;
                     }
@@ -4571,7 +4647,9 @@ async fn handle_connection(
         
         // 记录慢日志
         let duration_us = cmd_start.elapsed().as_micros() as u64;
-        slowlog.log_if_slow(duration_us, cmd_strings, &client_addr, &client_name);
+        if slowlog.log_if_slow(duration_us, cmd_strings, &client_addr, &client_name) {
+            metrics.slowlog_entries_total.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     let chan_len = channel_subscriptions.len();
@@ -4741,6 +4819,7 @@ pub async fn serve(
         pubsub_shard_subs: AtomicU64::new(0),
         pubsub_messages_delivered: AtomicU64::new(0),
         pubsub_messages_dropped: AtomicU64::new(0),
+        slowlog_entries_total: AtomicU64::new(0),
     });
     let slowlog = Arc::new(SlowLog::new());
     let pubsub = PubSubHub::new();
