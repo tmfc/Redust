@@ -2016,21 +2016,33 @@ async fn test_hincrbyfloat() {
     let mut reader = BufReader::new(read_half);
 
     // HINCRBYFLOAT 对不存在的 key 应创建 Hash 并设置 field 为增量值
-    send_array(&mut write_half, &["HINCRBYFLOAT", "myhash", "field1", "10.5"]).await;
+    send_array(
+        &mut write_half,
+        &["HINCRBYFLOAT", "myhash", "field1", "10.5"],
+    )
+    .await;
     let resp = read_line_helper(&mut reader).await;
     assert_eq!(resp, "$4\r\n");
     let val = read_line_helper(&mut reader).await;
     assert_eq!(val, "10.5\r\n");
 
     // HINCRBYFLOAT 对已存在的 field 应累加
-    send_array(&mut write_half, &["HINCRBYFLOAT", "myhash", "field1", "0.1"]).await;
+    send_array(
+        &mut write_half,
+        &["HINCRBYFLOAT", "myhash", "field1", "0.1"],
+    )
+    .await;
     let resp = read_line_helper(&mut reader).await;
     assert_eq!(resp, "$4\r\n");
     let val = read_line_helper(&mut reader).await;
     assert_eq!(val, "10.6\r\n");
 
     // HINCRBYFLOAT 支持负数
-    send_array(&mut write_half, &["HINCRBYFLOAT", "myhash", "field1", "-5.5"]).await;
+    send_array(
+        &mut write_half,
+        &["HINCRBYFLOAT", "myhash", "field1", "-5.5"],
+    )
+    .await;
     let resp = read_line_helper(&mut reader).await;
     assert_eq!(resp, "$3\r\n");
     let val = read_line_helper(&mut reader).await;
@@ -2039,7 +2051,11 @@ async fn test_hincrbyfloat() {
     // HINCRBYFLOAT 对非数值 field 应返回错误
     send_array(&mut write_half, &["HSET", "myhash", "strfield", "hello"]).await;
     let _ = read_line_helper(&mut reader).await;
-    send_array(&mut write_half, &["HINCRBYFLOAT", "myhash", "strfield", "1.0"]).await;
+    send_array(
+        &mut write_half,
+        &["HINCRBYFLOAT", "myhash", "strfield", "1.0"],
+    )
+    .await;
     let resp = read_line_helper(&mut reader).await;
     assert!(resp.starts_with("-ERR"));
 
@@ -2789,7 +2805,11 @@ async fn test_zmscore() {
     let mut reader = BufReader::new(read_half);
 
     // 创建 ZSet
-    send_array(&mut write_half, &["ZADD", "myzset", "1", "a", "2", "b", "3", "c"]).await;
+    send_array(
+        &mut write_half,
+        &["ZADD", "myzset", "1", "a", "2", "b", "3", "c"],
+    )
+    .await;
     let _ = read_line_helper(&mut reader).await;
 
     // ZMSCORE 获取多个成员的分数
@@ -2883,7 +2903,11 @@ async fn test_randomkey() {
     // RANDOMKEY 应该返回这个 key
     send_array(&mut write_half, &["RANDOMKEY"]).await;
     let len_line = read_line_helper(&mut reader).await;
-    assert!(len_line.starts_with("$"), "expected bulk string, got: {}", len_line);
+    assert!(
+        len_line.starts_with("$"),
+        "expected bulk string, got: {}",
+        len_line
+    );
     let key = read_line_helper(&mut reader).await;
     assert_eq!(key.trim(), "testkey");
 

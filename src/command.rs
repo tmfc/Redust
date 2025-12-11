@@ -667,37 +667,25 @@ fn parse_bulk_string(bytes: Vec<u8>) -> Result<String, Command> {
 }
 
 /// 从迭代器中提取必需的 key 参数
-fn require_key(
-    iter: &mut impl Iterator<Item = Vec<u8>>,
-    cmd: &str,
-) -> Result<String, Command> {
+fn require_key(iter: &mut impl Iterator<Item = Vec<u8>>, cmd: &str) -> Result<String, Command> {
     let key_bytes = iter.next().ok_or_else(|| err_wrong_args(cmd))?;
     parse_bulk_string(key_bytes)
 }
 
 /// 从迭代器中提取必需的 i64 参数
-fn require_i64(
-    iter: &mut impl Iterator<Item = Vec<u8>>,
-    cmd: &str,
-) -> Result<i64, Command> {
+fn require_i64(iter: &mut impl Iterator<Item = Vec<u8>>, cmd: &str) -> Result<i64, Command> {
     let bytes = iter.next().ok_or_else(|| err_wrong_args(cmd))?;
     parse_i64_from_bulk(bytes)
 }
 
 /// 从迭代器中提取必需的 f64 参数
-fn require_f64(
-    iter: &mut impl Iterator<Item = Vec<u8>>,
-    cmd: &str,
-) -> Result<f64, Command> {
+fn require_f64(iter: &mut impl Iterator<Item = Vec<u8>>, cmd: &str) -> Result<f64, Command> {
     let bytes = iter.next().ok_or_else(|| err_wrong_args(cmd))?;
     parse_f64_from_bulk(bytes)
 }
 
 /// 确保迭代器中没有多余参数
-fn ensure_no_more_args(
-    iter: &mut impl Iterator<Item = Vec<u8>>,
-    cmd: &str,
-) -> Result<(), Command> {
+fn ensure_no_more_args(iter: &mut impl Iterator<Item = Vec<u8>>, cmd: &str) -> Result<(), Command> {
     if iter.next().is_some() {
         Err(err_wrong_args(cmd))
     } else {

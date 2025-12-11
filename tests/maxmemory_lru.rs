@@ -143,10 +143,7 @@ async fn volatile_random_eviction_preserves_persistent_keys() {
     let _guard_aof = set_env("REDUST_AOF_ENABLED", "0");
     let _guard_bytes = set_env("REDUST_MAXMEMORY_BYTES", "65536");
     let _guard_policy = set_env("REDUST_MAXMEMORY_POLICY", "volatile-random");
-    assert_eq!(
-        std::env::var("REDUST_MAXMEMORY_BYTES").unwrap(),
-        "65536"
-    );
+    assert_eq!(std::env::var("REDUST_MAXMEMORY_BYTES").unwrap(), "65536");
 
     let (addr, shutdown, handle) = spawn_server().await;
     let mut client = TestClient::connect(addr).await;
