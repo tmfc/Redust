@@ -1,12 +1,12 @@
 //! Lua scripting support for Redis-compatible EVAL/EVALSHA commands.
 
 use dashmap::DashMap;
-use mlua::{Lua, Value, HookTriggers};
+use mlua::{HookTriggers, Lua, Value};
 use sha1::{Digest, Sha1};
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Once};
 use std::time::Instant;
 
 use crate::storage::Storage;
@@ -41,7 +41,10 @@ impl ScriptLimits {
             .ok()
             .and_then(|s| parse_memory_size(&s))
             .unwrap_or(10 * 1024 * 1024);
-        Self { timeout_ms, max_memory }
+        Self {
+            timeout_ms,
+            max_memory,
+        }
     }
 }
 
@@ -49,7 +52,10 @@ impl ScriptLimits {
 fn parse_memory_size(s: &str) -> Option<usize> {
     let s = s.trim().to_uppercase();
     if let Some(num) = s.strip_suffix("GB") {
-        num.trim().parse::<usize>().ok().map(|n| n * 1024 * 1024 * 1024)
+        num.trim()
+            .parse::<usize>()
+            .ok()
+            .map(|n| n * 1024 * 1024 * 1024)
     } else if let Some(num) = s.strip_suffix("MB") {
         num.trim().parse::<usize>().ok().map(|n| n * 1024 * 1024)
     } else if let Some(num) = s.strip_suffix("KB") {
@@ -62,12 +68,15 @@ fn parse_memory_size(s: &str) -> Option<usize> {
 /// 全局脚本限制配置
 static LUA_TIMEOUT_MS: AtomicU64 = AtomicU64::new(5000);
 static LUA_MAX_MEMORY: AtomicUsize = AtomicUsize::new(10 * 1024 * 1024);
+static INIT_ONCE: Once = Once::new();
 
-/// 初始化全局脚本限制（从环境变量读取）
+/// 初始化全局脚本限制（从环境变量读取，只执行一次）
 pub fn init_script_limits() {
-    let limits = ScriptLimits::from_env();
-    LUA_TIMEOUT_MS.store(limits.timeout_ms, Ordering::Relaxed);
-    LUA_MAX_MEMORY.store(limits.max_memory, Ordering::Relaxed);
+    INIT_ONCE.call_once(|| {
+        let limits = ScriptLimits::from_env();
+        LUA_TIMEOUT_MS.store(limits.timeout_ms, Ordering::Relaxed);
+        LUA_MAX_MEMORY.store(limits.max_memory, Ordering::Relaxed);
+    });
 }
 
 /// 设置脚本超时时间（毫秒）
@@ -187,10 +196,7 @@ pub struct ScriptContext {
 
 /// Execute a Lua script with redis.call/pcall support
 /// 支持超时和内存限制，防止恶意脚本耗尽资源
-pub fn execute_script(
-    script: &str,
-    ctx: ScriptContext,
-) -> Result<ScriptResult, String> {
+pub fn execute_script(script: &str, ctx: ScriptContext) -> Result<ScriptResult, String> {
     let lua = Lua::new();
 
     // 设置内存限制
@@ -205,14 +211,14 @@ pub fn execute_script(
     if timeout_ms > 0 {
         let start_time = Instant::now();
         let timeout_duration = std::time::Duration::from_millis(timeout_ms);
-        
+
         // 每执行 10000 条指令检查一次超时
         lua.set_hook(
             HookTriggers::new().every_nth_instruction(10000),
             move |_lua, _debug| {
                 if start_time.elapsed() > timeout_duration {
                     Err(mlua::Error::RuntimeError(
-                        "ERR BUSY script exceeded maximum execution time".to_string()
+                        "ERR BUSY script exceeded maximum execution time".to_string(),
                     ))
                 } else {
                     Ok(())
