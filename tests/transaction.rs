@@ -88,22 +88,31 @@ impl TestClient {
 
         let mut items = Vec::with_capacity(len);
         for _ in 0..len {
-            let mut bulk_header = String::new();
-            self.reader.read_line(&mut bulk_header).await.unwrap();
-            if bulk_header == "$-1\r\n" {
-                items.push(String::new());
-                continue;
-            }
-            assert!(bulk_header.starts_with('$'));
-            let bulk_len: usize = bulk_header[1..bulk_header.len() - 2].parse().unwrap();
-            let mut buf = vec![0u8; bulk_len];
-            self.reader.read_exact(&mut buf).await.unwrap();
-            let mut crlf = [0u8; 2];
-            self.reader.read_exact(&mut crlf).await.unwrap();
-            assert_eq!(&crlf, b"\r\n");
-            items.push(String::from_utf8(buf).unwrap());
+            let s = self.read_bulk_string().await.unwrap_or_default();
+            items.push(s);
         }
 
+        items
+    }
+
+    async fn read_array_len(&mut self) -> Option<usize> {
+        let mut header = String::new();
+        self.reader.read_line(&mut header).await.unwrap();
+        if header == "*-1\r\n" {
+            return None;
+        }
+        assert!(header.starts_with('*'));
+        let len_str = &header[1..header.len() - 2];
+        let len: usize = len_str.parse().unwrap();
+        Some(len)
+    }
+
+    async fn read_n_bulk_strings(&mut self, n: usize) -> Vec<String> {
+        let mut items = Vec::with_capacity(n);
+        for _ in 0..n {
+            let s = self.read_bulk_string().await.unwrap_or_default();
+            items.push(s);
+        }
         items
     }
 }
@@ -152,6 +161,71 @@ async fn multi_exec_basic() {
     // 第三个结果：INCR -> :1
     let line = client.read_simple_line().await;
     assert_eq!(line, ":1\r\n");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+/// 事务中支持 TYPE/KEYS/SCAN 命令
+#[tokio::test]
+async fn meta_commands_inside_transaction() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // 准备一些数据
+    client.send_array(&["SET", "foo", "bar"]).await;
+    let _ = client.read_simple_line().await;
+    client.send_array(&["LPUSH", "list", "a"]).await;
+    let _ = client.read_simple_line().await;
+
+    // MULTI
+    client.send_array(&["MULTI"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "+OK\r\n");
+
+    // QUEUE TYPE
+    client.send_array(&["TYPE", "foo"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "+QUEUED\r\n");
+
+    // QUEUE KEYS
+    client.send_array(&["KEYS", "*"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "+QUEUED\r\n");
+
+    // QUEUE SCAN
+    client
+        .send_array(&["SCAN", "0", "COUNT", "10", "TYPE", "string"])
+        .await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "+QUEUED\r\n");
+
+    // EXEC
+    client.send_array(&["EXEC"]).await;
+    let len = client.read_array_len().await;
+    assert_eq!(len, Some(3));
+
+    // TYPE -> simple string
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "+string\r\n");
+
+    // KEYS -> array contains foo and list (order by storage sorting)
+    let keys_len = client.read_array_len().await.unwrap();
+    let keys = client.read_n_bulk_strings(keys_len).await;
+    assert!(keys.contains(&"foo".to_string()));
+    assert!(keys.contains(&"list".to_string()));
+
+    // SCAN -> array of [cursor, items]; ensure foo present, only strings
+    let scan_outer_len = client.read_array_len().await.unwrap();
+    assert_eq!(scan_outer_len, 2);
+    let cursor_bulk = client.read_bulk_string().await.unwrap();
+    let scan_items_len = client.read_array_len().await.unwrap();
+    let scan_items = client.read_n_bulk_strings(scan_items_len).await;
+    // 游标应为 0 结束
+    assert_eq!(cursor_bulk, "0");
+    // 只应返回 string 类型 key：foo
+    assert!(scan_items.contains(&"foo".to_string()));
+    assert!(!scan_items.contains(&"list".to_string()));
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
@@ -260,7 +334,9 @@ async fn watch_basic() {
     let _ = client.read_simple_line().await;
 
     // SET watched_key new_value -> QUEUED
-    client.send_array(&["SET", "watched_key", "new_value"]).await;
+    client
+        .send_array(&["SET", "watched_key", "new_value"])
+        .await;
     let line = client.read_simple_line().await;
     assert_eq!(line, "+QUEUED\r\n");
 
@@ -317,7 +393,10 @@ async fn watch_aborted_by_concurrent_modification() {
     client1.send_array(&["EXEC"]).await;
     let mut header = String::new();
     client1.reader.read_line(&mut header).await.unwrap();
-    assert_eq!(header, "*-1\r\n", "EXEC should return null when WATCH fails");
+    assert_eq!(
+        header, "*-1\r\n",
+        "EXEC should return null when WATCH fails"
+    );
 
     // 验证值是 client2 设置的
     client1.send_array(&["GET", "key"]).await;
@@ -447,7 +526,10 @@ async fn watch_detects_hset_modification() {
     client1.send_array(&["EXEC"]).await;
     let mut header = String::new();
     client1.reader.read_line(&mut header).await.unwrap();
-    assert_eq!(header, "*-1\r\n", "EXEC should return null when WATCH fails due to HSET");
+    assert_eq!(
+        header, "*-1\r\n",
+        "EXEC should return null when WATCH fails due to HSET"
+    );
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
@@ -481,7 +563,10 @@ async fn watch_detects_lpush_modification() {
     client1.send_array(&["EXEC"]).await;
     let mut header = String::new();
     client1.reader.read_line(&mut header).await.unwrap();
-    assert_eq!(header, "*-1\r\n", "EXEC should return null when WATCH fails due to LPUSH");
+    assert_eq!(
+        header, "*-1\r\n",
+        "EXEC should return null when WATCH fails due to LPUSH"
+    );
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
@@ -501,7 +586,11 @@ async fn transaction_aborted_on_parse_error() {
     // SET key（缺少 value，应该返回错误而不是 QUEUED）
     client.send_array(&["SET", "key"]).await;
     let line = client.read_simple_line().await;
-    assert!(line.starts_with("-ERR"), "Expected error for wrong arity, got: {}", line);
+    assert!(
+        line.starts_with("-ERR"),
+        "Expected error for wrong arity, got: {}",
+        line
+    );
 
     // SET key2 value2 -> QUEUED（正常命令仍然入队）
     client.send_array(&["SET", "key2", "value2"]).await;
@@ -511,12 +600,19 @@ async fn transaction_aborted_on_parse_error() {
     // EXEC（应该返回 EXECABORT 错误）
     client.send_array(&["EXEC"]).await;
     let line = client.read_simple_line().await;
-    assert!(line.contains("EXECABORT"), "Expected EXECABORT error, got: {}", line);
+    assert!(
+        line.contains("EXECABORT"),
+        "Expected EXECABORT error, got: {}",
+        line
+    );
 
     // 验证 key2 没有被设置
     client.send_array(&["GET", "key2"]).await;
     let val = client.read_bulk_string().await;
-    assert_eq!(val, None, "key2 should not be set after aborted transaction");
+    assert_eq!(
+        val, None,
+        "key2 should not be set after aborted transaction"
+    );
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
@@ -578,7 +674,9 @@ async fn watch_detects_key_expiration() {
     let mut client = TestClient::connect(addr).await;
 
     // 设置一个很短 TTL 的 key
-    client.send_array(&["SET", "expiring", "value", "PX", "50"]).await;
+    client
+        .send_array(&["SET", "expiring", "value", "PX", "50"])
+        .await;
     let _ = client.read_simple_line().await;
 
     // WATCH 这个 key
@@ -606,7 +704,169 @@ async fn watch_detects_key_expiration() {
     client.send_array(&["EXEC"]).await;
     let mut header = String::new();
     client.reader.read_line(&mut header).await.unwrap();
-    assert_eq!(header, "*-1\r\n", "EXEC should return null when watched key expires");
+    assert_eq!(
+        header, "*-1\r\n",
+        "EXEC should return null when watched key expires"
+    );
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+/// 测试事务中 EVAL 脚本执行
+#[tokio::test]
+async fn eval_inside_transaction() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // 设置初始值
+    client.send_array(&["SET", "counter", "10"]).await;
+    let _ = client.read_simple_line().await;
+
+    // MULTI
+    client.send_array(&["MULTI"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "+OK\r\n");
+
+    // EVAL 脚本：增加 counter 并返回新值
+    client
+        .send_array(&[
+            "EVAL",
+            "return redis.call('INCRBY', KEYS[1], ARGV[1])",
+            "1",
+            "counter",
+            "5",
+        ])
+        .await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "+QUEUED\r\n");
+
+    // GET counter
+    client.send_array(&["GET", "counter"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "+QUEUED\r\n");
+
+    // EXEC
+    client.send_array(&["EXEC"]).await;
+
+    // 读取数组头
+    let mut header = String::new();
+    client.reader.read_line(&mut header).await.unwrap();
+    assert_eq!(header, "*2\r\n");
+
+    // 第一个结果：EVAL 返回 15
+    let mut result1 = String::new();
+    client.reader.read_line(&mut result1).await.unwrap();
+    assert_eq!(result1, ":15\r\n");
+
+    // 第二个结果：GET 返回 "15"
+    let mut bulk_header = String::new();
+    client.reader.read_line(&mut bulk_header).await.unwrap();
+    assert_eq!(bulk_header, "$2\r\n");
+    let mut value = String::new();
+    client.reader.read_line(&mut value).await.unwrap();
+    assert_eq!(value, "15\r\n");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+/// 测试事务中 EVALSHA 脚本执行
+#[tokio::test]
+async fn evalsha_inside_transaction() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // 先加载脚本
+    client
+        .send_array(&[
+            "SCRIPT",
+            "LOAD",
+            "return redis.call('SET', KEYS[1], ARGV[1])",
+        ])
+        .await;
+    let mut bulk_header = String::new();
+    client.reader.read_line(&mut bulk_header).await.unwrap();
+    assert!(bulk_header.starts_with('$'));
+    let len: usize = bulk_header[1..bulk_header.len() - 2].parse().unwrap();
+    let mut sha1 = vec![0u8; len];
+    client.reader.read_exact(&mut sha1).await.unwrap();
+    let mut crlf = [0u8; 2];
+    client.reader.read_exact(&mut crlf).await.unwrap();
+    let sha1_str = String::from_utf8(sha1).unwrap();
+
+    // MULTI
+    client.send_array(&["MULTI"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "+OK\r\n");
+
+    // EVALSHA
+    client
+        .send_array(&["EVALSHA", &sha1_str, "1", "mykey", "myvalue"])
+        .await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "+QUEUED\r\n");
+
+    // GET mykey
+    client.send_array(&["GET", "mykey"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "+QUEUED\r\n");
+
+    // EXEC
+    client.send_array(&["EXEC"]).await;
+
+    // 读取数组头
+    let mut header = String::new();
+    client.reader.read_line(&mut header).await.unwrap();
+    assert_eq!(header, "*2\r\n");
+
+    // 第一个结果：SET 返回 OK
+    let mut result1 = String::new();
+    client.reader.read_line(&mut result1).await.unwrap();
+    assert_eq!(result1, "+OK\r\n");
+
+    // 第二个结果：GET 返回 "myvalue"
+    let mut bulk_header2 = String::new();
+    client.reader.read_line(&mut bulk_header2).await.unwrap();
+    assert_eq!(bulk_header2, "$7\r\n");
+    let mut value = String::new();
+    client.reader.read_line(&mut value).await.unwrap();
+    assert_eq!(value, "myvalue\r\n");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+/// 测试事务中 SCRIPT LOAD/EXISTS 命令
+#[tokio::test]
+async fn script_commands_inside_transaction() {
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // MULTI
+    client.send_array(&["MULTI"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "+OK\r\n");
+
+    // SCRIPT LOAD
+    client.send_array(&["SCRIPT", "LOAD", "return 42"]).await;
+    let line = client.read_simple_line().await;
+    assert_eq!(line, "+QUEUED\r\n");
+
+    // EXEC
+    client.send_array(&["EXEC"]).await;
+
+    // 读取数组头
+    let mut header = String::new();
+    client.reader.read_line(&mut header).await.unwrap();
+    assert_eq!(header, "*1\r\n");
+
+    // 读取 SHA1
+    let mut bulk_header = String::new();
+    client.reader.read_line(&mut bulk_header).await.unwrap();
+    assert!(bulk_header.starts_with('$'));
+    let len: usize = bulk_header[1..bulk_header.len() - 2].parse().unwrap();
+    assert_eq!(len, 40); // SHA1 是 40 个十六进制字符
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();

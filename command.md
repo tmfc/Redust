@@ -272,7 +272,7 @@
 - [x] TYPE
 - [x] KEYS
 - [ ] SCAN
-- [ ] RANDOMKEY
+- [x] RANDOMKEY
 - [x] RENAME
 - [x] RENAMENX
 - [ ] MOVE
@@ -312,7 +312,7 @@
 - [x] SLOWLOG GET - 获取慢日志（当前返回空）
 - [x] SLOWLOG RESET - 重置慢日志
 - [x] SLOWLOG LEN - 获取慢日志长度
-- [ ] TIME
+- [x] TIME
 - [ ] COMMAND *（完整 COMMAND 系列）*
 
 ### Strings
@@ -344,16 +344,16 @@
 - [x] HGETALL
 - [x] HDEL
 - [x] HEXISTS
-- [ ] HINCRBY
-- [ ] HINCRBYFLOAT
-- [ ] HKEYS
-- [ ] HLEN
-- [ ] HMGET
-- [ ] HMSET
-- [ ] HSETNX
-- [ ] HSTRLEN
-- [ ] HVALS
-- [ ] HSCAN
+- [x] HINCRBY
+- [x] HINCRBYFLOAT
+- [x] HKEYS
+- [x] HLEN
+- [x] HMGET
+- [x] HMSET
+- [x] HSETNX
+- [x] HSTRLEN
+- [x] HVALS
+- [x] HSCAN
 
 ### Lists
 
@@ -364,13 +364,13 @@
 - [x] LRANGE
 - [x] LLEN
 - [x] LINDEX
-- [ ] LSET
-- [ ] LINSERT
+- [x] LSET
+- [x] LINSERT
 - [x] LREM
-- [ ] BLPOP
-- [ ] BRPOP
-- [ ] BRPOPLPUSH
-- [ ] RPOPLPUSH
+- [x] BLPOP
+- [x] BRPOP
+- [ ] BRPOPLPUSH（已废弃，推荐 BLMOVE）
+- [x] RPOPLPUSH
 
 ### Sets
 
@@ -385,25 +385,25 @@
 - [x] SUNIONSTORE
 - [x] SINTERSTORE
 - [x] SDIFFSTORE
-- [ ] SSCAN
+- [x] SSCAN
 
 ### Sorted Sets (ZSets)
 
 - [x] ZADD
 - [x] ZREM
 - [x] ZCARD
-- [ ] ZCOUNT
+- [x] ZCOUNT
 - [x] ZINCRBY
-- [ ] ZINTER / ZINTERSTORE
-- [ ] ZUNION / ZUNIONSTORE
-- [ ] ZDIFF / ZDIFFSTORE
+- [x] ZINTER / ZINTERSTORE
+- [x] ZUNION / ZUNIONSTORE
+- [x] ZDIFF / ZDIFFSTORE
 - [x] ZRANGE / ZRANGEBYSCORE / ZRANGEBYLEX
 - [x] ZREVRANGE / ZREVRANGEBYSCORE / ZREVRANGEBYLEX
-- [ ] ZPOPMIN / ZPOPMAX
+- [x] ZPOPMIN / ZPOPMAX
 - [ ] BZPOPMIN / BZPOPMAX
-- [ ] ZLEXCOUNT
-- [ ] ZMSCORE
-- [ ] ZRANK / ZREVRANK
+- [x] ZLEXCOUNT
+- [x] ZMSCORE
+- [x] ZRANK / ZREVRANK
 - [x] ZSCORE
 - [x] ZSCAN
 

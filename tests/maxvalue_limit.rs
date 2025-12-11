@@ -78,7 +78,7 @@ async fn rejects_value_exceeding_limit() {
     // large should be rejected
     client.send_array(&["SET", "k2", large]).await;
     let line = client.read_simple_line().await;
-    assert!(line.starts_with("-ERR value exceeds REDUST_MAXVALUE_BYTES"));
+    assert!(line.starts_with("-ERR value exceeds maximum allowed size"));
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
@@ -88,6 +88,7 @@ async fn rejects_value_exceeding_limit() {
 async fn hincrby_respects_limit() {
     let _lock = ENV_LOCK.lock().unwrap();
     let _guard = set_env("REDUST_MAXVALUE_BYTES", "4");
+    let _guard2 = set_env("REDUST_DISABLE_PERSISTENCE", "1");
 
     let (addr, shutdown, handle) = spawn_server().await;
     let mut client = TestClient::connect(addr).await;
@@ -102,7 +103,7 @@ async fn hincrby_respects_limit() {
         .send_array(&["HINCRBY", "numhash", "f", "9991"])
         .await;
     let line = client.read_simple_line().await;
-    assert!(line.starts_with("-ERR value exceeds REDUST_MAXVALUE_BYTES"));
+    assert!(line.starts_with("-ERR value exceeds maximum allowed size"));
 
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
@@ -112,6 +113,7 @@ async fn hincrby_respects_limit() {
 async fn mset_respects_limit() {
     let _lock = ENV_LOCK.lock().unwrap();
     let _guard = set_env("REDUST_MAXVALUE_BYTES", "8");
+    let _guard2 = set_env("REDUST_DISABLE_PERSISTENCE", "1");
 
     let (addr, shutdown, handle) = spawn_server().await;
     let mut client = TestClient::connect(addr).await;
@@ -121,7 +123,7 @@ async fn mset_respects_limit() {
         .send_array(&["MSET", "a", "12345678", "b", "123456789"])
         .await;
     let line = client.read_simple_line().await;
-    assert!(line.starts_with("-ERR value exceeds REDUST_MAXVALUE_BYTES"));
+    assert!(line.starts_with("-ERR value exceeds maximum allowed size"));
 
     // ensure that failed MSET did not partially write key a
     client.send_array(&["GET", "a"]).await;

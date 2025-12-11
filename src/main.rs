@@ -14,6 +14,7 @@ async fn main() -> io::Result<()> {
 
     let mut bind_from_cli: Option<String> = None;
     let mut maxmemory_from_cli: Option<String> = None;
+    let mut rdb_load_mode_from_cli: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -30,6 +31,12 @@ async fn main() -> io::Result<()> {
                     i += 1;
                 }
             }
+            "--rdb-load-mode" => {
+                if i + 1 < args.len() {
+                    rdb_load_mode_from_cli = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -41,6 +48,9 @@ async fn main() -> io::Result<()> {
     }
     if let Some(m) = maxmemory_from_cli {
         env::set_var("REDUST_MAXMEMORY_BYTES", &m);
+    }
+    if let Some(m) = rdb_load_mode_from_cli {
+        env::set_var("REDUST_RDB_LOAD_MODE", &m);
     }
 
     let bind_addr = env::var("REDUST_ADDR").unwrap_or_else(|_| "127.0.0.1:6379".to_string());

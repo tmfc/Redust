@@ -76,7 +76,7 @@ async fn lpush_rpush_respect_value_limit() {
     // 超出限制的 value 被拒绝
     client.send_array(&["RPUSH", "mylist", "12345"]).await;
     let line = client.read_simple_line().await;
-    assert!(line.starts_with("-ERR value exceeds REDUST_MAXVALUE_BYTES"));
+    assert!(line.starts_with("-ERR value exceeds maximum allowed size"));
 
     // 列表长度仍然为 1
     client.send_array(&["LLEN", "mylist"]).await;
@@ -100,7 +100,7 @@ async fn sadd_hset_respect_value_limit() {
     // SADD 中包含超限成员时整体失败
     client.send_array(&["SADD", "myset", "ok", "toolong"]).await;
     let line = client.read_simple_line().await;
-    assert!(line.starts_with("-ERR value exceeds REDUST_MAXVALUE_BYTES"));
+    assert!(line.starts_with("-ERR value exceeds maximum allowed size"));
 
     // 集合应保持为空
     client.send_array(&["SCARD", "myset"]).await;
@@ -112,7 +112,7 @@ async fn sadd_hset_respect_value_limit() {
         .send_array(&["HSET", "myhash", "field", "abcd"])
         .await;
     let line = client.read_simple_line().await;
-    assert!(line.starts_with("-ERR value exceeds REDUST_MAXVALUE_BYTES"));
+    assert!(line.starts_with("-ERR value exceeds maximum allowed size"));
 
     // 不超限的 HSET 正常生效
     client.send_array(&["HSET", "myhash", "field", "ok"]).await;

@@ -1,134 +1,88 @@
-# TODO - Phase B: HyperLogLog 支持
+# TODO
 
-> 目标：实现 Redis 兼容的 HyperLogLog 基数统计功能，支持 PFADD/PFCOUNT/PFMERGE 三个核心命令。
 
-## 1. HyperLogLog 算法研究与设计 📚
+## 高优先级（需立即修复）
 
-- [x] **算法原理学习**
-  - HyperLogLog 基本原理（基数估计、哈希分桶）
-  - Redis 实现细节（16384 个寄存器，6 位精度）
-  - 误差率分析（标准误差约 0.81%）
-  - 内存占用（每个 HLL 约 12KB）
+- [x] **慢日志锁竞争优化** (src/server.rs) ✅
+  - 已使用 parking_lot::Mutex 替代 std::sync::Mutex
+  - parking_lot 性能更好、不会 panic、占用空间更小
 
-- [x] **数据结构设计**
-  - 定义 `HyperLogLog` 结构体
-  - 16384 个 6-bit 寄存器的存储方案
-  - 稀疏表示优化（小基数时节省内存）——未实现，留作未来优化
-  - 与现有 `StorageValue` 枚举集成
+- [x] **Lua 脚本资源限制** (src/scripting.rs) ✅
+  - 已添加执行超时限制（lua-time-limit，默认 5000ms）
+  - 已添加内存使用限制（lua-max-memory，默认 10MB）
+  - 支持环境变量配置：REDUST_LUA_TIME_LIMIT_MS、REDUST_LUA_MAX_MEMORY
+  - 支持 CONFIG GET/SET 动态调整
 
-- [x] **哈希函数选择**
-  - 使用 Rust 标准库 DefaultHasher（基于 SipHash）
-  - 64-bit 哈希值分解：前 14 位做索引，后 50 位计算前导零
+## 中优先级
 
-## 2. 存储层实现 🔧
+- [x] **RDB 文件损坏处理优化** (src/storage.rs:load_rdb) ✅
+  - 已改进错误处理：魔数/版本不匹配、UTF-8 解析失败等情况现在返回明确错误
+  - 添加了详细的错误日志（eprintln! 输出）
+  - 返回 io::Error 而非静默忽略，让调用方可以决定如何处理
 
-- [x] **HyperLogLog 核心算法**
-  - `src/hyperloglog.rs` 新建模块
-  - `HyperLogLog::new()` - 创建空 HLL
-  - `HyperLogLog::add(&mut self, element: &[u8])` - 添加元素
-  - `HyperLogLog::count(&self) -> u64` - 估算基数
-  - `HyperLogLog::merge(&mut self, other: &HyperLogLog)` - 合并 HLL
-  - 稀疏/密集表示自动转换——未实现，留作未来优化
+- [x] **错误信息规范化** (src/command.rs, src/server.rs) ✅
+  - 已将 "ERR value exceeds REDUST_MAXVALUE_BYTES" 改为 "ERR value exceeds maximum allowed size"
+  - 隐藏了内部环境变量名，使用通用错误描述
 
-- [x] **Storage 集成**
-  - 在 `StorageValue` 枚举中添加 `HyperLogLog` 变体
-  - `storage.pfadd(key, elements)` - 添加元素到 HLL
-  - `storage.pfcount(keys)` - 统计单个或多个 HLL 的基数
-  - `storage.pfmerge(dest, sources)` - 合并多个 HLL
+## 低优先级（代码质量改进）
 
-- [x] **类型检查与错误处理**
-  - WRONGTYPE 错误（操作非 HLL 键）
-  - 空键处理（返回 0）
-  - 多键合并时的类型校验
+- [x] **参数验证逻辑重构** (src/command.rs) ✅
+  - 添加辅助函数：require_key, require_i64, require_f64, ensure_no_more_args, collect_keys
+  - 添加 try_cmd! 宏简化错误处理
+  - 重构了 GET, GETDEL, STRLEN, INCR, DECR, INCRBY, INCRBYFLOAT, DECRBY, DEL, UNLINK, HSTRLEN 等命令
 
-## 3. 命令层实现 ⚙️
+- [x] **Prometheus 指标完善** ✅
+  - 新增 redust_used_memory_bytes（内存使用量）
+  - 新增 redust_maxmemory_bytes（最大内存限制）
+  - 新增 redust_slowlog_entries_total（慢日志条目总数）
 
-- [x] **Command 枚举扩展**
-  - `src/command.rs` 添加 `Pfadd`, `Pfcount`, `Pfmerge` 变体
-  - RESP 协议解析（支持多参数）
-  - 参数校验（最少参数数量）
+## 进行中
 
-- [x] **命令处理逻辑**
-  - `src/server.rs` 中添加命令分发
-  - **PFADD key element [element ...]**
-    - 返回 0（未改变）或 1（已改变）
-    - 支持批量添加
-  - **PFCOUNT key [key ...]**
-    - 单键：返回估算基数
-    - 多键：临时合并后返回并集基数
-  - **PFMERGE destkey sourcekey [sourcekey ...]**
-    - 合并多个 HLL 到目标键
-    - 返回 +OK
+- [x] **Hash 命令补全** (src/command.rs, src/server.rs, src/storage.rs) ✅
+  - [x] HINCRBY - 对 hash field 做整数自增
+  - [x] HINCRBYFLOAT - 对 hash field 做浮点自增
+  - [x] HSETNX - 仅当 field 不存在时设置
+  - [x] HSTRLEN - 获取 field 值的字符串长度
+  - [x] HMGET - 批量获取多个 field
+  - [x] HMSET - 批量设置多个 field（已废弃但仍需支持）
+  - [x] HKEYS - 获取所有 field 名
+  - [x] HVALS - 获取所有 field 值
+  - [x] HLEN - 获取 hash 的 field 数量
+  - [x] HSCAN - 增量迭代 hash 的 field
 
-- [x] **WATCH 集成**
-  - PFADD/PFMERGE 触发键版本更新
-  - 事务中的 HLL 操作正确性
+- [x] **List 命令补全** (src/command.rs, src/server.rs, src/storage.rs) ✅
+  - [x] LSET - 设置指定索引的元素
+  - [x] LINSERT - 在指定元素前/后插入
+  - [x] RPOPLPUSH - 从源列表弹出并推入目标列表
+  - [x] BLPOP - 阻塞式左弹出
+  - [x] BRPOP - 阻塞式右弹出
+  - 注：BRPOPLPUSH 已废弃，推荐使用 BLMOVE
 
-## 4. 持久化支持 💾
+- [x] **Set 命令补全** ✅
+  - [x] SSCAN - 增量迭代集合成员
 
-- [x] **RDB 序列化**
-  - `src/storage.rs` 添加 HLL 类型标记 (type_byte = 5)
-  - 序列化 16384 个寄存器
-  - 反序列化并恢复 HLL 状态
+- [x] **ZSet 命令补全** ✅
+  - [x] ZCOUNT - 统计分数范围内的成员数
+  - [x] ZINTER / ZINTERSTORE - 交集运算
+  - [x] ZUNION / ZUNIONSTORE - 并集运算
+  - [x] ZDIFF / ZDIFFSTORE - 差集运算
+  - [x] ZPOPMIN / ZPOPMAX - 弹出最小/最大分数成员
+  - [x] ZLEXCOUNT - 统计字典序范围内的成员数
+  - [x] ZRANK / ZREVRANK - 获取成员排名
+  - [x] ZMSCORE - 批量获取分数
+  - 待实现：BZPOPMIN/BZPOPMAX（阻塞式）
 
-- [ ] **AOF 记录**（未实现，留作未来优化）
-  - PFADD/PFMERGE 命令记录到 AOF
-  - 启动时正确重放 HLL 操作
+- [x] **简单命令补全** ✅
+  - [x] TIME - 返回服务器时间
+  - [x] RANDOMKEY - 随机返回一个 key
+## 高优先级（小改动，高收益）
 
-## 5. 测试覆盖 ✅
+- [x] **maxmemory 策略对齐**
+  - 覆盖 allkeys/volatile LRU、random、TTL 等策略，配置项对齐 Redis
+  - 补齐采样/淘汰参数，添加过期采样与大 key 保护测试
+  - 预估：中
 
-- [x] **单元测试** (`src/hyperloglog.rs`)
-  - 基本添加与计数
-  - 基数估算精度（与真实基数对比）
-  - 合并操作正确性
-  - 边界情况（空 HLL、大量元素）
-
-- [x] **集成测试** (`tests/hyperloglog.rs`)
-  - PFADD 返回值正确性
-  - PFCOUNT 单键/多键场景
-  - PFMERGE 合并逻辑
-  - WRONGTYPE 错误处理
-  - 与其他数据类型混合操作
-
-- [ ] **性能测试**
-  - 大量元素添加性能
-  - 内存占用验证（约 12KB）
-  - 多键合并性能
-
-- [ ] **持久化测试**
-  - RDB 保存与加载
-  - AOF 重放正确性
-  - 重启后基数一致性
-
-## 6. 文档更新 📝
-
-- [x] **command.md**
-  - 添加 HyperLogLog 章节
-  - 标记 PFADD/PFCOUNT/PFMERGE 为已完成
-  - 说明误差率和内存占用
-
-- [ ] **README.md**
-  - 更新支持的数据结构列表
-  - 添加 HyperLogLog 使用示例
-
-- [ ] **future.md**
-  - 记录 HyperLogLog 完成状态
-  - 列出可能的优化方向（稀疏表示优化等）
-
-## 实现顺序建议
-
-1. **第一步**：算法研究与数据结构设计（1-2 天）
-2. **第二步**：核心算法实现与单元测试（2-3 天）
-3. **第三步**：Storage 集成与命令层（1-2 天）
-4. **第四步**：持久化支持（1 天）
-5. **第五步**：集成测试与文档（1 天）
-
-**预计总时间**: 6-9 天
-
----
-
-## 技术参考
-
-- [Redis HyperLogLog 实现](https://redis.io/docs/data-types/probabilistic/hyperloglogs/)
-- [HyperLogLog 论文](http://algo.inria.fr/flajolet/Publications/FlFuGaMe07.pdf)
-- [Redis 源码 hyperloglog.c](https://github.com/redis/redis/blob/unstable/src/hyperloglog.c)
+- [x] **持久化文件校验与降级**
+  - 启动时校验 AOF/RDB 损坏并提供可恢复的降级路径
+  - 提供自动备份/跳过损坏段的降级策略与告警日志
+  - 预估：中
