@@ -25,6 +25,30 @@ pub enum MaxmemoryPolicy {
     VolatileRandom = 5,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub enum RdbLoadMode {
+    #[default]
+    Strict,
+    Tolerant,
+}
+
+impl RdbLoadMode {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "strict" => Some(RdbLoadMode::Strict),
+            "tolerant" => Some(RdbLoadMode::Tolerant),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RdbLoadMode::Strict => "strict",
+            RdbLoadMode::Tolerant => "tolerant",
+        }
+    }
+}
+
 impl MaxmemoryPolicy {
     pub fn from_str(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
@@ -2625,9 +2649,10 @@ impl Storage {
         };
 
         match entry.value() {
-            StorageValue::Zset { value, .. } => {
-                Ok(members.iter().map(|m| value.by_member.get(m).cloned()).collect())
-            }
+            StorageValue::Zset { value, .. } => Ok(members
+                .iter()
+                .map(|m| value.by_member.get(m).cloned())
+                .collect()),
             _ => Err(()),
         }
     }
@@ -3413,20 +3438,30 @@ impl Storage {
     }
 
     pub fn load_rdb<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
-        let result = (|| -> io::Result<()> {
-            let path_ref = path.as_ref();
-            if !path_ref.exists() {
-                return Ok(());
-            }
+        self.load_rdb_with_mode(path, RdbLoadMode::Strict)
+    }
 
-            let mut file = File::open(path_ref)?;
+    pub fn load_rdb_with_mode<P: AsRef<Path>>(&self, path: P, mode: RdbLoadMode) -> io::Result<()> {
+        let path_ref = path.as_ref();
+        if !path_ref.exists() {
+            return Ok(());
+        }
 
+        let mut file = File::open(path_ref)?;
+
+        // 验证 magic header（致命错误，不可恢复）
         let mut magic = [0u8; 8];
         if let Err(e) = file.read_exact(&mut magic) {
-            eprintln!("[rdb] warning: failed to read magic header from {:?}: {}", path_ref, e);
+            eprintln!(
+                "[rdb] warning: failed to read magic header from {:?}: {}",
+                path_ref, e
+            );
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("RDB file {:?} is corrupted: cannot read magic header", path_ref),
+                format!(
+                    "RDB file {:?} is corrupted: cannot read magic header",
+                    path_ref
+                ),
             ));
         }
         if &magic != b"REDUSTDB" {
@@ -3441,9 +3476,13 @@ impl Storage {
             ));
         }
 
+        // 验证版本号（致命错误，不可恢复）
         let mut version_bytes = [0u8; 4];
         if let Err(e) = file.read_exact(&mut version_bytes) {
-            eprintln!("[rdb] warning: failed to read version from {:?}: {}", path_ref, e);
+            eprintln!(
+                "[rdb] warning: failed to read version from {:?}: {}",
+                path_ref, e
+            );
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("RDB file {:?} is corrupted: cannot read version", path_ref),
@@ -3457,195 +3496,228 @@ impl Storage {
             );
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("RDB file {:?} has unsupported version {}", path_ref, version),
+                format!(
+                    "RDB file {:?} has unsupported version {}",
+                    path_ref, version
+                ),
             ));
         }
 
-            self.data.clear();
-            self.last_access.clear();
+        // 使用临时 HashMap 加载数据，成功后再替换
+        let mut temp_data: HashMap<String, StorageValue> = HashMap::new();
+        let mut truncated = false;
 
+        let load_result: io::Result<()> = (|| {
             loop {
                 let mut type_buf = [0u8; 1];
-                let read = file.read(&mut type_buf)?;
+                let read = match file.read(&mut type_buf) {
+                    Ok(n) => n,
+                    Err(_) => {
+                        truncated = true;
+                        break;
+                    }
+                };
                 if read == 0 {
-                    break;
-                }
-                if read != 1 {
-                    self.data.clear();
-                    self.last_access.clear();
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "truncated record type",
-                    ));
+                    break; // 正常 EOF
                 }
 
                 let mut expires_buf = [0u8; 8];
-                file.read_exact(&mut expires_buf)?;
+                if file.read_exact(&mut expires_buf).is_err() {
+                    truncated = true;
+                    break;
+                }
                 let expires_millis = i64::from_le_bytes(expires_buf);
 
-            let mut key_len_buf = [0u8; 4];
-            if file.read_exact(&mut key_len_buf).is_err() {
-                break;
-            }
-            let key_len = u32::from_le_bytes(key_len_buf) as usize;
-            let mut key_bytes = vec![0u8; key_len];
-            if file.read_exact(&mut key_bytes).is_err() {
-                break;
-            }
-            let key = match String::from_utf8(key_bytes) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("[rdb] warning: invalid UTF-8 key in {:?}: {}", path_ref, e);
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("RDB file {:?} contains invalid UTF-8 key", path_ref),
-                    ));
+                let mut key_len_buf = [0u8; 4];
+                if file.read_exact(&mut key_len_buf).is_err() {
+                    truncated = true;
+                    break;
                 }
-            };
+                let key_len = u32::from_le_bytes(key_len_buf) as usize;
+                let mut key_bytes = vec![0u8; key_len];
+                if file.read_exact(&mut key_bytes).is_err() {
+                    truncated = true;
+                    break;
+                }
+                let key = match String::from_utf8(key_bytes) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[rdb] warning: invalid UTF-8 key in {:?}: {}", path_ref, e);
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("RDB file {:?} contains invalid UTF-8 key", path_ref),
+                        ));
+                    }
+                };
 
                 let now = Instant::now();
                 let expires_at = if expires_millis < 0 {
                     None
                 } else if expires_millis == 0 {
-                    continue;
+                    continue; // 已过期，跳过
                 } else {
                     Some(now + Duration::from_millis(expires_millis as u64))
                 };
 
-            let t = type_buf[0];
-            let value = match t {
-                0 => {
-                    let mut len_buf = [0u8; 4];
-                    if file.read_exact(&mut len_buf).is_err() {
-                        break;
-                    }
-                    let len = u32::from_le_bytes(len_buf) as usize;
-                    let mut v = vec![0u8; len];
-                    if file.read_exact(&mut v).is_err() {
-                        break;
-                    }
-                    StorageValue::String {
-                        value: v,
-                        expires_at,
-                    }
-                }
-                1 => {
-                    let mut len_buf = [0u8; 4];
-                    if file.read_exact(&mut len_buf).is_err() {
-                        break;
-                    }
-                    let len = u32::from_le_bytes(len_buf) as usize;
-                    let mut list = VecDeque::with_capacity(len);
-                    for _ in 0..len {
-                        let mut ilen_buf = [0u8; 4];
-                        if file.read_exact(&mut ilen_buf).is_err() {
+                let t = type_buf[0];
+                let value = match t {
+                    0 => {
+                        // String
+                        let mut len_buf = [0u8; 4];
+                        if file.read_exact(&mut len_buf).is_err() {
+                            truncated = true;
                             break;
                         }
-                        let ilen = u32::from_le_bytes(ilen_buf) as usize;
-                        let mut item = vec![0u8; ilen];
-                        if file.read_exact(&mut item).is_err() {
+                        let len = u32::from_le_bytes(len_buf) as usize;
+                        let mut v = vec![0u8; len];
+                        if file.read_exact(&mut v).is_err() {
+                            truncated = true;
                             break;
                         }
-                        let s = match String::from_utf8(item) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                eprintln!("[rdb] warning: invalid UTF-8 in list item: {}", e);
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "RDB file contains invalid UTF-8 in list",
-                                ));
+                        StorageValue::String {
+                            value: v,
+                            expires_at,
+                        }
+                    }
+                    1 => {
+                        // List
+                        let mut len_buf = [0u8; 4];
+                        if file.read_exact(&mut len_buf).is_err() {
+                            truncated = true;
+                            break;
+                        }
+                        let len = u32::from_le_bytes(len_buf) as usize;
+                        let mut list = VecDeque::with_capacity(len);
+                        for _ in 0..len {
+                            let mut ilen_buf = [0u8; 4];
+                            if file.read_exact(&mut ilen_buf).is_err() {
+                                truncated = true;
+                                break;
                             }
-                        };
-                        list.push_back(s);
-                    }
-                    StorageValue::List {
-                        value: list,
-                        expires_at,
-                    }
-                }
-                2 => {
-                    let mut len_buf = [0u8; 4];
-                    if file.read_exact(&mut len_buf).is_err() {
-                        break;
-                    }
-                    let len = u32::from_le_bytes(len_buf) as usize;
-                    let mut set = HashSet::with_capacity(len);
-                    for _ in 0..len {
-                        let mut mlen_buf = [0u8; 4];
-                        if file.read_exact(&mut mlen_buf).is_err() {
-                            break;
-                        }
-                        let mlen = u32::from_le_bytes(mlen_buf) as usize;
-                        let mut member = vec![0u8; mlen];
-                        if file.read_exact(&mut member).is_err() {
-                            break;
-                        }
-                        let s = match String::from_utf8(member) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                eprintln!("[rdb] warning: invalid UTF-8 in set member: {}", e);
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "RDB file contains invalid UTF-8 in set",
-                                ));
+                            let ilen = u32::from_le_bytes(ilen_buf) as usize;
+                            let mut item = vec![0u8; ilen];
+                            if file.read_exact(&mut item).is_err() {
+                                truncated = true;
+                                break;
                             }
-                        };
-                        set.insert(s);
-                    }
-                    StorageValue::Set {
-                        value: set,
-                        expires_at,
-                    }
-                }
-                3 => {
-                    let mut len_buf = [0u8; 4];
-                    if file.read_exact(&mut len_buf).is_err() {
-                        break;
-                    }
-                    let len = u32::from_le_bytes(len_buf) as usize;
-                    let mut map = HashMap::with_capacity(len);
-                    for _ in 0..len {
-                        let mut flen_buf = [0u8; 4];
-                        if file.read_exact(&mut flen_buf).is_err() {
+                            let s = match String::from_utf8(item) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    eprintln!("[rdb] warning: invalid UTF-8 in list item: {}", e);
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "RDB file contains invalid UTF-8 in list",
+                                    ));
+                                }
+                            };
+                            list.push_back(s);
+                        }
+                        if truncated {
                             break;
                         }
-                        let flen = u32::from_le_bytes(flen_buf) as usize;
-                        let mut field = vec![0u8; flen];
-                        if file.read_exact(&mut field).is_err() {
+                        StorageValue::List {
+                            value: list,
+                            expires_at,
+                        }
+                    }
+                    2 => {
+                        // Set
+                        let mut len_buf = [0u8; 4];
+                        if file.read_exact(&mut len_buf).is_err() {
+                            truncated = true;
                             break;
                         }
-                        let field_str = match String::from_utf8(field) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                eprintln!("[rdb] warning: invalid UTF-8 in hash field: {}", e);
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "RDB file contains invalid UTF-8 in hash field",
-                                ));
+                        let len = u32::from_le_bytes(len_buf) as usize;
+                        let mut set = HashSet::with_capacity(len);
+                        for _ in 0..len {
+                            let mut mlen_buf = [0u8; 4];
+                            if file.read_exact(&mut mlen_buf).is_err() {
+                                truncated = true;
+                                break;
                             }
-                        };
+                            let mlen = u32::from_le_bytes(mlen_buf) as usize;
+                            let mut member = vec![0u8; mlen];
+                            if file.read_exact(&mut member).is_err() {
+                                truncated = true;
+                                break;
+                            }
+                            let s = match String::from_utf8(member) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    eprintln!("[rdb] warning: invalid UTF-8 in set member: {}", e);
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "RDB file contains invalid UTF-8 in set",
+                                    ));
+                                }
+                            };
+                            set.insert(s);
+                        }
+                        if truncated {
+                            break;
+                        }
+                        StorageValue::Set {
+                            value: set,
+                            expires_at,
+                        }
+                    }
+                    3 => {
+                        // Hash
+                        let mut len_buf = [0u8; 4];
+                        if file.read_exact(&mut len_buf).is_err() {
+                            truncated = true;
+                            break;
+                        }
+                        let len = u32::from_le_bytes(len_buf) as usize;
+                        let mut map = HashMap::with_capacity(len);
+                        for _ in 0..len {
+                            let mut flen_buf = [0u8; 4];
+                            if file.read_exact(&mut flen_buf).is_err() {
+                                truncated = true;
+                                break;
+                            }
+                            let flen = u32::from_le_bytes(flen_buf) as usize;
+                            let mut field = vec![0u8; flen];
+                            if file.read_exact(&mut field).is_err() {
+                                truncated = true;
+                                break;
+                            }
+                            let field_str = match String::from_utf8(field) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    eprintln!("[rdb] warning: invalid UTF-8 in hash field: {}", e);
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "RDB file contains invalid UTF-8 in hash field",
+                                    ));
+                                }
+                            };
 
-                        let mut vlen_buf = [0u8; 4];
-                        if file.read_exact(&mut vlen_buf).is_err() {
-                            break;
-                        }
-                        let vlen = u32::from_le_bytes(vlen_buf) as usize;
-                        let mut val = vec![0u8; vlen];
-                        if file.read_exact(&mut val).is_err() {
-                            break;
-                        }
-                        let val_str = match String::from_utf8(val) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                eprintln!("[rdb] warning: invalid UTF-8 in hash value: {}", e);
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "RDB file contains invalid UTF-8 in hash value",
-                                ));
+                            let mut vlen_buf = [0u8; 4];
+                            if file.read_exact(&mut vlen_buf).is_err() {
+                                truncated = true;
+                                break;
                             }
-                        };
-
+                            let vlen = u32::from_le_bytes(vlen_buf) as usize;
+                            let mut val = vec![0u8; vlen];
+                            if file.read_exact(&mut val).is_err() {
+                                truncated = true;
+                                break;
+                            }
+                            let val_str = match String::from_utf8(val) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    eprintln!("[rdb] warning: invalid UTF-8 in hash value: {}", e);
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "RDB file contains invalid UTF-8 in hash value",
+                                    ));
+                                }
+                            };
                             map.insert(field_str, val_str);
+                        }
+                        if truncated {
+                            break;
                         }
                         StorageValue::Hash {
                             value: map,
@@ -3653,89 +3725,136 @@ impl Storage {
                         }
                     }
                     4 => {
-                        // ZSET 类型
+                        // ZSet
                         let mut len_buf = [0u8; 4];
-                        file.read_exact(&mut len_buf)?;
+                        if file.read_exact(&mut len_buf).is_err() {
+                            truncated = true;
+                            break;
+                        }
                         let len = u32::from_le_bytes(len_buf) as usize;
                         let mut by_member = HashMap::with_capacity(len);
                         let mut by_score = BTreeSet::new();
                         for _ in 0..len {
-                            // 读取 score (f64, 8 bytes)
                             let mut score_buf = [0u8; 8];
-                            file.read_exact(&mut score_buf)?;
+                            if file.read_exact(&mut score_buf).is_err() {
+                                truncated = true;
+                                break;
+                            }
                             let score = f64::from_le_bytes(score_buf);
 
-                        // 读取 member
-                        let mut mlen_buf = [0u8; 4];
-                        if file.read_exact(&mut mlen_buf).is_err() {
+                            let mut mlen_buf = [0u8; 4];
+                            if file.read_exact(&mut mlen_buf).is_err() {
+                                truncated = true;
+                                break;
+                            }
+                            let mlen = u32::from_le_bytes(mlen_buf) as usize;
+                            let mut member = vec![0u8; mlen];
+                            if file.read_exact(&mut member).is_err() {
+                                truncated = true;
+                                break;
+                            }
+                            let member_str = match String::from_utf8(member) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    eprintln!("[rdb] warning: invalid UTF-8 in zset member: {}", e);
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "RDB file contains invalid UTF-8 in zset",
+                                    ));
+                                }
+                            };
+                            by_member.insert(member_str.clone(), score);
+                            by_score.insert((OrderedFloat(score), member_str));
+                        }
+                        if truncated {
                             break;
                         }
-                        let mlen = u32::from_le_bytes(mlen_buf) as usize;
-                        let mut member = vec![0u8; mlen];
-                        if file.read_exact(&mut member).is_err() {
+                        StorageValue::Zset {
+                            value: ZSetInner {
+                                by_member,
+                                by_score,
+                            },
+                            expires_at,
+                        }
+                    }
+                    5 => {
+                        // HyperLogLog
+                        let mut registers = vec![0u8; 16384];
+                        if file.read_exact(&mut registers).is_err() {
+                            truncated = true;
                             break;
                         }
-                        let member_str = match String::from_utf8(member) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                eprintln!("[rdb] warning: invalid UTF-8 in zset member: {}", e);
+                        let hll = match HyperLogLog::from_registers(registers) {
+                            Some(h) => h,
+                            None => {
+                                eprintln!("[rdb] warning: invalid HyperLogLog registers");
                                 return Err(io::Error::new(
                                     io::ErrorKind::InvalidData,
-                                    "RDB file contains invalid UTF-8 in zset",
+                                    "RDB file contains invalid HyperLogLog data",
                                 ));
                             }
                         };
-
-                        by_member.insert(member_str.clone(), score);
-                        by_score.insert((OrderedFloat(score), member_str));
-                    }
-                    StorageValue::Zset {
-                        value: ZSetInner { by_member, by_score },
-                        expires_at,
-                    }
-                }
-                5 => {
-                    // 反序列化 HyperLogLog: 读取 16384 个寄存器
-                    let mut registers = vec![0u8; 16384];
-                    if file.read_exact(&mut registers).is_err() {
-                        break;
-                    }
-                    let hll = match HyperLogLog::from_registers(registers) {
-                        Some(h) => h,
-                        None => {
-                            eprintln!("[rdb] warning: invalid HyperLogLog registers");
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "RDB file contains invalid HyperLogLog data",
-                            ));
+                        StorageValue::HyperLogLog {
+                            value: hll,
+                            expires_at,
                         }
-                    };
-                    StorageValue::HyperLogLog {
-                        value: hll,
-                        expires_at,
                     }
-                }
-                _ => {
-                    eprintln!("[rdb] warning: unknown data type {} in RDB file", t);
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("RDB file contains unknown data type: {}", t),
-                    ));
-                }
-            };
+                    _ => {
+                        eprintln!("[rdb] warning: unknown data type {} in RDB file", t);
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("RDB file contains unknown data type: {}", t),
+                        ));
+                    }
+                };
 
-                self.data.insert(key, value);
+                temp_data.insert(key, value);
             }
-
             Ok(())
         })();
 
-        if result.is_err() {
-            self.data.clear();
-            self.last_access.clear();
-        }
+        // 根据模式决定如何处理结果
+        match (load_result, truncated, mode) {
+            // 格式错误（如无效 UTF-8、未知类型）：两种模式都返回错误，保留原数据
+            (Err(e), _, _) => Err(e),
 
-        result
+            // 正常加载完成：替换数据
+            (Ok(()), false, _) => {
+                self.data.clear();
+                self.last_access.clear();
+                for (k, v) in temp_data {
+                    self.data.insert(k, v);
+                }
+                Ok(())
+            }
+
+            // truncated + tolerant 模式：使用已加载的部分数据
+            (Ok(()), true, RdbLoadMode::Tolerant) => {
+                eprintln!(
+                    "[rdb] warning: RDB file {:?} is truncated, loaded {} keys in tolerant mode",
+                    path_ref,
+                    temp_data.len()
+                );
+                self.data.clear();
+                self.last_access.clear();
+                for (k, v) in temp_data {
+                    self.data.insert(k, v);
+                }
+                Ok(())
+            }
+
+            // truncated + strict 模式：返回错误，保留原数据
+            (Ok(()), true, RdbLoadMode::Strict) => {
+                eprintln!(
+                    "[rdb] warning: RDB file {:?} is truncated, rejecting in strict mode",
+                    path_ref
+                );
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("RDB file {:?} is truncated", path_ref),
+                ))
+            }
+        }
     }
 
     pub fn expire_seconds(&self, key: &str, seconds: i64) -> bool {

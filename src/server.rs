@@ -23,7 +23,7 @@ use crate::resp::{
     respond_simple_string,
 };
 use crate::scripting::{execute_script, ScriptCache, ScriptContext};
-use crate::storage::{MaxmemoryPolicy, Storage};
+use crate::storage::{MaxmemoryPolicy, RdbLoadMode, Storage};
 
 // 全局客户端 ID 计数器
 static CLIENT_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -463,7 +463,10 @@ fn command_to_strings(cmd: &Command) -> Vec<String> {
             }
             v
         }
-        Command::Zmscore { key, members } => std::iter::once("ZMSCORE".to_string()).chain(std::iter::once(key.clone())).chain(members.iter().cloned()).collect(),
+        Command::Zmscore { key, members } => std::iter::once("ZMSCORE".to_string())
+            .chain(std::iter::once(key.clone()))
+            .chain(members.iter().cloned())
+            .collect(),
         Command::Time => vec!["TIME".to_string()],
         Command::Randomkey => vec!["RANDOMKEY".to_string()],
         // 对于其他命令，使用 Debug 格式的简化表示
@@ -5111,7 +5114,9 @@ async fn handle_connection(
         // 记录慢日志
         let duration_us = cmd_start.elapsed().as_micros() as u64;
         if slowlog.log_if_slow(duration_us, cmd_strings, &client_addr, &client_name) {
-            metrics.slowlog_entries_total.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .slowlog_entries_total
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -5151,7 +5156,7 @@ pub async fn serve(
 ) -> io::Result<()> {
     // 初始化 Lua 脚本资源限制
     crate::scripting::init_script_limits();
-    
+
     let local_addr = listener.local_addr()?;
     let port = local_addr.port();
     let maxmemory_bytes = env::var("REDUST_MAXMEMORY_BYTES")
@@ -5178,6 +5183,10 @@ pub async fn serve(
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
     let aof_path = env::var("REDUST_AOF_PATH").unwrap_or_else(|_| "redust.aof".to_string());
+    let rdb_load_mode = env::var("REDUST_RDB_LOAD_MODE")
+        .ok()
+        .and_then(|s| RdbLoadMode::from_str(&s))
+        .unwrap_or(RdbLoadMode::Strict);
 
     let persistence = Arc::new(PersistenceState {
         rdb_path: rdb_path.clone(),
@@ -5196,7 +5205,7 @@ pub async fn serve(
         if let Some(path) = persistence.aof_path.clone() {
             let exists = std::path::Path::new(&path).exists();
             if exists {
-                match storage.load_rdb(&path) {
+                match storage.load_rdb_with_mode(&path, rdb_load_mode) {
                     Ok(()) => {
                         loaded_ok = true;
                         if let Some(ts) = file_mtime_seconds(&path) {
@@ -5217,7 +5226,7 @@ pub async fn serve(
         }
 
         if !loaded_ok {
-            if let Err(e) = storage.load_rdb(&rdb_path) {
+            if let Err(e) = storage.load_rdb_with_mode(&rdb_path, rdb_load_mode) {
                 error!("[rdb] failed to load RDB from {}: {}", rdb_path, e);
                 if let Some(new_path) = quarantine_corrupt_file(&rdb_path) {
                     error!("[rdb] quarantined corrupt file to {}", new_path);
@@ -5439,8 +5448,14 @@ fn get_config_values(pattern: &str, storage: &Storage, slowlog: &SlowLog) -> Vec
             slowlog.threshold_us().to_string(),
         ),
         ("slowlog-max-len", slowlog.max_len().to_string()),
-        ("lua-time-limit", crate::scripting::get_lua_timeout_ms().to_string()),
-        ("lua-max-memory", crate::scripting::get_lua_max_memory().to_string()),
+        (
+            "lua-time-limit",
+            crate::scripting::get_lua_timeout_ms().to_string(),
+        ),
+        (
+            "lua-max-memory",
+            crate::scripting::get_lua_max_memory().to_string(),
+        ),
     ];
 
     for (key, value) in configs {
