@@ -5,6 +5,12 @@ use crate::resp::read_resp_array;
 
 pub type Binary = Vec<u8>;
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub struct StreamId {
+    pub ms: u64,
+    pub seq: u64,
+}
+
 /// ZINTER/ZUNION 的聚合方式
 #[derive(Debug, Clone, Copy)]
 pub enum ZAggregate {
@@ -37,6 +43,54 @@ pub enum ZLexBound {
     Inclusive(String),
     /// 不包含该值 (value
     Exclusive(String),
+}
+
+/// BITFIELD 整数编码类型
+#[derive(Debug, Clone, Copy)]
+pub enum BitfieldEncoding {
+    /// 有符号整数 (i1-i64)
+    Signed(u8),
+    /// 无符号整数 (u1-u63)
+    Unsigned(u8),
+}
+
+/// BITFIELD 溢出行为
+#[derive(Debug, Clone, Copy, Default)]
+pub enum BitfieldOverflow {
+    /// 环绕（默认）
+    #[default]
+    Wrap,
+    /// 饱和
+    Sat,
+    /// 失败（返回 nil）
+    Fail,
+}
+
+/// BITFIELD 子命令
+#[derive(Debug, Clone)]
+pub enum BitfieldOp {
+    /// GET <encoding> <offset>
+    Get {
+        encoding: BitfieldEncoding,
+        offset: i64,
+        offset_multiplier: bool,
+    },
+    /// SET <encoding> <offset> <value>
+    Set {
+        encoding: BitfieldEncoding,
+        offset: i64,
+        offset_multiplier: bool,
+        value: i64,
+    },
+    /// INCRBY <encoding> <offset> <increment>
+    Incrby {
+        encoding: BitfieldEncoding,
+        offset: i64,
+        offset_multiplier: bool,
+        increment: i64,
+    },
+    /// OVERFLOW [WRAP|SAT|FAIL]
+    Overflow(BitfieldOverflow),
 }
 
 /// Custom error type for command parsing.
@@ -105,6 +159,57 @@ pub enum Command {
         key: String,
         offset: usize,
         value: Binary,
+    },
+    // Bitmap commands
+    Setbit {
+        key: String,
+        offset: u64,
+        value: bool,
+    },
+    Getbit {
+        key: String,
+        offset: u64,
+    },
+    Bitcount {
+        key: String,
+        start: Option<i64>,
+        end: Option<i64>,
+        use_bit: bool,
+    },
+    Bitpos {
+        key: String,
+        bit: bool,
+        start: Option<i64>,
+        end: Option<i64>,
+        use_bit: bool,
+    },
+    Bitop {
+        op: String,
+        destkey: String,
+        keys: Vec<String>,
+    },
+    Bitfield {
+        key: String,
+        ops: Vec<BitfieldOp>,
+    },
+    BitfieldRo {
+        key: String,
+        ops: Vec<BitfieldOp>,
+    },
+    // Streams
+    Xadd {
+        key: String,
+        id: Option<StreamId>,
+        fields: Vec<(Binary, Binary)>,
+    },
+    Xlen {
+        key: String,
+    },
+    Xrange {
+        key: String,
+        start: Option<StreamId>,
+        end: Option<StreamId>,
+        count: Option<usize>,
     },
     Append {
         key: String,
@@ -684,6 +789,16 @@ fn require_f64(iter: &mut impl Iterator<Item = Vec<u8>>, cmd: &str) -> Result<f6
     parse_f64_from_bulk(bytes)
 }
 
+fn parse_stream_id_token(token: Vec<u8>) -> Result<StreamId, Command> {
+    let s = parse_bulk_string(token)?;
+    let Some((ms_s, seq_s)) = s.split_once('-') else {
+        return Err(err_syntax());
+    };
+    let ms: u64 = ms_s.parse().map_err(|_| err_syntax())?;
+    let seq: u64 = seq_s.parse().map_err(|_| err_syntax())?;
+    Ok(StreamId { ms, seq })
+}
+
 /// 确保迭代器中没有多余参数
 fn ensure_no_more_args(iter: &mut impl Iterator<Item = Vec<u8>>, cmd: &str) -> Result<(), Command> {
     if iter.next().is_some() {
@@ -716,6 +831,52 @@ fn parse_i64_from_bulk(bytes: Vec<u8>) -> Result<i64, Command> {
 fn parse_u64_from_bulk(bytes: Vec<u8>) -> Result<u64, Command> {
     let s = parse_bulk_string(bytes)?;
     s.parse::<u64>().map_err(|_| err_not_integer())
+}
+
+fn parse_bitfield_encoding(s: &str) -> Result<BitfieldEncoding, String> {
+    if s.is_empty() {
+        return Err("ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is".to_string());
+    }
+    let (signed, rest) = match s.chars().next() {
+        Some('i') | Some('I') => (true, &s[1..]),
+        Some('u') | Some('U') => (false, &s[1..]),
+        _ => return Err("ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is".to_string()),
+    };
+    let bits: u8 = rest.parse().map_err(|_| {
+        "ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is".to_string()
+    })?;
+    if bits == 0 {
+        return Err("ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is".to_string());
+    }
+    if signed {
+        if bits > 64 {
+            return Err("ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is".to_string());
+        }
+        Ok(BitfieldEncoding::Signed(bits))
+    } else {
+        if bits > 63 {
+            return Err("ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is".to_string());
+        }
+        Ok(BitfieldEncoding::Unsigned(bits))
+    }
+}
+
+fn parse_bitfield_offset(s: &str) -> Result<(i64, bool), String> {
+    if s.is_empty() {
+        return Err("ERR bit offset is not an integer or out of range".to_string());
+    }
+    let (multiplier, rest) = if s.starts_with('#') {
+        (true, &s[1..])
+    } else {
+        (false, s)
+    };
+    let offset: i64 = rest.parse().map_err(|_| {
+        "ERR bit offset is not an integer or out of range".to_string()
+    })?;
+    if offset < 0 {
+        return Err("ERR bit offset is not an integer or out of range".to_string());
+    }
+    Ok((offset, multiplier))
 }
 
 fn parse_isize_from_bulk(bytes: Vec<u8>) -> Result<isize, Command> {
@@ -1183,6 +1344,527 @@ pub async fn read_command(
             }
             let offset = offset_i64 as usize;
             Command::Setrange { key, offset, value }
+        }
+        "SETBIT" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("setbit")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(offset_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("setbit")));
+            };
+            let Some(value_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("setbit")));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("setbit")));
+            }
+            let offset = match parse_u64_from_bulk(offset_bytes) {
+                Ok(v) => v,
+                Err(e) => return Ok(Some(e)),
+            };
+            let value_i64 = match parse_i64_from_bulk(value_bytes) {
+                Ok(v) => v,
+                Err(e) => return Ok(Some(e)),
+            };
+            if value_i64 != 0 && value_i64 != 1 {
+                return Ok(Some(Command::Error(
+                    "ERR bit is not an integer or out of range".to_string(),
+                )));
+            }
+            Command::Setbit { key, offset, value: value_i64 == 1 }
+        }
+        "GETBIT" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("getbit")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(offset_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("getbit")));
+            };
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("getbit")));
+            }
+            let offset = match parse_u64_from_bulk(offset_bytes) {
+                Ok(v) => v,
+                Err(e) => return Ok(Some(e)),
+            };
+            Command::Getbit { key, offset }
+        }
+        "BITCOUNT" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("bitcount")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let mut start: Option<i64> = None;
+            let mut end: Option<i64> = None;
+            let mut use_bit = false;
+
+            if let Some(start_bytes) = iter.next() {
+                start = Some(match parse_i64_from_bulk(start_bytes) {
+                    Ok(v) => v,
+                    Err(e) => return Ok(Some(e)),
+                });
+                if let Some(end_bytes) = iter.next() {
+                    end = Some(match parse_i64_from_bulk(end_bytes) {
+                        Ok(v) => v,
+                        Err(e) => return Ok(Some(e)),
+                    });
+                    // 检查是否有 BYTE/BIT 修饰符
+                    if let Some(mode_bytes) = iter.next() {
+                        let mode = match parse_bulk_string(mode_bytes) {
+                            Ok(m) => m.to_uppercase(),
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        match mode.as_str() {
+                            "BIT" => use_bit = true,
+                            "BYTE" => use_bit = false,
+                            _ => return Ok(Some(Command::Error(
+                                "ERR syntax error".to_string(),
+                            ))),
+                        }
+                    }
+                } else {
+                    // 只有 start 没有 end 是错误的
+                    return Ok(Some(err_wrong_args("bitcount")));
+                }
+            }
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("bitcount")));
+            }
+            Command::Bitcount { key, start, end, use_bit }
+        }
+        "BITPOS" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("bitpos")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(bit_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("bitpos")));
+            };
+            let bit_i64 = match parse_i64_from_bulk(bit_bytes) {
+                Ok(v) => v,
+                Err(e) => return Ok(Some(e)),
+            };
+            if bit_i64 != 0 && bit_i64 != 1 {
+                return Ok(Some(Command::Error(
+                    "ERR bit is not an integer or out of range".to_string(),
+                )));
+            }
+            let bit = bit_i64 == 1;
+
+            let mut start: Option<i64> = None;
+            let mut end: Option<i64> = None;
+            let mut use_bit = false;
+
+            if let Some(start_bytes) = iter.next() {
+                start = Some(match parse_i64_from_bulk(start_bytes) {
+                    Ok(v) => v,
+                    Err(e) => return Ok(Some(e)),
+                });
+                if let Some(end_bytes) = iter.next() {
+                    end = Some(match parse_i64_from_bulk(end_bytes) {
+                        Ok(v) => v,
+                        Err(e) => return Ok(Some(e)),
+                    });
+                    // 检查是否有 BYTE/BIT 修饰符
+                    if let Some(mode_bytes) = iter.next() {
+                        let mode = match parse_bulk_string(mode_bytes) {
+                            Ok(m) => m.to_uppercase(),
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        match mode.as_str() {
+                            "BIT" => use_bit = true,
+                            "BYTE" => use_bit = false,
+                            _ => return Ok(Some(Command::Error(
+                                "ERR syntax error".to_string(),
+                            ))),
+                        }
+                    }
+                }
+            }
+            if iter.next().is_some() {
+                return Ok(Some(err_wrong_args("bitpos")));
+            }
+            Command::Bitpos { key, bit, start, end, use_bit }
+        }
+        "BITOP" => {
+            let Some(op_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("bitop")));
+            };
+            let op = match parse_bulk_string(op_bytes) {
+                Ok(o) => o.to_uppercase(),
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(destkey_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("bitop")));
+            };
+            let destkey = match parse_bulk_string(destkey_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let mut keys = Vec::new();
+            for key_bytes in iter {
+                let key = match parse_bulk_string(key_bytes) {
+                    Ok(k) => k,
+                    Err(e) => return Ok(Some(e)),
+                };
+                keys.push(key);
+            }
+            if keys.is_empty() {
+                return Ok(Some(err_wrong_args("bitop")));
+            }
+            Command::Bitop { op, destkey, keys }
+        }
+        "BITFIELD" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("bitfield")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+
+            let mut ops = Vec::new();
+            while let Some(subcmd_bytes) = iter.next() {
+                let subcmd = match parse_bulk_string(subcmd_bytes) {
+                    Ok(s) => s.to_uppercase(),
+                    Err(e) => return Ok(Some(e)),
+                };
+
+                match subcmd.as_str() {
+                    "GET" => {
+                        let Some(enc_bytes) = iter.next() else {
+                            return Ok(Some(Command::Error("ERR syntax error".to_string())));
+                        };
+                        let enc_str = match parse_bulk_string(enc_bytes) {
+                            Ok(s) => s,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        let encoding = match parse_bitfield_encoding(&enc_str) {
+                            Ok(e) => e,
+                            Err(msg) => return Ok(Some(Command::Error(msg))),
+                        };
+
+                        let Some(off_bytes) = iter.next() else {
+                            return Ok(Some(Command::Error("ERR syntax error".to_string())));
+                        };
+                        let off_str = match parse_bulk_string(off_bytes) {
+                            Ok(s) => s,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        let (offset, offset_multiplier) = match parse_bitfield_offset(&off_str) {
+                            Ok(o) => o,
+                            Err(msg) => return Ok(Some(Command::Error(msg))),
+                        };
+
+                        ops.push(BitfieldOp::Get {
+                            encoding,
+                            offset,
+                            offset_multiplier,
+                        });
+                    }
+                    "SET" => {
+                        let Some(enc_bytes) = iter.next() else {
+                            return Ok(Some(Command::Error("ERR syntax error".to_string())));
+                        };
+                        let enc_str = match parse_bulk_string(enc_bytes) {
+                            Ok(s) => s,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        let encoding = match parse_bitfield_encoding(&enc_str) {
+                            Ok(e) => e,
+                            Err(msg) => return Ok(Some(Command::Error(msg))),
+                        };
+
+                        let Some(off_bytes) = iter.next() else {
+                            return Ok(Some(Command::Error("ERR syntax error".to_string())));
+                        };
+                        let off_str = match parse_bulk_string(off_bytes) {
+                            Ok(s) => s,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        let (offset, offset_multiplier) = match parse_bitfield_offset(&off_str) {
+                            Ok(o) => o,
+                            Err(msg) => return Ok(Some(Command::Error(msg))),
+                        };
+
+                        let Some(val_bytes) = iter.next() else {
+                            return Ok(Some(Command::Error("ERR syntax error".to_string())));
+                        };
+                        let value = match parse_i64_from_bulk(val_bytes) {
+                            Ok(v) => v,
+                            Err(_) => {
+                                return Ok(Some(Command::Error(
+                                    "ERR value is not an integer or out of range".to_string(),
+                                )))
+                            }
+                        };
+
+                        ops.push(BitfieldOp::Set {
+                            encoding,
+                            offset,
+                            offset_multiplier,
+                            value,
+                        });
+                    }
+                    "INCRBY" => {
+                        let Some(enc_bytes) = iter.next() else {
+                            return Ok(Some(Command::Error("ERR syntax error".to_string())));
+                        };
+                        let enc_str = match parse_bulk_string(enc_bytes) {
+                            Ok(s) => s,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        let encoding = match parse_bitfield_encoding(&enc_str) {
+                            Ok(e) => e,
+                            Err(msg) => return Ok(Some(Command::Error(msg))),
+                        };
+
+                        let Some(off_bytes) = iter.next() else {
+                            return Ok(Some(Command::Error("ERR syntax error".to_string())));
+                        };
+                        let off_str = match parse_bulk_string(off_bytes) {
+                            Ok(s) => s,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        let (offset, offset_multiplier) = match parse_bitfield_offset(&off_str) {
+                            Ok(o) => o,
+                            Err(msg) => return Ok(Some(Command::Error(msg))),
+                        };
+
+                        let Some(incr_bytes) = iter.next() else {
+                            return Ok(Some(Command::Error("ERR syntax error".to_string())));
+                        };
+                        let increment = match parse_i64_from_bulk(incr_bytes) {
+                            Ok(v) => v,
+                            Err(_) => {
+                                return Ok(Some(Command::Error(
+                                    "ERR value is not an integer or out of range".to_string(),
+                                )))
+                            }
+                        };
+
+                        ops.push(BitfieldOp::Incrby {
+                            encoding,
+                            offset,
+                            offset_multiplier,
+                            increment,
+                        });
+                    }
+                    "OVERFLOW" => {
+                        let Some(mode_bytes) = iter.next() else {
+                            return Ok(Some(Command::Error("ERR syntax error".to_string())));
+                        };
+                        let mode_str = match parse_bulk_string(mode_bytes) {
+                            Ok(s) => s.to_uppercase(),
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        let overflow = match mode_str.as_str() {
+                            "WRAP" => BitfieldOverflow::Wrap,
+                            "SAT" => BitfieldOverflow::Sat,
+                            "FAIL" => BitfieldOverflow::Fail,
+                            _ => {
+                                return Ok(Some(Command::Error(
+                                    "ERR Invalid OVERFLOW type (should be one of WRAP, SAT, FAIL)"
+                                        .to_string(),
+                                )))
+                            }
+                        };
+                        ops.push(BitfieldOp::Overflow(overflow));
+                    }
+                    _ => {
+                        return Ok(Some(Command::Error(format!(
+                            "ERR Unknown subcommand or wrong number of arguments for '{}'",
+                            subcmd
+                        ))));
+                    }
+                }
+            }
+
+            Command::Bitfield { key, ops }
+        }
+        "BITFIELD_RO" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("bitfield_ro")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+
+            let mut ops = Vec::new();
+            while let Some(subcmd_bytes) = iter.next() {
+                let subcmd = match parse_bulk_string(subcmd_bytes) {
+                    Ok(s) => s.to_uppercase(),
+                    Err(e) => return Ok(Some(e)),
+                };
+
+                if subcmd != "GET" {
+                    return Ok(Some(Command::Error(
+                        "ERR BITFIELD_RO only supports the GET subcommand".to_string(),
+                    )));
+                }
+
+                let Some(enc_bytes) = iter.next() else {
+                    return Ok(Some(Command::Error("ERR syntax error".to_string())));
+                };
+                let enc_str = match parse_bulk_string(enc_bytes) {
+                    Ok(s) => s,
+                    Err(e) => return Ok(Some(e)),
+                };
+                let encoding = match parse_bitfield_encoding(&enc_str) {
+                    Ok(e) => e,
+                    Err(msg) => return Ok(Some(Command::Error(msg))),
+                };
+
+                let Some(off_bytes) = iter.next() else {
+                    return Ok(Some(Command::Error("ERR syntax error".to_string())));
+                };
+                let off_str = match parse_bulk_string(off_bytes) {
+                    Ok(s) => s,
+                    Err(e) => return Ok(Some(e)),
+                };
+                let (offset, offset_multiplier) = match parse_bitfield_offset(&off_str) {
+                    Ok(o) => o,
+                    Err(msg) => return Ok(Some(Command::Error(msg))),
+                };
+
+                ops.push(BitfieldOp::Get {
+                    encoding,
+                    offset,
+                    offset_multiplier,
+                });
+            }
+
+            Command::BitfieldRo { key, ops }
+        }
+        "XADD" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("xadd")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+
+            let Some(id_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("xadd")));
+            };
+            let id_str = match parse_bulk_string(id_bytes) {
+                Ok(s) => s,
+                Err(e) => return Ok(Some(e)),
+            };
+            let id = if id_str == "*" {
+                None
+            } else {
+                match parse_stream_id_token(id_str.into_bytes()) {
+                    Ok(v) => Some(v),
+                    Err(e) => return Ok(Some(e)),
+                }
+            };
+
+            let mut fields: Vec<(Binary, Binary)> = Vec::new();
+            while let Some(field) = iter.next() {
+                let Some(value) = iter.next() else {
+                    return Ok(Some(err_wrong_args("xadd")));
+                };
+                fields.push((field, value));
+            }
+            if fields.is_empty() {
+                return Ok(Some(err_wrong_args("xadd")));
+            }
+            Command::Xadd { key, id, fields }
+        }
+        "XLEN" => {
+            let key = try_cmd!(require_key(&mut iter, "xlen"));
+            try_cmd!(ensure_no_more_args(&mut iter, "xlen"));
+            Command::Xlen { key }
+        }
+        "XRANGE" => {
+            let Some(key_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("xrange")));
+            };
+            let key = match parse_bulk_string(key_bytes) {
+                Ok(k) => k,
+                Err(e) => return Ok(Some(e)),
+            };
+            let Some(start_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("xrange")));
+            };
+            let start_s = match parse_bulk_string(start_bytes) {
+                Ok(s) => s,
+                Err(e) => return Ok(Some(e)),
+            };
+            let start = if start_s == "-" {
+                None
+            } else {
+                match parse_stream_id_token(start_s.into_bytes()) {
+                    Ok(v) => Some(v),
+                    Err(e) => return Ok(Some(e)),
+                }
+            };
+
+            let Some(end_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("xrange")));
+            };
+            let end_s = match parse_bulk_string(end_bytes) {
+                Ok(s) => s,
+                Err(e) => return Ok(Some(e)),
+            };
+            let end = if end_s == "+" {
+                None
+            } else {
+                match parse_stream_id_token(end_s.into_bytes()) {
+                    Ok(v) => Some(v),
+                    Err(e) => return Ok(Some(e)),
+                }
+            };
+
+            let mut count: Option<usize> = None;
+            while let Some(opt) = iter.next() {
+                let opt_upper = match parse_bulk_string(opt) {
+                    Ok(s) => s.to_uppercase(),
+                    Err(e) => return Ok(Some(e)),
+                };
+                match opt_upper.as_str() {
+                    "COUNT" => {
+                        let Some(n_bytes) = iter.next() else {
+                            return Ok(Some(err_wrong_args("xrange")));
+                        };
+                        let n = match parse_i64_from_bulk(n_bytes) {
+                            Ok(v) => v,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        if n < 0 {
+                            return Ok(Some(err_not_integer()));
+                        }
+                        count = Some(n as usize);
+                    }
+                    _ => {
+                        return Ok(Some(err_syntax()));
+                    }
+                }
+            }
+
+            Command::Xrange {
+                key,
+                start,
+                end,
+                count,
+            }
         }
         "APPEND" => {
             let Some(key_bytes) = iter.next() else {

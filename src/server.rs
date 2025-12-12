@@ -1097,6 +1097,203 @@ async fn handle_string_command(
                 }
             }
         }
+        Command::Setbit { key, offset, value } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.setbit(&physical, offset, value) {
+                Ok(old_bit) => {
+                    respond_integer(writer, old_bit).await?;
+                }
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(writer, "OOM command not allowed when used memory > 'maxmemory'.").await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Getbit { key, offset } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.getbit(&physical, offset) {
+                Ok(bit) => {
+                    respond_integer(writer, bit).await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(writer, "OOM command not allowed when used memory > 'maxmemory'.").await?;
+                }
+            }
+        }
+        Command::Bitcount { key, start, end, use_bit } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.bitcount(&physical, start, end, use_bit) {
+                Ok(count) => {
+                    respond_integer(writer, count).await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(writer, "OOM command not allowed when used memory > 'maxmemory'.").await?;
+                }
+            }
+        }
+        Command::Bitpos { key, bit, start, end, use_bit } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.bitpos(&physical, bit, start, end, use_bit) {
+                Ok(pos) => {
+                    respond_integer(writer, pos).await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(writer, "OOM command not allowed when used memory > 'maxmemory'.").await?;
+                }
+            }
+        }
+        Command::Bitop { op, destkey, keys } => {
+            let physical_dest = prefix_key(current_db, &destkey);
+            let physical_keys: Vec<String> = keys.iter().map(|k| prefix_key(current_db, k)).collect();
+            match storage.bitop(&op, &physical_dest, &physical_keys) {
+                Ok(len) => {
+                    respond_integer(writer, len).await?;
+                }
+                Err(crate::storage::BitopError::Oom) => {
+                    respond_error(writer, "OOM command not allowed when used memory > 'maxmemory'.").await?;
+                }
+                Err(crate::storage::BitopError::WrongType) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+                Err(crate::storage::BitopError::InvalidArgs(msg)) => {
+                    respond_error(writer, &msg).await?;
+                }
+            }
+        }
+        Command::Bitfield { key, ops } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.bitfield(&physical, &ops, false) {
+                Ok(results) => {
+                    // 返回数组
+                    writer.write_all(format!("*{}\r\n", results.len()).as_bytes()).await?;
+                    for result in results {
+                        match result {
+                            Some(v) => {
+                                writer.write_all(format!(":{}\r\n", v).as_bytes()).await?;
+                            }
+                            None => {
+                                writer.write_all(b"$-1\r\n").await?;
+                            }
+                        }
+                    }
+                }
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(writer, "OOM command not allowed when used memory > 'maxmemory'.").await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::BitfieldRo { key, ops } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.bitfield(&physical, &ops, true) {
+                Ok(results) => {
+                    // 返回数组
+                    writer.write_all(format!("*{}\r\n", results.len()).as_bytes()).await?;
+                    for result in results {
+                        match result {
+                            Some(v) => {
+                                writer.write_all(format!(":{}\r\n", v).as_bytes()).await?;
+                            }
+                            None => {
+                                writer.write_all(b"$-1\r\n").await?;
+                            }
+                        }
+                    }
+                }
+                Err(crate::storage::StorageError::Oom) => {
+                    respond_error(writer, "OOM command not allowed when used memory > 'maxmemory'.").await?;
+                }
+                Err(crate::storage::StorageError::WrongType) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Xadd { key, id, fields } => {
+            let physical = prefix_key(current_db, &key);
+            let mapped_fields: Vec<(Vec<u8>, Vec<u8>)> =
+                fields.into_iter().map(|(f, v)| (f, v)).collect();
+            match storage.xadd(&physical, id, mapped_fields) {
+                Ok(id) => {
+                    let id_s = format!("{}-{}", id.ms, id.seq);
+                    respond_bulk_string(writer, &id_s).await?;
+                }
+                Err(crate::storage::StreamError::Oom) => {
+                    respond_error(writer, "OOM command not allowed when used memory > 'maxmemory'.").await?;
+                }
+                Err(crate::storage::StreamError::WrongType) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+                Err(crate::storage::StreamError::IdTooSmall) => {
+                    respond_error(writer, "ERR The ID specified in XADD is equal or smaller than the target stream top item").await?;
+                }
+            }
+        }
+        Command::Xlen { key } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.xlen(&physical) {
+                Ok(len) => respond_integer(writer, len as i64).await?,
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Command::Xrange {
+            key,
+            start,
+            end,
+            count,
+        } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.xrange(&physical, start, end, count) {
+                Ok(items) => {
+                    writer
+                        .write_all(format!("*{}\r\n", items.len()).as_bytes())
+                        .await?;
+                    for (id, fields) in items {
+                        // each entry is [id, [field, value, ...]]
+                        writer.write_all(b"*2\r\n").await?;
+                        let id_s = format!("{}-{}", id.ms, id.seq);
+                        respond_bulk_string(writer, &id_s).await?;
+
+                        writer
+                            .write_all(format!("*{}\r\n", fields.len() * 2).as_bytes())
+                            .await?;
+                        for (f, v) in fields {
+                            respond_bulk_bytes(writer, &f).await?;
+                            respond_bulk_bytes(writer, &v).await?;
+                        }
+                    }
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
         Command::Append { key, value } => {
             let physical = prefix_key(current_db, &key);
             if let Some(limit) = current_max_value_bytes() {
@@ -3906,6 +4103,16 @@ async fn execute_command_in_transaction(
         | Command::Getex { .. }
         | Command::Getrange { .. }
         | Command::Setrange { .. }
+        | Command::Setbit { .. }
+        | Command::Getbit { .. }
+        | Command::Bitcount { .. }
+        | Command::Bitpos { .. }
+        | Command::Bitop { .. }
+        | Command::Bitfield { .. }
+        | Command::BitfieldRo { .. }
+        | Command::Xadd { .. }
+        | Command::Xlen { .. }
+        | Command::Xrange { .. }
         | Command::Append { .. }
         | Command::Strlen { .. }
         | Command::Getset { .. }
@@ -4443,6 +4650,16 @@ async fn handle_connection(
             | Command::Getex { .. }
             | Command::Getrange { .. }
             | Command::Setrange { .. }
+            | Command::Setbit { .. }
+            | Command::Getbit { .. }
+            | Command::Bitcount { .. }
+            | Command::Bitpos { .. }
+            | Command::Bitop { .. }
+            | Command::Bitfield { .. }
+            | Command::BitfieldRo { .. }
+            | Command::Xadd { .. }
+            | Command::Xlen { .. }
+            | Command::Xrange { .. }
             | Command::Append { .. }
             | Command::Strlen { .. }
             | Command::Getset { .. }

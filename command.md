@@ -409,16 +409,16 @@
 
 ### Streams
 
-- [ ] XADD
+- [x] XADD
 - [ ] XDEL
 - [ ] XREAD
 - [ ] XREADGROUP
-- [ ] XRANGE / XREVRANGE
+- [x] XRANGE / XREVRANGE
 - [ ] XACK
 - [ ] XCLAIM / XAUTOCLAIM
 - [ ] XGROUP *（CREATE/SETID/DESTROY/DELCONSUMER）*
 - [ ] XINFO *（STREAM/CONSUMERS/GROUPS）*
-- [ ] XLEN
+- [x] XLEN
 - [ ] XPENDING
 
 ### Pub/Sub
@@ -461,13 +461,13 @@
 
 ### Bitmaps
 
-- [ ] SETBIT
-- [ ] GETBIT
-- [ ] BITCOUNT
-- [ ] BITPOS
-- [ ] BITOP
-- [ ] BITFIELD
-- [ ] BITFIELD_RO
+- [x] SETBIT
+- [x] GETBIT
+- [x] BITCOUNT
+- [x] BITPOS
+- [x] BITOP
+- [x] BITFIELD
+- [x] BITFIELD_RO
 
 ### Modules / ACL / Cluster 等
 

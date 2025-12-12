@@ -1,3 +1,4 @@
+use crate::command::{BitfieldEncoding, BitfieldOp, BitfieldOverflow};
 use crate::hyperloglog::HyperLogLog;
 use dashmap::DashMap;
 use ordered_float::OrderedFloat;
@@ -11,7 +12,7 @@ use std::sync::{
     atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
     Arc,
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 type ByteString = Vec<u8>;
 
@@ -115,6 +116,20 @@ struct ZSetInner {
     by_score: BTreeSet<(OrderedFloat<f64>, String)>,
 }
 
+use crate::command::StreamId;
+
+#[derive(Debug, Clone)]
+struct StreamEntry {
+    id: StreamId,
+    fields: Vec<(ByteString, ByteString)>,
+}
+
+#[derive(Debug, Clone)]
+struct StreamInner {
+    entries: Vec<StreamEntry>,
+    last_id: StreamId,
+}
+
 #[derive(Debug, Clone)]
 enum StorageValue {
     String {
@@ -139,6 +154,10 @@ enum StorageValue {
     },
     HyperLogLog {
         value: HyperLogLog,
+        expires_at: Option<Instant>,
+    },
+    Stream {
+        value: StreamInner,
         expires_at: Option<Instant>,
     },
 }
@@ -192,6 +211,12 @@ pub enum ZsetError {
     Oom,
 }
 
+pub enum StreamError {
+    WrongType,
+    IdTooSmall,
+    Oom,
+}
+
 pub enum LsetError {
     WrongType,
     NoSuchKey,
@@ -210,6 +235,13 @@ pub enum ZsetAggregate {
 pub enum StorageError {
     WrongType,
     Oom,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BitopError {
+    WrongType,
+    Oom,
+    InvalidArgs(String),
 }
 
 impl Default for Storage {
@@ -244,6 +276,137 @@ impl Storage {
     pub fn bump_key_version(&self, key: &str) {
         let new_version = self.global_version.fetch_add(1, Ordering::SeqCst) + 1;
         self.key_versions.insert(key.to_string(), new_version);
+    }
+
+    fn now_millis() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_millis(0))
+            .as_millis() as u64
+    }
+
+    pub fn xadd(
+        &self,
+        key: &str,
+        id: Option<StreamId>,
+        fields: Vec<(ByteString, ByteString)>,
+    ) -> Result<StreamId, StreamError> {
+        self.maybe_evict_for_write().map_err(|_| StreamError::Oom)?;
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            // expired removed
+        }
+
+        match self.data.entry(key.to_string()) {
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                let next_id = match id {
+                    Some(given) => given,
+                    None => StreamId {
+                        ms: Self::now_millis(),
+                        seq: 0,
+                    },
+                };
+                if next_id.ms == 0 && next_id.seq == 0 {
+                    return Err(StreamError::IdTooSmall);
+                }
+                let inner = StreamInner {
+                    entries: vec![StreamEntry {
+                        id: next_id,
+                        fields,
+                    }],
+                    last_id: next_id,
+                };
+                v.insert(StorageValue::Stream {
+                    value: inner,
+                    expires_at: None,
+                });
+                self.bump_key_version(key);
+                Ok(next_id)
+            }
+            dashmap::mapref::entry::Entry::Occupied(mut o) => match o.get_mut() {
+                StorageValue::Stream { value, .. } => {
+                    let next_id = match id {
+                        Some(given) => given,
+                        None => {
+                            let mut ms = Self::now_millis();
+                            if ms < value.last_id.ms {
+                                ms = value.last_id.ms;
+                            }
+                            let seq = if ms == value.last_id.ms {
+                                value.last_id.seq.saturating_add(1)
+                            } else {
+                                0
+                            };
+                            StreamId { ms, seq }
+                        }
+                    };
+
+                    if next_id <= value.last_id {
+                        return Err(StreamError::IdTooSmall);
+                    }
+                    value.entries.push(StreamEntry {
+                        id: next_id,
+                        fields,
+                    });
+                    value.last_id = next_id;
+                    self.bump_key_version(key);
+                    Ok(next_id)
+                }
+                _ => Err(StreamError::WrongType),
+            },
+        }
+    }
+
+    pub fn xlen(&self, key: &str) -> Result<usize, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(0);
+        }
+        match self.data.get(key) {
+            None => Ok(0),
+            Some(v) => match v.value() {
+                StorageValue::Stream { value, .. } => Ok(value.entries.len()),
+                _ => Err(()),
+            },
+        }
+    }
+
+    pub fn xrange(
+        &self,
+        key: &str,
+        start: Option<StreamId>,
+        end: Option<StreamId>,
+        count: Option<usize>,
+    ) -> Result<Vec<(StreamId, Vec<(ByteString, ByteString)>)>, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(Vec::new());
+        }
+        let Some(v) = self.data.get(key) else {
+            return Ok(Vec::new());
+        };
+        let StorageValue::Stream { value, .. } = v.value() else {
+            return Err(());
+        };
+        let mut out = Vec::new();
+        let limit = count.unwrap_or(usize::MAX);
+        for e in &value.entries {
+            if let Some(s) = start {
+                if e.id < s {
+                    continue;
+                }
+            }
+            if let Some(en) = end {
+                if e.id > en {
+                    continue;
+                }
+            }
+            out.push((e.id, e.fields.clone()));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     pub fn flushdb(&self, db: u8) {
@@ -1139,6 +1302,713 @@ impl Storage {
         Ok(new_len)
     }
 
+    // ==================== Bitmap Operations ====================
+
+    /// SETBIT: 设置指定位的值，返回原来的位值
+    pub fn setbit(&self, key: &str, offset: u64, value: bool) -> Result<i64, StorageError> {
+        let now = Instant::now();
+        self.remove_if_expired(key, now);
+
+        let old_value = self.data.get(key).map(|e| e.value().clone());
+        let old_last_access = self.last_access.get(key).map(|v| *v);
+
+        let byte_index = (offset / 8) as usize;
+        let bit_index = 7 - (offset % 8) as u8; // Redis 使用大端位序
+
+        let old_bit = if let Some(mut entry) = self.data.get_mut(key) {
+            match entry.value_mut() {
+                StorageValue::String { value: s, .. } => {
+                    // 扩展字符串以容纳新位
+                    if byte_index >= s.len() {
+                        s.resize(byte_index + 1, 0);
+                    }
+                    let old = (s[byte_index] >> bit_index) & 1;
+                    if value {
+                        s[byte_index] |= 1 << bit_index;
+                    } else {
+                        s[byte_index] &= !(1 << bit_index);
+                    }
+                    old as i64
+                }
+                _ => return Err(StorageError::WrongType),
+            }
+        } else {
+            // key 不存在，创建新的
+            let mut s = vec![0u8; byte_index + 1];
+            if value {
+                s[byte_index] |= 1 << bit_index;
+            }
+            self.data.insert(
+                key.to_string(),
+                StorageValue::String {
+                    value: s,
+                    expires_at: None,
+                },
+            );
+            0
+        };
+
+        if let Err(e) = self.maybe_evict_for_write() {
+            self.restore_value(key, old_value, old_last_access);
+            return Err(e);
+        }
+        self.touch_key(key);
+        self.bump_key_version(key);
+
+        Ok(old_bit)
+    }
+
+    /// GETBIT: 获取指定位的值
+    pub fn getbit(&self, key: &str, offset: u64) -> Result<i64, StorageError> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(0);
+        }
+
+        let entry = match self.data.get(key) {
+            Some(e) => e,
+            None => return Ok(0),
+        };
+
+        match entry.value() {
+            StorageValue::String { value: s, .. } => {
+                let byte_index = (offset / 8) as usize;
+                let bit_index = 7 - (offset % 8) as u8;
+
+                if byte_index >= s.len() {
+                    Ok(0)
+                } else {
+                    Ok(((s[byte_index] >> bit_index) & 1) as i64)
+                }
+            }
+            _ => Err(StorageError::WrongType),
+        }
+    }
+
+    /// BITCOUNT: 统计字符串中置位的数量
+    pub fn bitcount(&self, key: &str, start: Option<i64>, end: Option<i64>, use_bit: bool) -> Result<i64, StorageError> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(0);
+        }
+
+        let entry = match self.data.get(key) {
+            Some(e) => e,
+            None => return Ok(0),
+        };
+
+        match entry.value() {
+            StorageValue::String { value: s, .. } => {
+                if s.is_empty() {
+                    return Ok(0);
+                }
+
+                if use_bit {
+                    // BIT 模式：start/end 是位偏移
+                    let total_bits = (s.len() * 8) as i64;
+                    let start_bit = start.unwrap_or(0);
+                    let end_bit = end.unwrap_or(total_bits - 1);
+
+                    let start_bit = if start_bit < 0 {
+                        (total_bits + start_bit).max(0)
+                    } else {
+                        start_bit.min(total_bits - 1)
+                    } as u64;
+
+                    let end_bit = if end_bit < 0 {
+                        (total_bits + end_bit).max(0)
+                    } else {
+                        end_bit.min(total_bits - 1)
+                    } as u64;
+
+                    if start_bit > end_bit {
+                        return Ok(0);
+                    }
+
+                    let mut count = 0i64;
+                    for bit_offset in start_bit..=end_bit {
+                        let byte_index = (bit_offset / 8) as usize;
+                        let bit_index = 7 - (bit_offset % 8) as u8;
+                        if byte_index < s.len() && (s[byte_index] >> bit_index) & 1 == 1 {
+                            count += 1;
+                        }
+                    }
+                    Ok(count)
+                } else {
+                    // BYTE 模式（默认）：start/end 是字节偏移
+                    let len = s.len() as i64;
+                    let start_byte = start.unwrap_or(0);
+                    let end_byte = end.unwrap_or(len - 1);
+
+                    let start_byte = if start_byte < 0 {
+                        (len + start_byte).max(0)
+                    } else {
+                        start_byte.min(len - 1)
+                    } as usize;
+
+                    let end_byte = if end_byte < 0 {
+                        (len + end_byte).max(0)
+                    } else {
+                        end_byte.min(len - 1)
+                    } as usize;
+
+                    if start_byte > end_byte {
+                        return Ok(0);
+                    }
+
+                    let count: u32 = s[start_byte..=end_byte]
+                        .iter()
+                        .map(|b| b.count_ones())
+                        .sum();
+                    Ok(count as i64)
+                }
+            }
+            _ => Err(StorageError::WrongType),
+        }
+    }
+
+    /// BITPOS: 查找第一个 0 或 1 的位置
+    pub fn bitpos(&self, key: &str, bit: bool, start: Option<i64>, end: Option<i64>, use_bit: bool) -> Result<i64, StorageError> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            // 空字符串：查找 0 返回 0，查找 1 返回 -1
+            return Ok(if bit { -1 } else { 0 });
+        }
+
+        let entry = match self.data.get(key) {
+            Some(e) => e,
+            None => return Ok(if bit { -1 } else { 0 }),
+        };
+
+        match entry.value() {
+            StorageValue::String { value: s, .. } => {
+                if s.is_empty() {
+                    return Ok(if bit { -1 } else { 0 });
+                }
+
+                let len = s.len() as i64;
+                let total_bits = (s.len() * 8) as i64;
+
+                if use_bit {
+                    // BIT 模式
+                    let start_bit = start.unwrap_or(0);
+                    let end_bit = end.unwrap_or(total_bits - 1);
+
+                    let start_bit = if start_bit < 0 {
+                        (total_bits + start_bit).max(0)
+                    } else {
+                        start_bit
+                    } as u64;
+
+                    let end_bit = if end_bit < 0 {
+                        (total_bits + end_bit).max(0)
+                    } else {
+                        end_bit
+                    } as u64;
+
+                    if start_bit > end_bit || start_bit >= total_bits as u64 {
+                        return Ok(-1);
+                    }
+
+                    let end_bit = end_bit.min(total_bits as u64 - 1);
+
+                    for bit_offset in start_bit..=end_bit {
+                        let byte_index = (bit_offset / 8) as usize;
+                        let bit_index = 7 - (bit_offset % 8) as u8;
+                        let current_bit = if byte_index < s.len() {
+                            (s[byte_index] >> bit_index) & 1 == 1
+                        } else {
+                            false
+                        };
+                        if current_bit == bit {
+                            return Ok(bit_offset as i64);
+                        }
+                    }
+                    Ok(-1)
+                } else {
+                    // BYTE 模式（默认）
+                    let start_byte = start.unwrap_or(0);
+                    let end_byte = end.unwrap_or(len - 1);
+                    let end_specified = end.is_some();
+
+                    let start_byte = if start_byte < 0 {
+                        (len + start_byte).max(0)
+                    } else {
+                        start_byte
+                    } as usize;
+
+                    let end_byte = if end_byte < 0 {
+                        (len + end_byte).max(0)
+                    } else {
+                        end_byte
+                    } as usize;
+
+                    if start_byte > end_byte || start_byte >= s.len() {
+                        return Ok(-1);
+                    }
+
+                    let end_byte = end_byte.min(s.len() - 1);
+
+                    for byte_idx in start_byte..=end_byte {
+                        let byte = s[byte_idx];
+                        for bit_idx in 0..8u8 {
+                            let current_bit = (byte >> (7 - bit_idx)) & 1 == 1;
+                            if current_bit == bit {
+                                return Ok((byte_idx * 8 + bit_idx as usize) as i64);
+                            }
+                        }
+                    }
+
+                    // 没找到：如果查找 0 且未指定 end，返回字符串末尾后的第一个位置
+                    if !bit && !end_specified {
+                        Ok(((end_byte + 1) * 8) as i64)
+                    } else {
+                        Ok(-1)
+                    }
+                }
+            }
+            _ => Err(StorageError::WrongType),
+        }
+    }
+
+    /// BITOP: 位运算（AND/OR/XOR/NOT）
+    pub fn bitop(&self, op: &str, destkey: &str, keys: &[String]) -> Result<i64, BitopError> {
+        let now = Instant::now();
+
+        // 收集所有源字符串
+        let mut sources: Vec<Vec<u8>> = Vec::with_capacity(keys.len());
+        let mut max_len = 0usize;
+
+        for key in keys {
+            self.remove_if_expired(key, now);
+            let value = match self.data.get(key) {
+                Some(entry) => match entry.value() {
+                    StorageValue::String { value, .. } => value.clone(),
+                    _ => return Err(BitopError::WrongType),
+                },
+                None => Vec::new(),
+            };
+            max_len = max_len.max(value.len());
+            sources.push(value);
+        }
+
+        let op_upper = op.to_uppercase();
+        let result = match op_upper.as_str() {
+            "NOT" => {
+                if sources.len() != 1 {
+                    return Err(BitopError::InvalidArgs("BITOP NOT requires exactly one source key".to_string()));
+                }
+                let src = &sources[0];
+                src.iter().map(|b| !b).collect::<Vec<u8>>()
+            }
+            "AND" => {
+                if sources.is_empty() {
+                    Vec::new()
+                } else {
+                    let mut result = vec![0xFFu8; max_len];
+                    for src in &sources {
+                        for (i, byte) in result.iter_mut().enumerate() {
+                            *byte &= src.get(i).copied().unwrap_or(0);
+                        }
+                    }
+                    result
+                }
+            }
+            "OR" => {
+                let mut result = vec![0u8; max_len];
+                for src in &sources {
+                    for (i, byte) in result.iter_mut().enumerate() {
+                        *byte |= src.get(i).copied().unwrap_or(0);
+                    }
+                }
+                result
+            }
+            "XOR" => {
+                let mut result = vec![0u8; max_len];
+                for src in &sources {
+                    for (i, byte) in result.iter_mut().enumerate() {
+                        *byte ^= src.get(i).copied().unwrap_or(0);
+                    }
+                }
+                result
+            }
+            _ => return Err(BitopError::InvalidArgs(format!("Unknown BITOP operation: {}", op))),
+        };
+
+        let result_len = result.len() as i64;
+
+        // 保存结果
+        self.remove_if_expired(destkey, now);
+        let old_value = self.data.get(destkey).map(|e| e.value().clone());
+        let old_last_access = self.last_access.get(destkey).map(|v| *v);
+
+        if result.is_empty() {
+            self.data.remove(destkey);
+        } else {
+            self.data.insert(
+                destkey.to_string(),
+                StorageValue::String {
+                    value: result,
+                    expires_at: None,
+                },
+            );
+        }
+
+        if let Err(e) = self.maybe_evict_for_write() {
+            self.restore_value(destkey, old_value, old_last_access);
+            return Err(match e {
+                StorageError::Oom => BitopError::Oom,
+                StorageError::WrongType => BitopError::WrongType,
+            });
+        }
+        self.touch_key(destkey);
+        self.bump_key_version(destkey);
+
+        Ok(result_len)
+    }
+
+    /// BITFIELD: 执行位域操作，返回结果数组
+    pub fn bitfield(
+        &self,
+        key: &str,
+        ops: &[BitfieldOp],
+        readonly: bool,
+    ) -> Result<Vec<Option<i64>>, StorageError> {
+        use BitfieldOp::*;
+        
+        let now = Instant::now();
+        self.remove_if_expired(key, now);
+        
+        let mut results = Vec::new();
+        let mut current_overflow = BitfieldOverflow::Wrap;
+        
+        // 对于只读操作，不需要保存旧值
+        let old_value = if !readonly {
+            self.data.get(key).map(|e| e.value().clone())
+        } else {
+            None
+        };
+        let old_last_access = if !readonly {
+            self.last_access.get(key).map(|v| *v)
+        } else {
+            None
+        };
+        
+        for op in ops {
+            match op {
+                Overflow(mode) => {
+                    current_overflow = *mode;
+                }
+                Get { encoding, offset, offset_multiplier } => {
+                    let bit_offset = self.compute_bit_offset(*encoding, *offset, *offset_multiplier);
+                    let value = self.bitfield_get_value(key, *encoding, bit_offset)?;
+                    results.push(Some(value));
+                }
+                Set { encoding, offset, offset_multiplier, value } => {
+                    let bit_offset = self.compute_bit_offset(*encoding, *offset, *offset_multiplier);
+                    let old_value = self.bitfield_set_value(key, *encoding, bit_offset, *value, current_overflow)?;
+                    results.push(old_value);
+                }
+                Incrby { encoding, offset, offset_multiplier, increment } => {
+                    let bit_offset = self.compute_bit_offset(*encoding, *offset, *offset_multiplier);
+                    let new_value = self.bitfield_incrby_value(key, *encoding, bit_offset, *increment, current_overflow)?;
+                    results.push(new_value);
+                }
+            }
+        }
+        
+        // 检查内存限制
+        if !readonly {
+            if let Err(e) = self.maybe_evict_for_write() {
+                self.restore_value(key, old_value, old_last_access);
+                return Err(e);
+            }
+            self.touch_key(key);
+            self.bump_key_version(key);
+        }
+        
+        Ok(results)
+    }
+    
+    fn compute_bit_offset(&self, encoding: BitfieldEncoding, offset: i64, offset_multiplier: bool) -> u64 {
+        let bits = match encoding {
+            BitfieldEncoding::Signed(b) | BitfieldEncoding::Unsigned(b) => b as u64,
+        };
+        if offset_multiplier {
+            (offset as u64) * bits
+        } else {
+            offset as u64
+        }
+    }
+    
+    fn bitfield_get_value(&self, key: &str, encoding: BitfieldEncoding, bit_offset: u64) -> Result<i64, StorageError> {
+        let entry = match self.data.get(key) {
+            Some(e) => e,
+            None => return Ok(0),
+        };
+        
+        match entry.value() {
+            StorageValue::String { value: s, .. } => {
+                Ok(self.read_bitfield_value(s, encoding, bit_offset))
+            }
+            _ => Err(StorageError::WrongType),
+        }
+    }
+    
+    fn bitfield_set_value(
+        &self,
+        key: &str,
+        encoding: BitfieldEncoding,
+        bit_offset: u64,
+        value: i64,
+        overflow: BitfieldOverflow,
+    ) -> Result<Option<i64>, StorageError> {
+        let bits = match encoding {
+            BitfieldEncoding::Signed(b) | BitfieldEncoding::Unsigned(b) => b,
+        };
+        
+        // 计算需要的字节数
+        let end_bit = bit_offset + bits as u64 - 1;
+        let required_bytes = (end_bit / 8 + 1) as usize;
+        
+        // 获取或创建字符串
+        let mut entry = self.data.entry(key.to_string()).or_insert_with(|| {
+            StorageValue::String {
+                value: vec![0u8; required_bytes],
+                expires_at: None,
+            }
+        });
+        
+        match entry.value_mut() {
+            StorageValue::String { value: s, .. } => {
+                // 扩展字符串
+                if s.len() < required_bytes {
+                    s.resize(required_bytes, 0);
+                }
+                
+                // 读取旧值
+                let old_value = self.read_bitfield_value(s, encoding, bit_offset);
+                
+                // 应用溢出处理并写入新值
+                let clamped_value = self.clamp_bitfield_value(encoding, value, overflow);
+                if let Some(v) = clamped_value {
+                    self.write_bitfield_value(s, encoding, bit_offset, v);
+                    Ok(Some(old_value))
+                } else {
+                    // OVERFLOW FAIL 且溢出
+                    Ok(None)
+                }
+            }
+            _ => Err(StorageError::WrongType),
+        }
+    }
+    
+    fn bitfield_incrby_value(
+        &self,
+        key: &str,
+        encoding: BitfieldEncoding,
+        bit_offset: u64,
+        increment: i64,
+        overflow: BitfieldOverflow,
+    ) -> Result<Option<i64>, StorageError> {
+        let bits = match encoding {
+            BitfieldEncoding::Signed(b) | BitfieldEncoding::Unsigned(b) => b,
+        };
+        
+        let end_bit = bit_offset + bits as u64 - 1;
+        let required_bytes = (end_bit / 8 + 1) as usize;
+        
+        let mut entry = self.data.entry(key.to_string()).or_insert_with(|| {
+            StorageValue::String {
+                value: vec![0u8; required_bytes],
+                expires_at: None,
+            }
+        });
+        
+        match entry.value_mut() {
+            StorageValue::String { value: s, .. } => {
+                if s.len() < required_bytes {
+                    s.resize(required_bytes, 0);
+                }
+                
+                let current = self.read_bitfield_value(s, encoding, bit_offset);
+                let new_value = current.wrapping_add(increment);
+                
+                // 检查溢出并应用策略
+                let result = self.apply_overflow(encoding, current, increment, new_value, overflow);
+                if let Some(v) = result {
+                    self.write_bitfield_value(s, encoding, bit_offset, v);
+                    Ok(Some(v))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Err(StorageError::WrongType),
+        }
+    }
+    
+    fn read_bitfield_value(&self, data: &[u8], encoding: BitfieldEncoding, bit_offset: u64) -> i64 {
+        let bits = match encoding {
+            BitfieldEncoding::Signed(b) | BitfieldEncoding::Unsigned(b) => b,
+        };
+        
+        let mut value: u64 = 0;
+        for i in 0..bits {
+            let bit_pos = bit_offset + i as u64;
+            let byte_idx = (bit_pos / 8) as usize;
+            let bit_idx = 7 - (bit_pos % 8) as u8;
+            
+            if byte_idx < data.len() {
+                let bit = (data[byte_idx] >> bit_idx) & 1;
+                value = (value << 1) | bit as u64;
+            } else {
+                value <<= 1;
+            }
+        }
+        
+        match encoding {
+            BitfieldEncoding::Unsigned(_) => value as i64,
+            BitfieldEncoding::Signed(b) => {
+                // 符号扩展
+                if b < 64 && (value >> (b - 1)) & 1 == 1 {
+                    // 负数，进行符号扩展
+                    let mask = !((1u64 << b) - 1);
+                    (value | mask) as i64
+                } else {
+                    value as i64
+                }
+            }
+        }
+    }
+    
+    fn write_bitfield_value(&self, data: &mut [u8], encoding: BitfieldEncoding, bit_offset: u64, value: i64) {
+        let bits = match encoding {
+            BitfieldEncoding::Signed(b) | BitfieldEncoding::Unsigned(b) => b,
+        };
+        
+        let value_bits = value as u64;
+        for i in 0..bits {
+            let bit_pos = bit_offset + i as u64;
+            let byte_idx = (bit_pos / 8) as usize;
+            let bit_idx = 7 - (bit_pos % 8) as u8;
+            
+            if byte_idx < data.len() {
+                let bit = ((value_bits >> (bits - 1 - i)) & 1) as u8;
+                if bit == 1 {
+                    data[byte_idx] |= 1 << bit_idx;
+                } else {
+                    data[byte_idx] &= !(1 << bit_idx);
+                }
+            }
+        }
+    }
+    
+    fn clamp_bitfield_value(&self, encoding: BitfieldEncoding, value: i64, overflow: BitfieldOverflow) -> Option<i64> {
+        let (min, max) = self.get_bitfield_range(encoding);
+        
+        match overflow {
+            BitfieldOverflow::Wrap => {
+                Some(self.wrap_value(encoding, value))
+            }
+            BitfieldOverflow::Sat => {
+                Some(value.clamp(min, max))
+            }
+            BitfieldOverflow::Fail => {
+                if value < min || value > max {
+                    None
+                } else {
+                    Some(value)
+                }
+            }
+        }
+    }
+    
+    fn apply_overflow(&self, encoding: BitfieldEncoding, current: i64, increment: i64, new_value: i64, overflow: BitfieldOverflow) -> Option<i64> {
+        let (min, max) = self.get_bitfield_range(encoding);
+        
+        // 检测溢出
+        let overflowed = match encoding {
+            BitfieldEncoding::Signed(_) => {
+                (increment > 0 && new_value < current) || (increment < 0 && new_value > current)
+            }
+            BitfieldEncoding::Unsigned(bits) => {
+                let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                let current_u = (current as u64) & mask;
+                let new_u = (new_value as u64) & mask;
+                (increment > 0 && new_u < current_u) || (increment < 0 && new_u > current_u)
+            }
+        };
+        
+        match overflow {
+            BitfieldOverflow::Wrap => {
+                Some(self.wrap_value(encoding, new_value))
+            }
+            BitfieldOverflow::Sat => {
+                if overflowed {
+                    if increment > 0 {
+                        Some(max)
+                    } else {
+                        Some(min)
+                    }
+                } else {
+                    Some(new_value.clamp(min, max))
+                }
+            }
+            BitfieldOverflow::Fail => {
+                if overflowed || new_value < min || new_value > max {
+                    None
+                } else {
+                    Some(new_value)
+                }
+            }
+        }
+    }
+    
+    fn get_bitfield_range(&self, encoding: BitfieldEncoding) -> (i64, i64) {
+        match encoding {
+            BitfieldEncoding::Signed(bits) => {
+                if bits >= 64 {
+                    (i64::MIN, i64::MAX)
+                } else {
+                    let max = (1i64 << (bits - 1)) - 1;
+                    let min = -(1i64 << (bits - 1));
+                    (min, max)
+                }
+            }
+            BitfieldEncoding::Unsigned(bits) => {
+                if bits >= 63 {
+                    (0, i64::MAX)
+                } else {
+                    (0, (1i64 << bits) - 1)
+                }
+            }
+        }
+    }
+    
+    fn wrap_value(&self, encoding: BitfieldEncoding, value: i64) -> i64 {
+        match encoding {
+            BitfieldEncoding::Unsigned(bits) => {
+                let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                ((value as u64) & mask) as i64
+            }
+            BitfieldEncoding::Signed(bits) => {
+                if bits >= 64 {
+                    value
+                } else {
+                    let mask = (1u64 << bits) - 1;
+                    let wrapped = (value as u64) & mask;
+                    // 符号扩展
+                    if (wrapped >> (bits - 1)) & 1 == 1 {
+                        let sign_extend = !((1u64 << bits) - 1);
+                        (wrapped | sign_extend) as i64
+                    } else {
+                        wrapped as i64
+                    }
+                }
+            }
+        }
+    }
+
     pub fn mget(&self, keys: &[String]) -> Vec<Option<ByteString>> {
         keys.iter().map(|k| self.get(k)).collect()
     }
@@ -1321,6 +2191,7 @@ impl Storage {
             StorageValue::Hash { .. } => "hashtable",
             StorageValue::Zset { .. } => "skiplist",
             StorageValue::HyperLogLog { .. } => "raw",
+            StorageValue::Stream { .. } => "stream",
         };
         Some(encoding)
     }
@@ -1521,6 +2392,7 @@ impl Storage {
                 StorageValue::Hash { .. } => "hash".to_string(),
                 StorageValue::Zset { .. } => "zset".to_string(),
                 StorageValue::HyperLogLog { .. } => "string".to_string(), // Redis 中 HLL 的类型显示为 string
+                StorageValue::Stream { .. } => "stream".to_string(),
             },
         )
     }
@@ -1561,7 +2433,8 @@ impl Storage {
                 | StorageValue::Set { expires_at, .. }
                 | StorageValue::Hash { expires_at, .. }
                 | StorageValue::Zset { expires_at, .. }
-                | StorageValue::HyperLogLog { expires_at, .. } => {
+                | StorageValue::HyperLogLog { expires_at, .. }
+                | StorageValue::Stream { expires_at, .. } => {
                     expires_at.map_or(false, |exp| exp <= now)
                 }
             };
@@ -3338,6 +4211,10 @@ impl Storage {
             let key = entry.key();
             let value = entry.value();
 
+            if matches!(value, StorageValue::Stream { .. }) {
+                continue;
+            }
+
             if Storage::value_is_expired(value, now) {
                 continue;
             }
@@ -3360,6 +4237,11 @@ impl Storage {
                 }
                 StorageValue::HyperLogLog { expires_at, .. } => {
                     (5u8, Self::remaining_millis(*expires_at, now))
+                }
+                StorageValue::Stream { .. } => {
+                    // Streams 暂不写入 RDB（后续需要定义序列化格式）
+                    // 这里仅为保证 match 完整；理论上不会走到该分支（上方已 continue）。
+                    (255u8, 0)
                 }
             };
 
@@ -3430,6 +4312,9 @@ impl Storage {
                     // 序列化 HyperLogLog: 直接写入 16384 个寄存器
                     let registers = hll.registers();
                     file.write_all(&registers)?;
+                }
+                StorageValue::Stream { .. } => {
+                    // Streams 暂不写入 RDB（后续需要定义序列化格式）
                 }
             }
         }
@@ -3885,7 +4770,8 @@ impl Storage {
             | StorageValue::Set { expires_at, .. }
             | StorageValue::Hash { expires_at, .. }
             | StorageValue::Zset { expires_at, .. }
-            | StorageValue::HyperLogLog { expires_at, .. } => {
+            | StorageValue::HyperLogLog { expires_at, .. }
+            | StorageValue::Stream { expires_at, .. } => {
                 *expires_at = Some(deadline);
                 self.bump_key_version(key);
                 true
@@ -3920,7 +4806,8 @@ impl Storage {
             | StorageValue::Set { expires_at, .. }
             | StorageValue::Hash { expires_at, .. }
             | StorageValue::Zset { expires_at, .. }
-            | StorageValue::HyperLogLog { expires_at, .. } => {
+            | StorageValue::HyperLogLog { expires_at, .. }
+            | StorageValue::Stream { expires_at, .. } => {
                 *expires_at = Some(deadline);
                 self.bump_key_version(key);
                 true
@@ -3948,7 +4835,8 @@ impl Storage {
             | StorageValue::Set { expires_at, .. }
             | StorageValue::Hash { expires_at, .. }
             | StorageValue::Zset { expires_at, .. }
-            | StorageValue::HyperLogLog { expires_at, .. } => expires_at,
+            | StorageValue::HyperLogLog { expires_at, .. }
+            | StorageValue::Stream { expires_at, .. } => expires_at,
         };
 
         let Some(deadline) = expires_at else {
@@ -3986,7 +4874,8 @@ impl Storage {
             | StorageValue::Set { expires_at, .. }
             | StorageValue::Hash { expires_at, .. }
             | StorageValue::Zset { expires_at, .. }
-            | StorageValue::HyperLogLog { expires_at, .. } => expires_at,
+            | StorageValue::HyperLogLog { expires_at, .. }
+            | StorageValue::Stream { expires_at, .. } => expires_at,
         };
 
         let Some(deadline) = expires_at else {
@@ -4020,7 +4909,8 @@ impl Storage {
             | StorageValue::Set { expires_at, .. }
             | StorageValue::Hash { expires_at, .. }
             | StorageValue::Zset { expires_at, .. }
-            | StorageValue::HyperLogLog { expires_at, .. } => {
+            | StorageValue::HyperLogLog { expires_at, .. }
+            | StorageValue::Stream { expires_at, .. } => {
                 if expires_at.is_some() {
                     *expires_at = None;
                     self.bump_key_version(key);
@@ -4067,7 +4957,8 @@ impl Storage {
             | StorageValue::Set { expires_at, .. }
             | StorageValue::Hash { expires_at, .. }
             | StorageValue::Zset { expires_at, .. }
-            | StorageValue::HyperLogLog { expires_at, .. } => {
+            | StorageValue::HyperLogLog { expires_at, .. }
+            | StorageValue::Stream { expires_at, .. } => {
                 *expires_at = Some(deadline);
                 self.bump_key_version(key);
                 true
@@ -4108,7 +4999,8 @@ impl Storage {
             | StorageValue::Set { expires_at, .. }
             | StorageValue::Hash { expires_at, .. }
             | StorageValue::Zset { expires_at, .. }
-            | StorageValue::HyperLogLog { expires_at, .. } => {
+            | StorageValue::HyperLogLog { expires_at, .. }
+            | StorageValue::Stream { expires_at, .. } => {
                 *expires_at = Some(deadline);
                 self.bump_key_version(key);
                 true
@@ -4134,7 +5026,8 @@ impl Storage {
             | StorageValue::Set { expires_at, .. }
             | StorageValue::Hash { expires_at, .. }
             | StorageValue::Zset { expires_at, .. }
-            | StorageValue::HyperLogLog { expires_at, .. } => expires_at,
+            | StorageValue::HyperLogLog { expires_at, .. }
+            | StorageValue::Stream { expires_at, .. } => expires_at,
         };
 
         let Some(deadline) = expires_at else {
@@ -4173,7 +5066,8 @@ impl Storage {
             | StorageValue::Set { expires_at, .. }
             | StorageValue::Hash { expires_at, .. }
             | StorageValue::Zset { expires_at, .. }
-            | StorageValue::HyperLogLog { expires_at, .. } => expires_at,
+            | StorageValue::HyperLogLog { expires_at, .. }
+            | StorageValue::Stream { expires_at, .. } => expires_at,
         };
 
         let Some(deadline) = expires_at else {
@@ -4339,6 +5233,7 @@ impl Storage {
             StorageValue::Hash { expires_at, .. } => *expires_at,
             StorageValue::Zset { expires_at, .. } => *expires_at,
             StorageValue::HyperLogLog { expires_at, .. } => *expires_at,
+            StorageValue::Stream { expires_at, .. } => *expires_at,
         }
     }
 
@@ -4619,6 +5514,17 @@ impl Storage {
                     // HyperLogLog 固定占用约 12KB (16384 个 6-bit 寄存器)
                     12288
                 }
+                StorageValue::Stream { value, .. } => value
+                    .entries
+                    .iter()
+                    .map(|e| {
+                        e.fields
+                            .iter()
+                            .map(|(f, v)| (f.len() + v.len()) as u64)
+                            .sum::<u64>()
+                            .saturating_add(16)
+                    })
+                    .sum(),
             };
 
             total = total.saturating_add(key_size.saturating_add(value_size));

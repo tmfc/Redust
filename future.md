@@ -464,6 +464,47 @@ enum HllRepr {
 
 ---
 
+## Streams 模块增强（V2）
+
+现状：已实现 Streams 的最小闭环子集：`XADD`/`XRANGE`/`XLEN`（不含消费者组、不含阻塞读取、不含持久化）。
+
+- [ ] **XREAD / 阻塞读取（BLOCK）**
+  - 实现 `XREAD [COUNT n] [BLOCK ms] STREAMS key id [key id ...]`。
+  - 需要与 Tokio 并发模型结合：
+    - 可以先做非阻塞版本（不支持 BLOCK），再扩展阻塞；
+    - 阻塞实现可选：每个 stream 一个 `Notify`，XADD 后 `notify_waiters()`。
+
+- [ ] **XGROUP / 消费者组**
+  - 核心数据结构：group state、pending entries list（PEL）、consumer state。
+  - 最小支持路径：`XGROUP CREATE` + `XREADGROUP` + `XACK`。
+
+- [ ] **XINFO / introspection**
+  - `XINFO STREAM` 输出基础字段（length/last-generated-id/first-entry/last-entry）。
+  - `XINFO GROUPS/CONSUMERS` 依赖消费者组实现。
+
+- [ ] **XRANGE/XREVRANGE 完整语义**
+  - 当前仅实现 `XRANGE` 并支持 `-`/`+` 与 `COUNT`。
+  - 后续补：`XREVRANGE` 反向遍历、`MINID/MAXLEN` 裁剪策略（与 XADD 选项耦合）。
+
+- [ ] **XDEL / XTRIM**
+  - `XDEL` 删除 entry。
+  - `XTRIM` 支持 MAXLEN/MINID/approximate（~）。
+
+- [ ] **RDB/AOF 持久化**
+  - 当前实现中 Streams 暂未写入 RDB（save 时跳过）。
+  - 后续需要定义序列化格式：
+    - stream length
+    - last_id
+    - entries: [id(ms,seq), field/value pairs]
+    - （有消费者组时还需 group/PEL 等元数据）
+  - 同时需要补 load_rdb 的解析与回放。
+
+- [ ] **内存与性能优化**
+  - entry 索引：目前线性 Vec 扫描；后续可引入二分查找（按 ID 有序）或跳表。
+  - 限制单个 stream 的 entry 数/单条 entry 字段数/字段 value bytes（防止大 key）。
+
+---
+
 ## 安全与多租户（V2）
 
 - [ ] **基于 AUTH 的多用户/多租户模型设计**
