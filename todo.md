@@ -12,18 +12,18 @@
 
 - [ ] **Streams 消息队列**
   - [x] XADD - 添加消息
-  - [ ] XREAD - 读取消息
+  - [x] XREAD - 读取消息
   - [x] XRANGE/XREVRANGE - 范围查询
   - [x] XLEN - 获取流长度
-  - [ ] XINFO - 流信息查询
+  - [x] XINFO - 流信息查询
   - [ ] XGROUP - 消费者组管理
   - [ ] XACK/XCLAIM/XPENDING - 消息确认与处理
 
 - [ ] **Geo 地理位置**
-  - [ ] GEOADD - 添加地理位置
-  - [ ] GEODIST - 计算距离
-  - [ ] GEOHASH - 获取 geohash
-  - [ ] GEOPOS - 获取坐标
+  - [x] GEOADD - 添加地理位置
+  - [x] GEODIST - 计算距离
+  - [x] GEOHASH - 获取 geohash
+  - [x] GEOPOS - 获取坐标
   - [ ] GEOSEARCH/GEORADIUS - 范围搜索
 
 ## 主从复制

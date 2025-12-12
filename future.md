@@ -5,61 +5,9 @@
 
 ---
 
-## 🎉 Phase B: 命令补全完成总结（2025-12）
+## HyperLogLog 待优化方向
 
-### 已完成命令（25+ 个）
-
-#### Hash 命令
-- ✅ HSETNX - 字段不存在时设置
-- ✅ HSTRLEN - 获取字段值长度
-- ✅ HMSET - 批量设置字段
-
-#### List 命令
-- ✅ LTRIM - 裁剪列表
-- ✅ LSET - 设置指定索引元素
-- ✅ LINSERT - 在指定元素前/后插入
-- ✅ RPOPLPUSH - 弹出并推入另一列表
-- ✅ LPOS - 查找元素位置
-
-#### Sorted Set 命令
-- ✅ ZCOUNT - 统计分数范围内的成员数
-- ✅ ZRANK / ZREVRANK - 获取成员排名
-- ✅ ZPOPMIN / ZPOPMAX - 弹出最小/最大分数成员
-- ✅ ZINTER / ZUNION / ZDIFF - 集合运算（支持 WEIGHTS/AGGREGATE/WITHSCORES）
-- ✅ ZINTERSTORE / ZUNIONSTORE / ZDIFFSTORE - 集合运算并存储
-- ✅ ZLEXCOUNT - 字典序范围计数
-
-#### Generic 命令
-- ✅ COPY - 复制键（支持 REPLACE 选项）
-- ✅ UNLINK - 异步删除（简化实现）
-- ✅ TOUCH - 更新访问时间
-- ✅ OBJECT ENCODING - 获取对象编码类型
-
-#### Expire 命令
-- ✅ EXPIREAT - 设置绝对过期时间（Unix 秒）
-- ✅ PEXPIREAT - 设置绝对过期时间（Unix 毫秒）
-- ✅ EXPIRETIME - 获取绝对过期时间（Unix 秒）
-- ✅ PEXPIRETIME - 获取绝对过期时间（Unix 毫秒）
-
-### 测试覆盖
-- 所有新增命令均有对应的集成测试
-- 测试覆盖正常路径、边界条件、错误处理
-
----
-
-## 🎉 Phase B: HyperLogLog 完成总结（2025-12）
-
-### 已完成功能
-
-- ✅ **HyperLogLog 核心算法**: 16384 个 6-bit 寄存器，标准误差约 0.81%
-- ✅ **PFADD/PFCOUNT/PFMERGE**: 完整的 HyperLogLog 命令支持
-- ✅ **RDB 持久化**: HyperLogLog 类型序列化/反序列化
-- ✅ **WATCH 集成**: PFADD/PFMERGE 触发键版本更新
-- ✅ **性能测试**: 大量元素添加、多键合并、内存占用验证
-
-### 待优化方向
-
-#### 稀疏表示优化（推荐优先实现）
+### 稀疏表示优化（推荐优先实现）
 
 Redis 的 HyperLogLog 使用两种表示方式来优化内存：
 
@@ -93,57 +41,14 @@ enum HllRepr {
 - 100 个元素：~300 bytes vs 16KB（节省 98%）
 - 1000+ 个元素：自动转为密集表示
 
-#### 其他优化
+### 其他优化
 
 - **AOF 支持**: PFADD/PFMERGE 命令记录到 AOF
 - **紧凑存储**: 使用 6-bit 紧凑存储替代 u8，将内存从 16KB 降至 12KB（密集表示）
 
----
-
-## 🎉 Phase A 完成总结（2025-12）
-
-### 已完成功能
-
-#### 核心数据结构（5 种）
-- ✅ **String**: 完整的字符串操作（SET/GET/INCR/APPEND 等 20+ 命令）
-- ✅ **List**: 双端队列操作（LPUSH/RPUSH/LPOP/RPOP/LRANGE 等）
-- ✅ **Set**: 集合操作（SADD/SREM/SUNION/SINTER/SDIFF 等）
-- ✅ **Hash**: 哈希表操作（HSET/HGET/HINCRBY/HGETALL 等）
-- ✅ **Sorted Set**: 有序集合（ZADD/ZRANGE/ZSCORE/ZINCRBY/ZSCAN 等）
-
-#### 高级特性
-- ✅ **事务**: MULTI/EXEC/DISCARD/WATCH/UNWATCH，支持乐观锁
-- ✅ **Lua 脚本**: EVAL/EVALSHA/SCRIPT 命令，redis.call/pcall 支持 46 个命令
-  - 二进制安全参数处理
-  - Nil 正确映射为 false
-  - SHA1 脚本缓存
-- ✅ **持久化**: AOF（everysec）+ RDB 快照，支持 SAVE/BGSAVE/LASTSAVE
-- ✅ **Pub/Sub**: Channel/Pattern/Shard 三种订阅模式
-- ✅ **扫描**: SCAN/SSCAN/HSCAN/ZSCAN 游标扫描
-- ✅ **运维命令**: CONFIG GET/SET、CLIENT 管理、SLOWLOG 基础
-
-#### 质量保证
-- ✅ **测试覆盖**: 99 个测试全部通过
-- ✅ **命令总数**: 120+ 个 Redis 命令
-- ✅ **文档完善**: command.md、roadmap.md、future.md 全面更新
-
-### 技术亮点
-1. **完整的 WATCH 机制**: Key 版本追踪覆盖所有写操作和过期/淘汰
-2. **二进制安全**: Lua 脚本参数和值保持原始字节，支持非 UTF-8 数据
-3. **Redis 语义对齐**: Nil 映射为 false，错误处理与 Redis 一致
-4. **异步持久化**: AOF 异步写入，RDB 后台保存，不阻塞主线程
-5. **内存管理**: LRU 淘汰策略，maxmemory 限制，过期键自动清理
-
----
-
 ## 过期语义增强（V2）
 
 目标：在现有过期语义 MVP 的基础上，逐步向更完整的 Redis 行为靠近。
-
-- [x] **高级 SET 选项支持** ✅ 已完成
-  - `SET key value NX|XX [EX seconds|PX milliseconds|EXAT unix-time|PXAT ms-unix-time] [KEEPTTL] [GET]`
-  - 已实现所有选项组合和错误处理
-  - 完整的测试覆盖
 
 - [ ] **主动过期采样策略调优**
   - 当前实现：
@@ -152,13 +57,6 @@ enum HllRepr {
     - 优先采样有过期时间的 key，而不是所有 key。
     - 根据最近一次扫描的“过期命中率”粗略调整扫描频率/样本数。
     - 观察不同参数下对吞吐量和内存占用的影响（可以在 `INFO` 或日志中打印简单指标）。
-
-- [x] **过期语义边界与持久化交互** ✅ 基础已完成
-  - 已实现 AOF/RDB 持久化
-  - 启动时自动加载并处理过期键
-  - 🔄 待完善：损坏文件校验与友好降级
-
----
 
 ## 内存与淘汰策略演进（V2）
 
@@ -288,25 +186,6 @@ enum HllRepr {
 
 > 现状：`SCAN`/`KEYS`/`SSCAN`/`HSCAN`/`ZSCAN` 已实现基础功能，`pattern_match` 支持 `*`、`?`、`[abc]`、`[a-z]`、`\` 转义等 glob 语法。
 
-- [x] **`[^abc]` 取反字符集支持** ✅ 已完成（2025-12）
-  - Redis 支持 `[^abc]` 表示"不匹配 a/b/c 中任一字符"。
-  - 已在 `match_set` 中增加对 `^` 前缀的处理，支持取反字符集和取反范围。
-
-- [x] **SCAN TYPE 选项** ✅ 已完成（2025-12）
-  - Redis 6.0+ 支持 `SCAN cursor TYPE string|list|set|hash|zset` 按类型过滤。
-  - 已在 `Command::Scan` 中增加 `type_filter` 字段，扫描时调用 `storage.type_of()` 过滤。
-
-- [x] **SCAN NOVALUES 选项（HSCAN/ZSCAN）** ✅ 已完成（2025-12）
-  - Redis 7.4+ 支持 `HSCAN key cursor NOVALUES` 仅返回 field 不返回 value，减少网络开销。
-  - 已实现 HSCAN 和 ZSCAN 的 NOVALUES 选项。
-
-- [x] **SCAN 游标稳定性优化** ✅ 已完成（2025-12）
-  - 使用键名哈希值作为游标，替代简单的数组索引。
-  - 游标基于 `DefaultHasher` 计算的 u64 哈希值，按哈希值排序后扫描。
-  - 优点：并发写入/删除时不会产生重复键（已扫描的哈希值不会再次返回）。
-  - 限制：新增键如果哈希值小于当前游标可能被跳过（与 Redis 行为一致）。
-  - 支持完整的 u64 游标范围，解析时使用 `parse_u64_from_bulk`。
-
 ---
 
 ## 事务与脚本增强（V2）
@@ -314,116 +193,32 @@ enum HllRepr {
 > 现状：`MULTI`/`EXEC`/`DISCARD`/`WATCH`/`UNWATCH` 已实现基础语义，支持命令队列和乐观锁。
 > Lua 脚本基础功能已实现（`EVAL`/`EVALSHA`/`SCRIPT LOAD|EXISTS|FLUSH`）。
 
-- [x] **EVAL/EVALSHA Lua 脚本支持（基础版）**
-  - 已引入 `mlua` crate（Lua 5.4），支持基础脚本执行。
-  - 已实现 `EVAL script numkeys [key ...] [arg ...]` 和 `EVALSHA sha1 numkeys [key ...] [arg ...]`。
-  - 已实现 `SCRIPT LOAD` / `SCRIPT EXISTS` / `SCRIPT FLUSH` 脚本管理命令。
-  - 已支持 `KEYS` 和 `ARGV` 表访问。
-  - 已支持返回值类型转换（integer, string, array, nil, boolean）。
-
-- [x] **redis.call() / redis.pcall() 回调实现**
-  - 已实现 `redis.call()` 和 `redis.pcall()` 在 Lua 脚本中调用 Redis 命令。
-  - 支持 40+ 常用命令：GET/SET/DEL/EXISTS/INCR/DECR/INCRBY/DECRBY/APPEND/STRLEN/MGET/MSET、
-    HGET/HSET/HDEL/HEXISTS/HGETALL/HKEYS/HVALS/HLEN/HMGET/HMSET/HINCRBY、
-    LPUSH/RPUSH/LPOP/RPOP/LLEN/LRANGE/LINDEX、SADD/SREM/SMEMBERS/SISMEMBER/SCARD、
-    ZADD/ZREM/ZSCORE/ZCARD/ZRANGE/ZREVRANGE、TYPE/TTL/PTTL/EXPIRE/PEXPIRE/PERSIST。
-  - `redis.call()` 在错误时抛出 Lua 异常，`redis.pcall()` 返回 `{err = "..."}` 表。
-
-- [x] **事务中 Lua 脚本支持** ✅ 已完成（2025-12）
-  - 支持 `EVAL`/`EVALSHA`/`SCRIPT LOAD`/`SCRIPT EXISTS`/`SCRIPT FLUSH` 在 MULTI 中执行。
-  - 脚本在事务中正常执行，结果作为事务响应数组的一部分返回。
-
-- [x] **事务中更多命令支持** ✅ 已完成（2025-12）
-  - 已支持 `TYPE`、`KEYS`、`SCAN`、`DBSIZE` 等元命令在事务中执行。
-
 - [ ] **事务错误处理增强**
   - Redis 在 EXEC 时如果队列中有语法错误命令，会中止整个事务。
   - 当前实现在命令入队时已做语法检查，但可进一步对齐 Redis 行为。
-
-- [x] **WATCH 版本追踪优化**
-  - 已在所有写路径中调用 `bump_key_version`，包括 `LPUSH`、`SADD`、`HSET`、`ZADD` 等。
-  - 已在 TTL 过期删除和 LRU 淘汰时更新 key 版本。
 
 ---
 
 ## 运维命令（V2）
 
-- [x] **基础运维命令实现**
-  - 已实现 `CONFIG GET pattern` - 获取匹配的配置参数（支持 * 通配符）。
-  - 已实现 `CONFIG SET parameter value` - 设置配置参数（当前大多数参数不可动态修改，返回错误）。
-  - 已实现 `CLIENT LIST` - 列出当前客户端连接信息（简化版）。
-  - 已实现 `CLIENT ID` - 获取当前连接的唯一 ID。
-  - 已实现 `CLIENT SETNAME name` - 设置连接名称。
-  - 已实现 `CLIENT GETNAME` - 获取连接名称。
-  - 已实现 `SLOWLOG GET [count]` - 获取慢日志（当前返回空数组）。
-  - 已实现 `SLOWLOG RESET` - 重置慢日志。
-  - 已实现 `SLOWLOG LEN` - 获取慢日志长度（当前返回 0）。
+- [ ] **timeout / tcp-keepalive 真正生效**
+  - 现状：配置值可改但未作用于连接行为。
+  - 目标：在连接处理层应用超时与 keepalive。
 
-- [x] **CONFIG 动态配置支持** ✅（部分完成）
-  - 已支持运行时修改：`maxmemory`、`slowlog-log-slower-than`、`slowlog-max-len`、`timeout`、`tcp-keepalive`（timeout/keepalive 当前仅存值，尚未作用于连接行为）。
-  - 待办：
-    - 使 `timeout`/`tcp-keepalive` 实际生效：在连接处理层应用超时和 keepalive 参数。
-    - 考虑配置持久化（写入配置文件或环境变量）。
-    - 评估是否开放更多动态参数（如 maxmemory-policy）。
+- [ ] **SCRIPT KILL**
+  - 允许终止正在运行的脚本。
 
-- [x] **SLOWLOG 实际实现** ✅ 已完成（2025-12）
-  - 已实现完整的慢日志功能：记录超过阈值的命令、维护固定大小队列。
-  - 支持 SLOWLOG GET/RESET/LEN 完整语义。
-  - 环境变量配置：REDUST_SLOWLOG_SLOWER_THAN（微秒）、REDUST_SLOWLOG_MAX_LEN。
-  - 🔧 **性能优化**：使用 `parking_lot::Mutex` 替代 `std::sync::Mutex`，减少锁竞争开销。
+- [ ] **RDB 校验与自动备份/部分恢复策略**
+  - 添加校验和、损坏文件自动备份、尽量恢复可读数据。
 
-- [x] **Lua 脚本资源限制** ✅ 已完成（2025-12）
-  - 已添加执行超时限制，使用 mlua hook 机制每 10000 条指令检查一次。
-  - 已添加内存使用限制，使用 mlua set_memory_limit API。
-  - 环境变量配置：REDUST_LUA_TIME_LIMIT_MS（默认 5000ms）、REDUST_LUA_MAX_MEMORY（默认 10MB）。
-  - 支持 CONFIG GET/SET 动态调整：lua-time-limit、lua-max-memory。
-  - 🔮 **未来改进**：
-    - 添加 SCRIPT KILL 命令支持，允许终止正在运行的脚本。
-    - 考虑更细粒度的资源监控（如 CPU 时间 vs 墙钟时间）。
-    - 添加脚本执行统计指标到 Prometheus。
+- [ ] **错误信息审计与错误码**
+  - 审查所有错误信息，避免泄露内部细节；考虑错误码体系。
 
-- [x] **RDB 文件损坏处理优化** ✅ 已完成（2025-12）
-  - 改进了 `load_rdb` 函数的错误处理，不再静默忽略损坏的文件。
-  - 魔数不匹配、版本不支持、UTF-8 解析失败等情况现在返回 `io::Error`。
-  - 添加了详细的错误日志输出（`eprintln!`），便于问题诊断。
-  - 🔮 **未来改进**：
-    - 添加 RDB 文件校验和验证。
-    - 实现损坏文件的自动备份机制。
-    - 考虑部分恢复策略（跳过损坏的键，恢复可读的数据）。
+- [ ] **Prometheus 指标增强**
+  - 命令延迟 histogram、按命令分类计数器、过期删除计数器等。
 
-- [x] **错误信息规范化** ✅ 已完成（2025-12）
-  - 将暴露内部实现细节的错误信息改为通用描述。
-  - 例如：`ERR value exceeds REDUST_MAXVALUE_BYTES` → `ERR value exceeds maximum allowed size`
-  - 🔮 **未来改进**：
-    - 审查所有错误信息，确保不泄露敏感信息。
-    - 考虑添加错误码系统，便于客户端程序化处理。
-
-- [x] **参数验证逻辑重构** ✅ 已完成（2025-12）
-  - 添加辅助函数：`require_key`, `require_i64`, `require_f64`, `ensure_no_more_args`, `collect_keys`
-  - 添加 `try_cmd!` 宏简化从 `Result<T, Command>` 到 `Ok(Some(Command))` 的错误处理
-  - 重构了多个命令的解析代码，减少了约 100 行重复代码
-  - 🔮 **未来改进**：
-    - 继续重构更多命令（如 GETEX, GETRANGE, SETRANGE, APPEND, GETSET 等）
-    - 考虑使用过程宏进一步简化命令定义
-
-- [x] **Prometheus 指标完善** ✅ 已完成（2025-12）
-  - 新增 `redust_used_memory_bytes`（内存使用量）
-  - 新增 `redust_maxmemory_bytes`（最大内存限制，仅在配置时导出）
-  - 新增 `redust_slowlog_entries_total`（慢日志条目总数计数器）
-  - 🔮 **未来改进**：
-    - 添加命令延迟直方图（histogram）
-    - 添加按命令类型分类的计数器
-    - 添加过期键删除计数器
-
-- [x] **CLIENT 命令扩展**（部分完成）
-  - 已支持：LIST/ID/SETNAME/GETNAME/PAUSE/UNPAUSE。
-  - 待实现：
-    - `CLIENT UNBLOCK client-id [TIMEOUT|ERROR]` - 解除阻塞的客户端（需要阻塞命令支持，如 BLPOP）。
-    - `CLIENT KILL [ID client-id] [ADDR ip:port] [TYPE normal|master|slave|pubsub]` - 关闭指定客户端连接。
-    - `CLIENT REPLY ON|OFF|SKIP` - 控制响应行为。
-    - `CLIENT NO-EVICT ON|OFF` - 标记客户端不被驱逐。
-    - `CLIENT CACHING YES|NO` - 客户端缓存控制。
-    - `CLIENT TRACKINGINFO` - 获取客户端追踪信息。
+- [ ] **CLIENT 命令扩展**
+  - `CLIENT UNBLOCK/KILL/REPLY/NO-EVICT/CACHING/TRACKINGINFO`。
 
 - [ ] **INFO 命令实现**
   - 实现 `INFO [section]` 命令，返回服务器状态信息。
@@ -437,25 +232,6 @@ enum HllRepr {
 ---
 
 ## 列表 / 集合命令增强（V2）
-
-- [x] **列表高级命令** ✅ 已完成
-  - 已实现 `LINSERT` / `LSET` / `LTRIM` / `RPOPLPUSH` / `LPOS`
-  - 🔄 待实现：`BLPOP` / `BRPOP` 等阻塞语义命令
-  - 思考阻塞列表操作在当前 Tokio 并发模型下的实现方式（例如：每 key 的等待队列 vs 全局调度）。
-
-- [x] **集合命令扩展与性能调优** ✅ 已完成（2025-12）
-  - 已实现 `SPOP` / `SRANDMEMBER` / `SMOVE` / `SUNIONSTORE` / `SINTERSTORE` / `SDIFFSTORE` 等命令。
-  - 性能优化：
-    - 移除 `SUNION`/`SINTER`/`SDIFF` 返回结果的不必要排序（Redis 不保证顺序）。
-    - `SUNION`/`SUNIONSTORE` 使用 `extend` 替代循环插入。
-    - `SDIFF`/`SDIFFSTORE` 使用 `retain` 替代遍历后续集合，并添加早期退出优化。
-  - 基准测试提升：`set_union` +17%，`set_difference` +8%。
-
-- [x] **Sorted Set 高级命令** ✅ 已完成
-  - 已实现 `ZCOUNT` / `ZRANK` / `ZREVRANK` / `ZPOPMIN` / `ZPOPMAX`
-  - 已实现 `ZINTER` / `ZUNION` / `ZDIFF` 及其 STORE 变体（支持 WEIGHTS/AGGREGATE）
-  - 已实现 `ZLEXCOUNT` 字典序范围计数
-
 > 后续如果有新的“第二阶段”想法（例如 Hash/List/Stream 的高级特性），可以在本文件中按模块继续追加章节。例如：
 >
 > - `## Hash 模块增强（V2）`
@@ -466,13 +242,12 @@ enum HllRepr {
 
 ## Streams 模块增强（V2）
 
-现状：已实现 Streams 的最小闭环子集：`XADD`/`XRANGE`/`XLEN`（不含消费者组、不含阻塞读取、不含持久化）。
+现状：已实现 Streams 的最小闭环子集：`XADD`/`XRANGE`/`XLEN`/`XREAD`（不含消费者组、不含持久化）。
 
-- [ ] **XREAD / 阻塞读取（BLOCK）**
-  - 实现 `XREAD [COUNT n] [BLOCK ms] STREAMS key id [key id ...]`。
-  - 需要与 Tokio 并发模型结合：
-    - 可以先做非阻塞版本（不支持 BLOCK），再扩展阻塞；
-    - 阻塞实现可选：每个 stream 一个 `Notify`，XADD 后 `notify_waiters()`。
+- [ ] **XREAD 改进**
+  - 使用 `Notify`/条件变量替代轮询，降低空转 CPU 并提升唤醒精度。
+  - 补齐/对齐更多错误消息细节。
+  - Redis 7.4 的 `+` 特殊 ID 语义（请求最后一条，且忽略 COUNT）可作为可选增强。
 
 - [ ] **XGROUP / 消费者组**
   - 核心数据结构：group state、pending entries list（PEL）、consumer state。
@@ -502,6 +277,24 @@ enum HllRepr {
 - [ ] **内存与性能优化**
   - entry 索引：目前线性 Vec 扫描；后续可引入二分查找（按 ID 有序）或跳表。
   - 限制单个 stream 的 entry 数/单条 entry 字段数/字段 value bytes（防止大 key）。
+
+---
+
+## Geo 模块增强（V2）
+
+现状：已实现 Geo 最小子集：`GEOADD`/`GEOPOS`/`GEODIST`/`GEOHASH`（基于 ZSet + 52-bit geohash 编码）。
+
+- [ ] **GEOSEARCH / GEORADIUS**
+  - 实现基于半径或矩形范围的地理位置搜索。
+  - 支持 `BYRADIUS`/`BYBOX`、`ASC`/`DESC` 排序、`COUNT` 限制。
+  - `GEORADIUS`/`GEORADIUSBYMEMBER` 为旧版命令，可选实现。
+
+- [ ] **GEOSEARCHSTORE**
+  - 将搜索结果存储到新的 ZSet 中。
+
+- [ ] **精度与兼容性**
+  - 当前 geohash 编码与 Redis 略有差异，后续可对齐 Redis 的精确编码算法。
+  - 距离计算使用 haversine 公式，与 Redis 一致。
 
 ---
 

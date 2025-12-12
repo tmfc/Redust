@@ -411,7 +411,7 @@
 
 - [x] XADD
 - [ ] XDEL
-- [ ] XREAD
+- [x] XREAD
 - [ ] XREADGROUP
 - [x] XRANGE / XREVRANGE
 - [ ] XACK
@@ -445,10 +445,10 @@
 
 ### Geo
 
-- [ ] GEOADD
-- [ ] GEOPOS
-- [ ] GEODIST
-- [ ] GEOHASH
+- [x] GEOADD
+- [x] GEOPOS
+- [x] GEODIST
+- [x] GEOHASH
 - [ ] GEORADIUS / GEORADIUSBYMEMBER （已被 GEOSEARCH 等命令取代）
 - [ ] GEOSEARCH
 - [ ] GEOSEARCHSTORE

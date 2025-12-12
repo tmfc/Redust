@@ -83,6 +83,12 @@ impl TestClient {
         assert!(line.starts_with('*'), "Expected array, got: {}", line);
         line.trim_start_matches('*').trim().parse().unwrap()
     }
+
+    async fn read_null_array(&mut self) {
+        let mut line = String::new();
+        self.reader.read_line(&mut line).await.unwrap();
+        assert_eq!(line.trim(), "*-1", "Expected null array, got: {}", line);
+    }
 }
 
 #[tokio::test]
@@ -183,6 +189,155 @@ async fn test_xrange_count() {
         .await;
     let n = client.read_array_len().await;
     assert_eq!(n, 2);
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_xread_non_blocking_empty_returns_empty_array() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    client
+        .send_command(&["XREAD", "STREAMS", "mystream", "0-0"])
+        .await;
+    let n = client.read_array_len().await;
+    assert_eq!(n, 0);
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_xread_reads_entries() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    client
+        .send_command(&["XADD", "mystream", "*", "f", "v1"])
+        .await;
+    let _ = client.read_bulk_string().await.unwrap();
+
+    client
+        .send_command(&["XREAD", "COUNT", "10", "STREAMS", "mystream", "0-0"])
+        .await;
+
+    let outer = client.read_array_len().await;
+    assert_eq!(outer, 1);
+
+    let pair_len = client.read_array_len().await;
+    assert_eq!(pair_len, 2);
+    let key = client.read_bulk_string().await.unwrap();
+    assert_eq!(key, "mystream");
+
+    let entries_len = client.read_array_len().await;
+    assert_eq!(entries_len, 1);
+    let entry_len = client.read_array_len().await;
+    assert_eq!(entry_len, 2);
+    let _id = client.read_bulk_string().await.unwrap();
+    let fv_len = client.read_array_len().await;
+    assert_eq!(fv_len, 2);
+    let field = client.read_bulk_string().await.unwrap();
+    let val = client.read_bulk_string().await.unwrap();
+    assert_eq!(field, "f");
+    assert_eq!(val, "v1");
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_xread_block_timeout_returns_null() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    client
+        .send_command(&["XREAD", "BLOCK", "1", "STREAMS", "mystream", "0-0"])
+        .await;
+    client.read_null_array().await;
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_xinfo_stream_missing_returns_empty_array() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    client.send_command(&["XINFO", "STREAM", "mystream"]).await;
+    let n = client.read_array_len().await;
+    assert_eq!(n, 0);
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_xinfo_stream_basic_fields() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    client
+        .send_command(&["XADD", "mystream", "*", "f", "v1"])
+        .await;
+    let id1 = client.read_bulk_string().await.unwrap();
+
+    client
+        .send_command(&["XADD", "mystream", "*", "f", "v2"])
+        .await;
+    let id2 = client.read_bulk_string().await.unwrap();
+
+    client.send_command(&["XINFO", "STREAM", "mystream"]).await;
+
+    let n = client.read_array_len().await;
+    assert_eq!(n, 8);
+
+    let f1 = client.read_bulk_string().await.unwrap();
+    assert_eq!(f1, "length");
+    assert_eq!(client.read_integer().await, 2);
+
+    let f2 = client.read_bulk_string().await.unwrap();
+    assert_eq!(f2, "last-generated-id");
+    let last_id = client.read_bulk_string().await.unwrap();
+    assert_eq!(last_id, id2);
+
+    let f3 = client.read_bulk_string().await.unwrap();
+    assert_eq!(f3, "first-entry");
+    let first_pair_len = client.read_array_len().await;
+    assert_eq!(first_pair_len, 2);
+    let first_id = client.read_bulk_string().await.unwrap();
+    assert_eq!(first_id, id1);
+    let fv_len = client.read_array_len().await;
+    assert_eq!(fv_len, 2);
+    let field = client.read_bulk_string().await.unwrap();
+    let val = client.read_bulk_string().await.unwrap();
+    assert_eq!(field, "f");
+    assert_eq!(val, "v1");
+
+    let f4 = client.read_bulk_string().await.unwrap();
+    assert_eq!(f4, "last-entry");
+    let last_pair_len = client.read_array_len().await;
+    assert_eq!(last_pair_len, 2);
+    let last_id2 = client.read_bulk_string().await.unwrap();
+    assert_eq!(last_id2, id2);
+    let fv_len = client.read_array_len().await;
+    assert_eq!(fv_len, 2);
+    let field = client.read_bulk_string().await.unwrap();
+    let val = client.read_bulk_string().await.unwrap();
+    assert_eq!(field, "f");
+    assert_eq!(val, "v2");
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_xinfo_stream_wrongtype() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    client.send_command(&["SET", "mystream", "hello"]).await;
+    let _ = client.read_simple_string().await;
+
+    client.send_command(&["XINFO", "STREAM", "mystream"]).await;
+    let err = client.read_error().await;
+    assert!(err.contains("WRONGTYPE"));
 
     let _ = shutdown.send(());
 }

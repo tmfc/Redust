@@ -116,7 +116,7 @@ struct ZSetInner {
     by_score: BTreeSet<(OrderedFloat<f64>, String)>,
 }
 
-use crate::command::StreamId;
+use crate::command::{StreamId, StreamReadId};
 
 #[derive(Debug, Clone)]
 struct StreamEntry {
@@ -128,6 +128,14 @@ struct StreamEntry {
 struct StreamInner {
     entries: Vec<StreamEntry>,
     last_id: StreamId,
+}
+
+#[derive(Debug, Clone)]
+pub struct StreamInfo {
+    pub length: usize,
+    pub last_generated_id: StreamId,
+    pub first_entry: Option<(StreamId, Vec<(ByteString, ByteString)>)>,
+    pub last_entry: Option<(StreamId, Vec<(ByteString, ByteString)>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -371,6 +379,29 @@ impl Storage {
         }
     }
 
+    pub fn xinfo_stream(&self, key: &str) -> Result<Option<StreamInfo>, ()> {
+        let now = Instant::now();
+        if self.remove_if_expired(key, now) {
+            return Ok(None);
+        }
+        let Some(v) = self.data.get(key) else {
+            return Ok(None);
+        };
+        let StorageValue::Stream { value, .. } = v.value() else {
+            return Err(());
+        };
+        let length = value.entries.len();
+        let first_entry = value.entries.first().map(|e| (e.id, e.fields.clone()));
+        let last_entry = value.entries.last().map(|e| (e.id, e.fields.clone()));
+        self.touch_key(key);
+        Ok(Some(StreamInfo {
+            length,
+            last_generated_id: value.last_id,
+            first_entry,
+            last_entry,
+        }))
+    }
+
     pub fn xrange(
         &self,
         key: &str,
@@ -406,6 +437,53 @@ impl Storage {
                 break;
             }
         }
+        Ok(out)
+    }
+
+    pub fn xread(
+        &self,
+        streams: &[(String, StreamReadId)],
+        count: Option<usize>,
+    ) -> Result<Vec<(String, Vec<(StreamId, Vec<(ByteString, ByteString)>)>)>, ()> {
+        let mut out: Vec<(String, Vec<(StreamId, Vec<(ByteString, ByteString)>)>)> = Vec::new();
+        let limit = count.unwrap_or(usize::MAX);
+
+        for (key, id) in streams {
+            let now = Instant::now();
+            if self.remove_if_expired(key, now) {
+                continue;
+            }
+
+            let Some(v) = self.data.get(key) else {
+                continue;
+            };
+
+            let StorageValue::Stream { value, .. } = v.value() else {
+                return Err(());
+            };
+
+            let last_seen = match id {
+                StreamReadId::Id(sid) => *sid,
+                StreamReadId::Latest => value.last_id,
+            };
+
+            let mut items: Vec<(StreamId, Vec<(ByteString, ByteString)>)> = Vec::new();
+            for e in &value.entries {
+                if e.id <= last_seen {
+                    continue;
+                }
+                items.push((e.id, e.fields.clone()));
+                if items.len() >= limit {
+                    break;
+                }
+            }
+
+            if !items.is_empty() {
+                self.touch_key(key);
+                out.push((key.clone(), items));
+            }
+        }
+
         Ok(out)
     }
 
@@ -5712,4 +5790,161 @@ impl Storage {
         self.bump_key_version(destkey);
         Ok(())
     }
+
+    // ==================== Geo Commands (based on ZSet + geohash) ====================
+
+    /// GEOADD: Add geo members to a key (stored as ZSet with geohash score)
+    pub fn geoadd(
+        &self,
+        key: &str,
+        members: &[(f64, f64, String)], // (longitude, latitude, member)
+    ) -> Result<usize, ZsetError> {
+        let entries: Vec<(f64, String)> = members
+            .iter()
+            .map(|(lon, lat, member)| {
+                let hash = geohash_encode(*lon, *lat);
+                (hash as f64, member.clone())
+            })
+            .collect();
+        self.zadd(key, &entries)
+    }
+
+    /// GEOPOS: Get positions of members
+    pub fn geopos(&self, key: &str, members: &[String]) -> Result<Vec<Option<(f64, f64)>>, ()> {
+        let scores = self.zmscore(key, members)?;
+        Ok(scores
+            .into_iter()
+            .map(|opt_score| opt_score.map(|s| geohash_decode(s as u64)))
+            .collect())
+    }
+
+    /// GEODIST: Get distance between two members
+    pub fn geodist(
+        &self,
+        key: &str,
+        member1: &str,
+        member2: &str,
+    ) -> Result<Option<f64>, ()> {
+        let scores = self.zmscore(key, &[member1.to_string(), member2.to_string()])?;
+        match (scores.get(0), scores.get(1)) {
+            (Some(Some(s1)), Some(Some(s2))) => {
+                let (lon1, lat1) = geohash_decode(*s1 as u64);
+                let (lon2, lat2) = geohash_decode(*s2 as u64);
+                Ok(Some(haversine_distance(lat1, lon1, lat2, lon2)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// GEOHASH: Get geohash strings for members
+    pub fn geohash(&self, key: &str, members: &[String]) -> Result<Vec<Option<String>>, ()> {
+        let scores = self.zmscore(key, members)?;
+        Ok(scores
+            .into_iter()
+            .map(|opt_score| opt_score.map(|s| geohash_to_string(s as u64)))
+            .collect())
+    }
+}
+
+// ==================== Geohash encoding/decoding ====================
+
+const GEO_STEP: u32 = 26; // 52 bits total (26 for lon, 26 for lat)
+const LAT_MIN: f64 = -85.05112878;
+const LAT_MAX: f64 = 85.05112878;
+const LON_MIN: f64 = -180.0;
+const LON_MAX: f64 = 180.0;
+
+/// Check if longitude and latitude are valid
+pub fn geo_validate_coords(lon: f64, lat: f64) -> Result<(), &'static str> {
+    if lon < LON_MIN || lon > LON_MAX {
+        return Err("ERR invalid longitude,latitude pair");
+    }
+    if lat < LAT_MIN || lat > LAT_MAX {
+        return Err("ERR invalid longitude,latitude pair");
+    }
+    Ok(())
+}
+
+/// Encode longitude and latitude to a 52-bit geohash integer
+fn geohash_encode(lon: f64, lat: f64) -> u64 {
+    // Clamp to valid range (caller should validate first)
+    let lon_clamped = lon.clamp(LON_MIN, LON_MAX);
+    let lat_clamped = lat.clamp(LAT_MIN, LAT_MAX);
+
+    // Normalize to [0, 1]
+    let lon_norm = (lon_clamped - LON_MIN) / (LON_MAX - LON_MIN);
+    let lat_norm = (lat_clamped - LAT_MIN) / (LAT_MAX - LAT_MIN);
+
+    // Convert to integer range [0, 2^26)
+    let lon_int = (lon_norm * (1u64 << GEO_STEP) as f64) as u64;
+    let lat_int = (lat_norm * (1u64 << GEO_STEP) as f64) as u64;
+
+    // Interleave bits: lon in even positions, lat in odd positions
+    interleave_bits(lon_int, lat_int)
+}
+
+/// Decode a 52-bit geohash integer to (longitude, latitude)
+fn geohash_decode(hash: u64) -> (f64, f64) {
+    let (lon_int, lat_int) = deinterleave_bits(hash);
+
+    let lon_norm = lon_int as f64 / (1u64 << GEO_STEP) as f64;
+    let lat_norm = lat_int as f64 / (1u64 << GEO_STEP) as f64;
+
+    let lon = LON_MIN + lon_norm * (LON_MAX - LON_MIN);
+    let lat = LAT_MIN + lat_norm * (LAT_MAX - LAT_MIN);
+
+    (lon, lat)
+}
+
+/// Interleave two 26-bit integers into a 52-bit integer
+fn interleave_bits(x: u64, y: u64) -> u64 {
+    let mut result = 0u64;
+    for i in 0..GEO_STEP {
+        result |= ((x >> i) & 1) << (2 * i);
+        result |= ((y >> i) & 1) << (2 * i + 1);
+    }
+    result
+}
+
+/// Deinterleave a 52-bit integer into two 26-bit integers
+fn deinterleave_bits(z: u64) -> (u64, u64) {
+    let mut x = 0u64;
+    let mut y = 0u64;
+    for i in 0..GEO_STEP {
+        x |= ((z >> (2 * i)) & 1) << i;
+        y |= ((z >> (2 * i + 1)) & 1) << i;
+    }
+    (x, y)
+}
+
+/// Convert geohash integer to base32 string (11 characters for 52 bits)
+fn geohash_to_string(hash: u64) -> String {
+    const ALPHABET: &[u8] = b"0123456789bcdefghjkmnpqrstuvwxyz";
+    let mut result = String::with_capacity(11);
+    let mut h = hash;
+    
+    // Process 5 bits at a time, starting from the most significant
+    for _ in 0..11 {
+        let idx = ((h >> 47) & 0x1F) as usize;
+        result.push(ALPHABET[idx] as char);
+        h <<= 5;
+    }
+    
+    result
+}
+
+/// Calculate haversine distance between two points in meters
+fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const EARTH_RADIUS_M: f64 = 6372797.560856;
+
+    let lat1_rad = lat1.to_radians();
+    let lat2_rad = lat2.to_radians();
+    let delta_lat = (lat2 - lat1).to_radians();
+    let delta_lon = (lon2 - lon1).to_radians();
+
+    let a = (delta_lat / 2.0).sin().powi(2)
+        + lat1_rad.cos() * lat2_rad.cos() * (delta_lon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().asin();
+
+    EARTH_RADIUS_M * c
 }

@@ -11,6 +11,12 @@ pub struct StreamId {
     pub seq: u64,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum StreamReadId {
+    Id(StreamId),
+    Latest,
+}
+
 /// ZINTER/ZUNION 的聚合方式
 #[derive(Debug, Clone, Copy)]
 pub enum ZAggregate {
@@ -64,6 +70,36 @@ pub enum BitfieldOverflow {
     Sat,
     /// 失败（返回 nil）
     Fail,
+}
+
+/// Geo 距离单位
+#[derive(Debug, Clone, Copy, Default)]
+pub enum GeoUnit {
+    #[default]
+    Meters,
+    Kilometers,
+    Miles,
+    Feet,
+}
+
+impl GeoUnit {
+    pub fn to_meters(&self, value: f64) -> f64 {
+        match self {
+            GeoUnit::Meters => value,
+            GeoUnit::Kilometers => value * 1000.0,
+            GeoUnit::Miles => value * 1609.34,
+            GeoUnit::Feet => value * 0.3048,
+        }
+    }
+
+    pub fn from_meters(&self, meters: f64) -> f64 {
+        match self {
+            GeoUnit::Meters => meters,
+            GeoUnit::Kilometers => meters / 1000.0,
+            GeoUnit::Miles => meters / 1609.34,
+            GeoUnit::Feet => meters / 0.3048,
+        }
+    }
 }
 
 /// BITFIELD 子命令
@@ -205,11 +241,38 @@ pub enum Command {
     Xlen {
         key: String,
     },
+    XinfoStream {
+        key: String,
+    },
     Xrange {
         key: String,
         start: Option<StreamId>,
         end: Option<StreamId>,
         count: Option<usize>,
+    },
+    Xread {
+        count: Option<usize>,
+        block_millis: Option<u64>,
+        streams: Vec<(String, StreamReadId)>,
+    },
+    // Geo commands
+    Geoadd {
+        key: String,
+        members: Vec<(f64, f64, String)>, // (longitude, latitude, member)
+    },
+    Geopos {
+        key: String,
+        members: Vec<String>,
+    },
+    Geodist {
+        key: String,
+        member1: String,
+        member2: String,
+        unit: GeoUnit,
+    },
+    Geohash {
+        key: String,
+        members: Vec<String>,
     },
     Append {
         key: String,
@@ -797,6 +860,20 @@ fn parse_stream_id_token(token: Vec<u8>) -> Result<StreamId, Command> {
     let ms: u64 = ms_s.parse().map_err(|_| err_syntax())?;
     let seq: u64 = seq_s.parse().map_err(|_| err_syntax())?;
     Ok(StreamId { ms, seq })
+}
+
+fn parse_stream_read_id_token(token: Vec<u8>) -> Result<StreamReadId, Command> {
+    let s = parse_bulk_string(token)?;
+    if s == "$" {
+        return Ok(StreamReadId::Latest);
+    }
+    if let Some((ms_s, seq_s)) = s.split_once('-') {
+        let ms: u64 = ms_s.parse().map_err(|_| err_syntax())?;
+        let seq: u64 = seq_s.parse().map_err(|_| err_syntax())?;
+        return Ok(StreamReadId::Id(StreamId { ms, seq }));
+    }
+    let ms: u64 = s.parse().map_err(|_| err_syntax())?;
+    Ok(StreamReadId::Id(StreamId { ms, seq: 0 }))
 }
 
 /// 确保迭代器中没有多余参数
@@ -1865,6 +1942,180 @@ pub async fn read_command(
                 end,
                 count,
             }
+        }
+        "XREAD" => {
+            let mut count: Option<usize> = None;
+            let mut block_millis: Option<u64> = None;
+            let mut found_streams = false;
+
+            while let Some(opt) = iter.next() {
+                let opt_upper = match parse_bulk_string(opt) {
+                    Ok(s) => s.to_uppercase(),
+                    Err(e) => return Ok(Some(e)),
+                };
+                match opt_upper.as_str() {
+                    "COUNT" => {
+                        let Some(n_bytes) = iter.next() else {
+                            return Ok(Some(err_wrong_args("xread")));
+                        };
+                        let n = match parse_i64_from_bulk(n_bytes) {
+                            Ok(v) => v,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        if n < 0 {
+                            return Ok(Some(err_not_integer()));
+                        }
+                        count = Some(n as usize);
+                    }
+                    "BLOCK" => {
+                        let Some(ms_bytes) = iter.next() else {
+                            return Ok(Some(err_wrong_args("xread")));
+                        };
+                        let ms = match parse_i64_from_bulk(ms_bytes) {
+                            Ok(v) => v,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        if ms < 0 {
+                            return Ok(Some(err_not_integer()));
+                        }
+                        block_millis = Some(ms as u64);
+                    }
+                    "STREAMS" => {
+                        found_streams = true;
+                        break;
+                    }
+                    _ => {
+                        return Ok(Some(err_syntax()));
+                    }
+                }
+            }
+
+            if !found_streams {
+                return Ok(Some(err_wrong_args("xread")));
+            }
+
+            let mut rest: Vec<Vec<u8>> = iter.collect();
+            if rest.len() < 2 || rest.len() % 2 != 0 {
+                return Ok(Some(err_wrong_args("xread")));
+            }
+            let n = rest.len() / 2;
+            let ids = rest.split_off(n);
+
+            let mut streams: Vec<(String, StreamReadId)> = Vec::with_capacity(n);
+            for (k_bytes, id_bytes) in rest.into_iter().zip(ids.into_iter()) {
+                let key = match parse_bulk_string(k_bytes) {
+                    Ok(k) => k,
+                    Err(e) => return Ok(Some(e)),
+                };
+                let id = match parse_stream_read_id_token(id_bytes) {
+                    Ok(v) => v,
+                    Err(e) => return Ok(Some(e)),
+                };
+                streams.push((key, id));
+            }
+
+            Command::Xread {
+                count,
+                block_millis,
+                streams,
+            }
+        }
+        "XINFO" => {
+            let Some(sub_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("xinfo")));
+            };
+            let sub = match parse_bulk_string(sub_bytes) {
+                Ok(s) => s.to_uppercase(),
+                Err(e) => return Ok(Some(e)),
+            };
+            match sub.as_str() {
+                "STREAM" => {
+                    let key = try_cmd!(require_key(&mut iter, "xinfo"));
+                    try_cmd!(ensure_no_more_args(&mut iter, "xinfo"));
+                    Command::XinfoStream { key }
+                }
+                _ => return Ok(Some(err_syntax())),
+            }
+        }
+        "GEOADD" => {
+            let key = try_cmd!(require_key(&mut iter, "geoadd"));
+            let mut members: Vec<(f64, f64, String)> = Vec::new();
+            while let Some(lon_bytes) = iter.next() {
+                let lon = match parse_f64_from_bulk(lon_bytes) {
+                    Ok(v) => v,
+                    Err(e) => return Ok(Some(e)),
+                };
+                let Some(lat_bytes) = iter.next() else {
+                    return Ok(Some(err_wrong_args("geoadd")));
+                };
+                let lat = match parse_f64_from_bulk(lat_bytes) {
+                    Ok(v) => v,
+                    Err(e) => return Ok(Some(e)),
+                };
+                let Some(member_bytes) = iter.next() else {
+                    return Ok(Some(err_wrong_args("geoadd")));
+                };
+                let member = match parse_bulk_string(member_bytes) {
+                    Ok(m) => m,
+                    Err(e) => return Ok(Some(e)),
+                };
+                members.push((lon, lat, member));
+            }
+            if members.is_empty() {
+                return Ok(Some(err_wrong_args("geoadd")));
+            }
+            Command::Geoadd { key, members }
+        }
+        "GEOPOS" => {
+            let key = try_cmd!(require_key(&mut iter, "geopos"));
+            let mut members: Vec<String> = Vec::new();
+            while let Some(member_bytes) = iter.next() {
+                let member = match parse_bulk_string(member_bytes) {
+                    Ok(m) => m,
+                    Err(e) => return Ok(Some(e)),
+                };
+                members.push(member);
+            }
+            if members.is_empty() {
+                return Ok(Some(err_wrong_args("geopos")));
+            }
+            Command::Geopos { key, members }
+        }
+        "GEODIST" => {
+            let key = try_cmd!(require_key(&mut iter, "geodist"));
+            let member1 = try_cmd!(require_key(&mut iter, "geodist"));
+            let member2 = try_cmd!(require_key(&mut iter, "geodist"));
+            let mut unit = GeoUnit::Meters;
+            if let Some(unit_bytes) = iter.next() {
+                let unit_str = match parse_bulk_string(unit_bytes) {
+                    Ok(s) => s.to_uppercase(),
+                    Err(e) => return Ok(Some(e)),
+                };
+                unit = match unit_str.as_str() {
+                    "M" => GeoUnit::Meters,
+                    "KM" => GeoUnit::Kilometers,
+                    "MI" => GeoUnit::Miles,
+                    "FT" => GeoUnit::Feet,
+                    _ => return Ok(Some(err_syntax())),
+                };
+            }
+            try_cmd!(ensure_no_more_args(&mut iter, "geodist"));
+            Command::Geodist { key, member1, member2, unit }
+        }
+        "GEOHASH" => {
+            let key = try_cmd!(require_key(&mut iter, "geohash"));
+            let mut members: Vec<String> = Vec::new();
+            while let Some(member_bytes) = iter.next() {
+                let member = match parse_bulk_string(member_bytes) {
+                    Ok(m) => m,
+                    Err(e) => return Ok(Some(e)),
+                };
+                members.push(member);
+            }
+            if members.is_empty() {
+                return Ok(Some(err_wrong_args("geohash")));
+            }
+            Command::Geohash { key, members }
         }
         "APPEND" => {
             let Some(key_bytes) = iter.next() else {

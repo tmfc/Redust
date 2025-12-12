@@ -17,7 +17,7 @@ use tokio::time::{sleep, Duration};
 
 use log::{error, info};
 
-use crate::command::{read_command, Command, CommandError}; // Import CommandError
+use crate::command::{read_command, Command, CommandError, GeoUnit, StreamReadId};
 use crate::resp::{
     respond_bulk_bytes, respond_bulk_string, respond_error, respond_integer, respond_null_bulk,
     respond_simple_string,
@@ -1258,6 +1258,67 @@ async fn handle_string_command(
                 }
             }
         }
+        Command::XinfoStream { key } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.xinfo_stream(&physical) {
+                Ok(None) => {
+                    // Redis returns empty array for missing stream
+                    writer.write_all(b"*0\r\n").await?;
+                }
+                Ok(Some(info)) => {
+                    // Minimal subset:
+                    // [length, last-generated-id, first-entry, last-entry]
+                    // as field/value pairs in an array.
+                    writer.write_all(b"*8\r\n").await?;
+
+                    respond_bulk_string(writer, "length").await?;
+                    respond_integer(writer, info.length as i64).await?;
+
+                    respond_bulk_string(writer, "last-generated-id").await?;
+                    let last_id_s = format!("{}-{}", info.last_generated_id.ms, info.last_generated_id.seq);
+                    respond_bulk_string(writer, &last_id_s).await?;
+
+                    respond_bulk_string(writer, "first-entry").await?;
+                    if let Some((id, fields)) = info.first_entry {
+                        writer.write_all(b"*2\r\n").await?;
+                        let id_s = format!("{}-{}", id.ms, id.seq);
+                        respond_bulk_string(writer, &id_s).await?;
+                        writer
+                            .write_all(format!("*{}\r\n", fields.len() * 2).as_bytes())
+                            .await?;
+                        for (f, v) in fields {
+                            respond_bulk_bytes(writer, &f).await?;
+                            respond_bulk_bytes(writer, &v).await?;
+                        }
+                    } else {
+                        writer.write_all(b"*-1\r\n").await?;
+                    }
+
+                    respond_bulk_string(writer, "last-entry").await?;
+                    if let Some((id, fields)) = info.last_entry {
+                        writer.write_all(b"*2\r\n").await?;
+                        let id_s = format!("{}-{}", id.ms, id.seq);
+                        respond_bulk_string(writer, &id_s).await?;
+                        writer
+                            .write_all(format!("*{}\r\n", fields.len() * 2).as_bytes())
+                            .await?;
+                        for (f, v) in fields {
+                            respond_bulk_bytes(writer, &f).await?;
+                            respond_bulk_bytes(writer, &v).await?;
+                        }
+                    } else {
+                        writer.write_all(b"*-1\r\n").await?;
+                    }
+                }
+                Err(()) => {
+                    respond_error(
+                        writer,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )
+                    .await?;
+                }
+            }
+        }
         Command::Xrange {
             key,
             start,
@@ -1291,6 +1352,165 @@ async fn handle_string_command(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
                     )
                     .await?;
+                }
+            }
+        }
+        Command::Xread {
+            count,
+            block_millis,
+            streams,
+        } => {
+            let physical_streams: Vec<(String, StreamReadId)> = streams
+                .into_iter()
+                .map(|(k, id)| (prefix_key(current_db, &k), id))
+                .collect();
+
+            let poll_interval = Duration::from_millis(100);
+            let start = std::time::Instant::now();
+            let timeout_duration = block_millis.map(Duration::from_millis);
+
+            loop {
+                match storage.xread(&physical_streams, count) {
+                    Ok(items) => {
+                        if items.is_empty() {
+                            if let Some(timeout_dur) = timeout_duration {
+                                if start.elapsed() >= timeout_dur {
+                                    // XREAD 超时返回 null reply
+                                    writer.write_all(b"*-1\r\n").await?;
+                                    return Ok(());
+                                }
+                                tokio::time::sleep(poll_interval).await;
+                                continue;
+                            }
+                            // 非阻塞情况下无数据，返回空数组
+                            writer.write_all(b"*0\r\n").await?;
+                            return Ok(());
+                        }
+
+                        writer
+                            .write_all(format!("*{}\r\n", items.len()).as_bytes())
+                            .await?;
+                        for (physical_key, entries) in items {
+                            writer.write_all(b"*2\r\n").await?;
+                            let prefix = format!("{}:", current_db);
+                            let logical = physical_key
+                                .strip_prefix(&prefix)
+                                .unwrap_or(physical_key.as_str());
+                            respond_bulk_string(writer, logical).await?;
+
+                            writer
+                                .write_all(format!("*{}\r\n", entries.len()).as_bytes())
+                                .await?;
+                            for (id, fields) in entries {
+                                writer.write_all(b"*2\r\n").await?;
+                                let id_s = format!("{}-{}", id.ms, id.seq);
+                                respond_bulk_string(writer, &id_s).await?;
+                                writer
+                                    .write_all(format!("*{}\r\n", fields.len() * 2).as_bytes())
+                                    .await?;
+                                for (f, v) in fields {
+                                    respond_bulk_bytes(writer, &f).await?;
+                                    respond_bulk_bytes(writer, &v).await?;
+                                }
+                            }
+                        }
+                        return Ok(());
+                    }
+                    Err(()) => {
+                        respond_error(
+                            writer,
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Command::Geoadd { key, members } => {
+            // Validate coordinates first
+            for (lon, lat, _) in &members {
+                if let Err(msg) = crate::storage::geo_validate_coords(*lon, *lat) {
+                    respond_error(writer, msg).await?;
+                    return Ok(());
+                }
+            }
+            let physical = prefix_key(current_db, &key);
+            match storage.geoadd(&physical, &members) {
+                Ok(added) => {
+                    respond_integer(writer, added as i64).await?;
+                }
+                Err(crate::storage::ZsetError::Oom) => {
+                    respond_error(writer, "OOM command not allowed when used memory > 'maxmemory'.").await?;
+                }
+                Err(crate::storage::ZsetError::WrongType) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+                Err(crate::storage::ZsetError::NotFloat) => {
+                    respond_error(writer, "ERR value is not a valid float").await?;
+                }
+            }
+        }
+        Command::Geopos { key, members } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.geopos(&physical, &members) {
+                Ok(positions) => {
+                    writer.write_all(format!("*{}\r\n", positions.len()).as_bytes()).await?;
+                    for pos in positions {
+                        match pos {
+                            Some((lon, lat)) => {
+                                writer.write_all(b"*2\r\n").await?;
+                                let lon_s = format!("{:.6}", lon);
+                                let lat_s = format!("{:.6}", lat);
+                                respond_bulk_string(writer, &lon_s).await?;
+                                respond_bulk_string(writer, &lat_s).await?;
+                            }
+                            None => {
+                                // Redis returns null bulk for missing member, not null array
+                                respond_null_bulk(writer).await?;
+                            }
+                        }
+                    }
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Geodist { key, member1, member2, unit } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.geodist(&physical, &member1, &member2) {
+                Ok(Some(meters)) => {
+                    let dist = unit.from_meters(meters);
+                    let dist_s = format!("{:.4}", dist);
+                    respond_bulk_string(writer, &dist_s).await?;
+                }
+                Ok(None) => {
+                    respond_null_bulk(writer).await?;
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Geohash { key, members } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.geohash(&physical, &members) {
+                Ok(hashes) => {
+                    writer.write_all(format!("*{}\r\n", hashes.len()).as_bytes()).await?;
+                    for hash in hashes {
+                        match hash {
+                            Some(h) => {
+                                respond_bulk_string(writer, &h).await?;
+                            }
+                            None => {
+                                respond_null_bulk(writer).await?;
+                            }
+                        }
+                    }
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
                 }
             }
         }
@@ -4112,7 +4332,12 @@ async fn execute_command_in_transaction(
         | Command::BitfieldRo { .. }
         | Command::Xadd { .. }
         | Command::Xlen { .. }
+        | Command::XinfoStream { .. }
         | Command::Xrange { .. }
+        | Command::Geoadd { .. }
+        | Command::Geopos { .. }
+        | Command::Geodist { .. }
+        | Command::Geohash { .. }
         | Command::Append { .. }
         | Command::Strlen { .. }
         | Command::Getset { .. }
@@ -4159,6 +4384,14 @@ async fn execute_command_in_transaction(
         // 阻塞命令在事务中不支持
         Command::Blpop { .. } | Command::Brpop { .. } => {
             respond_error(writer, "ERR BLPOP/BRPOP inside MULTI is not allowed").await?;
+        }
+
+        Command::Xread { block_millis, .. } => {
+            if block_millis.is_some() {
+                respond_error(writer, "ERR XREAD BLOCK inside MULTI is not allowed").await?;
+            } else {
+                handle_string_command(cmd, storage, writer, current_db).await?;
+            }
         }
 
         // set 命令
@@ -4659,7 +4892,13 @@ async fn handle_connection(
             | Command::BitfieldRo { .. }
             | Command::Xadd { .. }
             | Command::Xlen { .. }
+            | Command::XinfoStream { .. }
             | Command::Xrange { .. }
+            | Command::Xread { .. }
+            | Command::Geoadd { .. }
+            | Command::Geopos { .. }
+            | Command::Geodist { .. }
+            | Command::Geohash { .. }
             | Command::Append { .. }
             | Command::Strlen { .. }
             | Command::Getset { .. }
@@ -5396,6 +5635,7 @@ pub async fn serve(
     let persistence_disabled = env::var("REDUST_DISABLE_PERSISTENCE")
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
+    let persistence_disabled = persistence_disabled || cfg!(test);
     let aof_enabled = env::var("REDUST_AOF_ENABLED")
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
