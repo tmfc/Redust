@@ -17,10 +17,10 @@ use tokio::time::{sleep, Duration};
 
 use log::{error, info};
 
-use crate::command::{read_command, Command, CommandError, GeoUnit, StreamReadId};
+use crate::command::{read_command, Command, CommandError, StreamReadId};
 use crate::resp::{
-    respond_bulk_bytes, respond_bulk_string, respond_error, respond_integer, respond_null_bulk,
-    respond_simple_string,
+    respond_bulk_bytes, respond_bulk_string, respond_error, respond_integer, respond_null_array,
+    respond_null_bulk, respond_simple_string,
 };
 use crate::scripting::{execute_script, ScriptCache, ScriptContext};
 use crate::storage::{MaxmemoryPolicy, RdbLoadMode, Storage};
@@ -1243,6 +1243,9 @@ async fn handle_string_command(
                 Err(crate::storage::StreamError::IdTooSmall) => {
                     respond_error(writer, "ERR The ID specified in XADD is equal or smaller than the target stream top item").await?;
                 }
+                Err(_) => {
+                    respond_error(writer, "ERR unknown error").await?;
+                }
             }
         }
         Command::Xlen { key } => {
@@ -1424,6 +1427,260 @@ async fn handle_string_command(
                         .await?;
                         return Ok(());
                     }
+                }
+            }
+        }
+        Command::XgroupCreate { key, group, id, mkstream } => {
+            let physical = prefix_key(current_db, &key);
+            // Handle special "$" ID - get the last ID from the stream
+            let actual_id = if id.ms == u64::MAX && id.seq == u64::MAX {
+                // Get the last ID from the stream, or 0-0 if stream doesn't exist
+                match storage.xinfo_stream(&physical) {
+                    Ok(Some(info)) => info.last_generated_id,
+                    _ => crate::command::StreamId { ms: 0, seq: 0 },
+                }
+            } else {
+                id
+            };
+            match storage.xgroup_create(&physical, &group, actual_id, mkstream) {
+                Ok(()) => {
+                    respond_simple_string(writer, "OK").await?;
+                }
+                Err(crate::storage::StreamError::NoSuchKey) => {
+                    respond_error(writer, "ERR The XGROUP subcommand requires the key to exist. Note that for CREATE you may want to use the MKSTREAM option to create an empty stream automatically.").await?;
+                }
+                Err(crate::storage::StreamError::GroupAlreadyExists) => {
+                    respond_error(writer, "BUSYGROUP Consumer Group name already exists").await?;
+                }
+                Err(crate::storage::StreamError::WrongType) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+                Err(_) => {
+                    respond_error(writer, "ERR unknown error").await?;
+                }
+            }
+        }
+        Command::XgroupSetid { key, group, id } => {
+            let physical = prefix_key(current_db, &key);
+            let actual_id = if id.ms == u64::MAX && id.seq == u64::MAX {
+                match storage.xinfo_stream(&physical) {
+                    Ok(Some(info)) => info.last_generated_id,
+                    _ => crate::command::StreamId { ms: 0, seq: 0 },
+                }
+            } else {
+                id
+            };
+            match storage.xgroup_setid(&physical, &group, actual_id) {
+                Ok(()) => {
+                    respond_simple_string(writer, "OK").await?;
+                }
+                Err(crate::storage::StreamError::NoSuchKey) => {
+                    respond_error(writer, "ERR The XGROUP subcommand requires the key to exist.").await?;
+                }
+                Err(crate::storage::StreamError::NoSuchGroup) => {
+                    respond_error(writer, "NOGROUP No such consumer group for key name").await?;
+                }
+                Err(crate::storage::StreamError::WrongType) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+                Err(_) => {
+                    respond_error(writer, "ERR unknown error").await?;
+                }
+            }
+        }
+        Command::XgroupDestroy { key, group } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.xgroup_destroy(&physical, &group) {
+                Ok(removed) => {
+                    respond_integer(writer, if removed { 1 } else { 0 }).await?;
+                }
+                Err(crate::storage::StreamError::NoSuchKey) => {
+                    respond_error(writer, "ERR The XGROUP subcommand requires the key to exist.").await?;
+                }
+                Err(crate::storage::StreamError::WrongType) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+                Err(_) => {
+                    respond_error(writer, "ERR unknown error").await?;
+                }
+            }
+        }
+        Command::XgroupCreateconsumer { key, group, consumer } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.xgroup_createconsumer(&physical, &group, &consumer) {
+                Ok(created) => {
+                    respond_integer(writer, if created { 1 } else { 0 }).await?;
+                }
+                Err(crate::storage::StreamError::NoSuchKey) => {
+                    respond_error(writer, "ERR The XGROUP subcommand requires the key to exist.").await?;
+                }
+                Err(crate::storage::StreamError::NoSuchGroup) => {
+                    respond_error(writer, "NOGROUP No such consumer group for key name").await?;
+                }
+                Err(crate::storage::StreamError::WrongType) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+                Err(_) => {
+                    respond_error(writer, "ERR unknown error").await?;
+                }
+            }
+        }
+        Command::XgroupDelconsumer { key, group, consumer } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.xgroup_delconsumer(&physical, &group, &consumer) {
+                Ok(pending_count) => {
+                    respond_integer(writer, pending_count as i64).await?;
+                }
+                Err(crate::storage::StreamError::NoSuchKey) => {
+                    respond_error(writer, "ERR The XGROUP subcommand requires the key to exist.").await?;
+                }
+                Err(crate::storage::StreamError::NoSuchGroup) => {
+                    respond_error(writer, "NOGROUP No such consumer group for key name").await?;
+                }
+                Err(crate::storage::StreamError::WrongType) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+                Err(_) => {
+                    respond_error(writer, "ERR unknown error").await?;
+                }
+            }
+        }
+        Command::Xreadgroup { group, consumer, count, block_millis, noack, streams } => {
+            // Supports multiple streams; COUNT/BLOCK apply globally
+            let poll_interval = std::time::Duration::from_millis(50);
+            let deadline = block_millis.map(|ms| {
+                if ms == 0 {
+                    None // Block forever
+                } else {
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(ms))
+                }
+            });
+
+            loop {
+                let mut all_results: Vec<(String, Vec<(crate::command::StreamId, Vec<(Vec<u8>, Vec<u8>)>)>)> = Vec::new();
+
+                for (key, id) in &streams {
+                    let physical = prefix_key(current_db, key);
+                    match storage.xreadgroup(&physical, &group, &consumer, *id, count, noack) {
+                        Ok(entries) => {
+                            if !entries.is_empty() {
+                                all_results.push((key.clone(), entries));
+                            }
+                        }
+                        Err(crate::storage::StreamError::NoSuchKey) => {
+                            respond_error(writer, "NOGROUP No such key or consumer group").await?;
+                            return Ok(());
+                        }
+                        Err(crate::storage::StreamError::NoSuchGroup) => {
+                            respond_error(writer, "NOGROUP No such consumer group for key name").await?;
+                            return Ok(());
+                        }
+                        Err(crate::storage::StreamError::WrongType) => {
+                            respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                            return Ok(());
+                        }
+                        Err(_) => {
+                            respond_error(writer, "ERR unknown error").await?;
+                            return Ok(());
+                        }
+                    }
+                }
+
+                if !all_results.is_empty() {
+                    // Return results
+                    writer.write_all(format!("*{}\r\n", all_results.len()).as_bytes()).await?;
+                    for (key, entries) in all_results {
+                        writer.write_all(b"*2\r\n").await?;
+                        respond_bulk_string(writer, &key).await?;
+                        writer.write_all(format!("*{}\r\n", entries.len()).as_bytes()).await?;
+                        for (id, fields) in entries {
+                            writer.write_all(b"*2\r\n").await?;
+                            let id_s = format!("{}-{}", id.ms, id.seq);
+                            respond_bulk_string(writer, &id_s).await?;
+                            writer.write_all(format!("*{}\r\n", fields.len() * 2).as_bytes()).await?;
+                            for (f, v) in fields {
+                                respond_bulk_bytes(writer, &f).await?;
+                                respond_bulk_bytes(writer, &v).await?;
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+
+                // No results - check if we should block
+                if let Some(deadline_opt) = deadline {
+                    if let Some(dl) = deadline_opt {
+                        if std::time::Instant::now() >= dl {
+                            // Timeout - return null
+                            respond_null_array(writer).await?;
+                            return Ok(());
+                        }
+                    }
+                    // Block and retry
+                    tokio::time::sleep(poll_interval).await;
+                    continue;
+                }
+
+                // Non-blocking, no results - return null
+                respond_null_array(writer).await?;
+                return Ok(());
+            }
+        }
+        Command::Xack { key, group, ids } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.xack(&physical, &group, &ids) {
+                Ok(acked) => {
+                    respond_integer(writer, acked as i64).await?;
+                }
+                Err(crate::storage::StreamError::WrongType) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+                Err(_) => {
+                    respond_error(writer, "ERR unknown error").await?;
+                }
+            }
+        }
+        Command::Xpending { key, group } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.xpending_summary(&physical, &group) {
+                Ok(Some((total, min_id, max_id, consumers))) => {
+                    // Return array: [total, min_id, max_id, [[consumer, count], ...]]
+                    writer.write_all(b"*4\r\n").await?;
+                    respond_integer(writer, total as i64).await?;
+                    match min_id {
+                        Some(id) => respond_bulk_string(writer, &format!("{}-{}", id.ms, id.seq)).await?,
+                        None => respond_null_bulk(writer).await?,
+                    }
+                    match max_id {
+                        Some(id) => respond_bulk_string(writer, &format!("{}-{}", id.ms, id.seq)).await?,
+                        None => respond_null_bulk(writer).await?,
+                    }
+                    writer.write_all(format!("*{}\r\n", consumers.len()).as_bytes()).await?;
+                    for (consumer, count) in consumers {
+                        writer.write_all(b"*2\r\n").await?;
+                        respond_bulk_string(writer, &consumer).await?;
+                        respond_bulk_string(writer, &count.to_string()).await?;
+                    }
+                }
+                Ok(None) => {
+                    respond_null_array(writer).await?;
+                }
+                Err(crate::storage::StreamError::NoSuchKey) => {
+                    // Key doesn't exist - return empty pending summary like Redis
+                    writer.write_all(b"*4\r\n").await?;
+                    respond_integer(writer, 0).await?;
+                    respond_null_bulk(writer).await?;
+                    respond_null_bulk(writer).await?;
+                    writer.write_all(b"*0\r\n").await?;
+                }
+                Err(crate::storage::StreamError::NoSuchGroup) => {
+                    respond_error(writer, "NOGROUP No such consumer group for key name").await?;
+                }
+                Err(crate::storage::StreamError::WrongType) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+                Err(_) => {
+                    respond_error(writer, "ERR unknown error").await?;
                 }
             }
         }
@@ -4334,6 +4591,13 @@ async fn execute_command_in_transaction(
         | Command::Xlen { .. }
         | Command::XinfoStream { .. }
         | Command::Xrange { .. }
+        | Command::XgroupCreate { .. }
+        | Command::XgroupSetid { .. }
+        | Command::XgroupDestroy { .. }
+        | Command::XgroupCreateconsumer { .. }
+        | Command::XgroupDelconsumer { .. }
+        | Command::Xack { .. }
+        | Command::Xpending { .. }
         | Command::Geoadd { .. }
         | Command::Geopos { .. }
         | Command::Geodist { .. }
@@ -4389,6 +4653,14 @@ async fn execute_command_in_transaction(
         Command::Xread { block_millis, .. } => {
             if block_millis.is_some() {
                 respond_error(writer, "ERR XREAD BLOCK inside MULTI is not allowed").await?;
+            } else {
+                handle_string_command(cmd, storage, writer, current_db).await?;
+            }
+        }
+
+        Command::Xreadgroup { block_millis, .. } => {
+            if block_millis.is_some() {
+                respond_error(writer, "ERR XREADGROUP BLOCK inside MULTI is not allowed").await?;
             } else {
                 handle_string_command(cmd, storage, writer, current_db).await?;
             }
@@ -4895,6 +5167,14 @@ async fn handle_connection(
             | Command::XinfoStream { .. }
             | Command::Xrange { .. }
             | Command::Xread { .. }
+            | Command::XgroupCreate { .. }
+            | Command::XgroupSetid { .. }
+            | Command::XgroupDestroy { .. }
+            | Command::XgroupCreateconsumer { .. }
+            | Command::XgroupDelconsumer { .. }
+            | Command::Xreadgroup { .. }
+            | Command::Xack { .. }
+            | Command::Xpending { .. }
             | Command::Geoadd { .. }
             | Command::Geopos { .. }
             | Command::Geodist { .. }

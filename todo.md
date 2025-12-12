@@ -16,8 +16,11 @@
   - [x] XRANGE/XREVRANGE - 范围查询
   - [x] XLEN - 获取流长度
   - [x] XINFO - 流信息查询
-  - [ ] XGROUP - 消费者组管理
-  - [ ] XACK/XCLAIM/XPENDING - 消息确认与处理
+  - [x] XGROUP - 消费者组管理 (CREATE/SETID/DESTROY/CREATECONSUMER/DELCONSUMER)
+  - [x] XREADGROUP - 消费者组读取
+  - [x] XACK - 消息确认
+  - [x] XPENDING - 待处理消息查询
+  - [ ] XCLAIM - 消息转移
 
 - [ ] **Geo 地理位置**
   - [x] GEOADD - 添加地理位置

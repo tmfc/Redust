@@ -135,6 +135,10 @@ pub async fn respond_null_bulk(writer: &mut tokio::net::tcp::OwnedWriteHalf) -> 
     writer.write_all(b"$-1\r\n").await
 }
 
+pub async fn respond_null_array(writer: &mut tokio::net::tcp::OwnedWriteHalf) -> io::Result<()> {
+    writer.write_all(b"*-1\r\n").await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

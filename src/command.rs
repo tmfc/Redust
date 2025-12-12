@@ -255,6 +255,49 @@ pub enum Command {
         block_millis: Option<u64>,
         streams: Vec<(String, StreamReadId)>,
     },
+    // XGROUP subcommands
+    XgroupCreate {
+        key: String,
+        group: String,
+        id: StreamId,
+        mkstream: bool,
+    },
+    XgroupSetid {
+        key: String,
+        group: String,
+        id: StreamId,
+    },
+    XgroupDestroy {
+        key: String,
+        group: String,
+    },
+    XgroupCreateconsumer {
+        key: String,
+        group: String,
+        consumer: String,
+    },
+    XgroupDelconsumer {
+        key: String,
+        group: String,
+        consumer: String,
+    },
+    Xreadgroup {
+        group: String,
+        consumer: String,
+        count: Option<usize>,
+        block_millis: Option<u64>,
+        noack: bool,
+        streams: Vec<(String, Option<StreamId>)>, // None means ">"
+    },
+    Xack {
+        key: String,
+        group: String,
+        ids: Vec<StreamId>,
+    },
+    Xpending {
+        key: String,
+        group: String,
+    },
     // Geo commands
     Geoadd {
         key: String,
@@ -854,6 +897,10 @@ fn require_f64(iter: &mut impl Iterator<Item = Vec<u8>>, cmd: &str) -> Result<f6
 
 fn parse_stream_id_token(token: Vec<u8>) -> Result<StreamId, Command> {
     let s = parse_bulk_string(token)?;
+    parse_stream_id(&s)
+}
+
+fn parse_stream_id(s: &str) -> Result<StreamId, Command> {
     let Some((ms_s, seq_s)) = s.split_once('-') else {
         return Err(err_syntax());
     };
@@ -942,8 +989,8 @@ fn parse_bitfield_offset(s: &str) -> Result<(i64, bool), String> {
     if s.is_empty() {
         return Err("ERR bit offset is not an integer or out of range".to_string());
     }
-    let (multiplier, rest) = if s.starts_with('#') {
-        (true, &s[1..])
+    let (multiplier, rest) = if let Some(stripped) = s.strip_prefix('#') {
+        (true, stripped)
     } else {
         (false, s)
     };
@@ -1030,6 +1077,7 @@ fn parse_zlex_bound(bytes: Vec<u8>) -> Result<ZLexBound, Command> {
 }
 
 /// 解析 ZINTER/ZUNION 的可选参数: WEIGHTS, AGGREGATE, WITHSCORES
+#[allow(clippy::type_complexity)]
 fn parse_zset_options(
     iter: &mut std::vec::IntoIter<Vec<u8>>,
     numkeys: usize,
@@ -1995,7 +2043,7 @@ pub async fn read_command(
             }
 
             let mut rest: Vec<Vec<u8>> = iter.collect();
-            if rest.len() < 2 || rest.len() % 2 != 0 {
+            if rest.len() < 2 || !rest.len().is_multiple_of(2) {
                 return Ok(Some(err_wrong_args("xread")));
             }
             let n = rest.len() / 2;
@@ -2037,6 +2085,218 @@ pub async fn read_command(
                 _ => return Ok(Some(err_syntax())),
             }
         }
+        "XGROUP" => {
+            let Some(sub_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("xgroup")));
+            };
+            let sub = match parse_bulk_string(sub_bytes) {
+                Ok(s) => s.to_uppercase(),
+                Err(e) => return Ok(Some(e)),
+            };
+            match sub.as_str() {
+                "CREATE" => {
+                    let key = try_cmd!(require_key(&mut iter, "xgroup"));
+                    let group = try_cmd!(require_key(&mut iter, "xgroup"));
+                    let Some(id_bytes) = iter.next() else {
+                        return Ok(Some(err_wrong_args("xgroup")));
+                    };
+                    let id_str = match parse_bulk_string(id_bytes) {
+                        Ok(s) => s,
+                        Err(e) => return Ok(Some(e)),
+                    };
+                    let id = if id_str == "$" {
+                        StreamId { ms: u64::MAX, seq: u64::MAX } // Special marker for "last ID"
+                    } else {
+                        match parse_stream_id(&id_str) {
+                            Ok(sid) => sid,
+                            Err(e) => return Ok(Some(e)),
+                        }
+                    };
+                    let mut mkstream = false;
+                    while let Some(opt_bytes) = iter.next() {
+                        let opt = match parse_bulk_string(opt_bytes) {
+                            Ok(s) => s.to_uppercase(),
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        if opt == "MKSTREAM" {
+                            mkstream = true;
+                        } else if opt == "ENTRIESREAD" {
+                            // Skip the entries_read value (not implemented)
+                            let _ = iter.next();
+                        } else {
+                            return Ok(Some(err_syntax()));
+                        }
+                    }
+                    Command::XgroupCreate { key, group, id, mkstream }
+                }
+                "SETID" => {
+                    let key = try_cmd!(require_key(&mut iter, "xgroup"));
+                    let group = try_cmd!(require_key(&mut iter, "xgroup"));
+                    let Some(id_bytes) = iter.next() else {
+                        return Ok(Some(err_wrong_args("xgroup")));
+                    };
+                    let id_str = match parse_bulk_string(id_bytes) {
+                        Ok(s) => s,
+                        Err(e) => return Ok(Some(e)),
+                    };
+                    let id = if id_str == "$" {
+                        StreamId { ms: u64::MAX, seq: u64::MAX }
+                    } else {
+                        match parse_stream_id(&id_str) {
+                            Ok(sid) => sid,
+                            Err(e) => return Ok(Some(e)),
+                        }
+                    };
+                    try_cmd!(ensure_no_more_args(&mut iter, "xgroup"));
+                    Command::XgroupSetid { key, group, id }
+                }
+                "DESTROY" => {
+                    let key = try_cmd!(require_key(&mut iter, "xgroup"));
+                    let group = try_cmd!(require_key(&mut iter, "xgroup"));
+                    try_cmd!(ensure_no_more_args(&mut iter, "xgroup"));
+                    Command::XgroupDestroy { key, group }
+                }
+                "CREATECONSUMER" => {
+                    let key = try_cmd!(require_key(&mut iter, "xgroup"));
+                    let group = try_cmd!(require_key(&mut iter, "xgroup"));
+                    let consumer = try_cmd!(require_key(&mut iter, "xgroup"));
+                    try_cmd!(ensure_no_more_args(&mut iter, "xgroup"));
+                    Command::XgroupCreateconsumer { key, group, consumer }
+                }
+                "DELCONSUMER" => {
+                    let key = try_cmd!(require_key(&mut iter, "xgroup"));
+                    let group = try_cmd!(require_key(&mut iter, "xgroup"));
+                    let consumer = try_cmd!(require_key(&mut iter, "xgroup"));
+                    try_cmd!(ensure_no_more_args(&mut iter, "xgroup"));
+                    Command::XgroupDelconsumer { key, group, consumer }
+                }
+                _ => return Ok(Some(err_syntax())),
+            }
+        }
+        "XREADGROUP" => {
+            // XREADGROUP GROUP group consumer [COUNT count] [BLOCK milliseconds] [NOACK] STREAMS key [key ...] id [id ...]
+            let Some(group_kw_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("xreadgroup")));
+            };
+            let group_kw = match parse_bulk_string(group_kw_bytes) {
+                Ok(s) => s.to_uppercase(),
+                Err(e) => return Ok(Some(e)),
+            };
+            if group_kw != "GROUP" {
+                return Ok(Some(err_syntax()));
+            }
+
+            let group = try_cmd!(require_key(&mut iter, "xreadgroup"));
+            let consumer = try_cmd!(require_key(&mut iter, "xreadgroup"));
+
+            let mut count: Option<usize> = None;
+            let mut block_millis: Option<u64> = None;
+            let mut noack = false;
+            let mut keys: Vec<String> = Vec::new();
+
+            // Parse options until STREAMS keyword
+            while let Some(opt_bytes) = iter.next() {
+                let opt = match parse_bulk_string(opt_bytes.clone()) {
+                    Ok(s) => s.to_uppercase(),
+                    Err(e) => return Ok(Some(e)),
+                };
+                match opt.as_str() {
+                    "COUNT" => {
+                        let Some(count_bytes) = iter.next() else {
+                            return Ok(Some(err_wrong_args("xreadgroup")));
+                        };
+                        count = Some(match parse_u64_from_bulk(count_bytes) {
+                            Ok(c) => c as usize,
+                            Err(e) => return Ok(Some(e)),
+                        });
+                    }
+                    "BLOCK" => {
+                        let Some(block_bytes) = iter.next() else {
+                            return Ok(Some(err_wrong_args("xreadgroup")));
+                        };
+                        block_millis = Some(match parse_u64_from_bulk(block_bytes) {
+                            Ok(b) => b,
+                            Err(e) => return Ok(Some(e)),
+                        });
+                    }
+                    "NOACK" => {
+                        noack = true;
+                    }
+                    "STREAMS" => {
+                        // Collect remaining tokens as keys and IDs
+                        let remaining: Vec<Vec<u8>> = iter.collect();
+                        if remaining.is_empty() || !remaining.len().is_multiple_of(2) {
+                            return Ok(Some(err_wrong_args("xreadgroup")));
+                        }
+                        let half = remaining.len() / 2;
+                        for item in remaining.iter().take(half) {
+                            let key = match parse_bulk_string(item.clone()) {
+                                Ok(k) => k,
+                                Err(e) => return Ok(Some(e)),
+                            };
+                            keys.push(key);
+                        }
+                        let mut streams: Vec<(String, Option<StreamId>)> = Vec::new();
+                        for (i, item) in remaining.iter().skip(half).enumerate() {
+                            let id_str = match parse_bulk_string(item.clone()) {
+                                Ok(s) => s,
+                                Err(e) => return Ok(Some(e)),
+                            };
+                            let id = if id_str == ">" {
+                                None // Special marker for "new messages"
+                            } else {
+                                Some(match parse_stream_id(&id_str) {
+                                    Ok(sid) => sid,
+                                    Err(e) => return Ok(Some(e)),
+                                })
+                            };
+                            streams.push((keys[i].clone(), id));
+                        }
+                        return Ok(Some(Command::Xreadgroup {
+                            group,
+                            consumer,
+                            count,
+                            block_millis,
+                            noack,
+                            streams,
+                        }));
+                    }
+                    _ => return Ok(Some(err_syntax())),
+                }
+            }
+
+            // No STREAMS keyword found
+            return Ok(Some(err_wrong_args("xreadgroup")));
+        }
+        "XACK" => {
+            // XACK key group id [id ...]
+            let key = try_cmd!(require_key(&mut iter, "xack"));
+            let group = try_cmd!(require_key(&mut iter, "xack"));
+            let mut ids: Vec<StreamId> = Vec::new();
+            for id_bytes in iter.by_ref() {
+                let id_str = match parse_bulk_string(id_bytes) {
+                    Ok(s) => s,
+                    Err(e) => return Ok(Some(e)),
+                };
+                let id = match parse_stream_id(&id_str) {
+                    Ok(sid) => sid,
+                    Err(e) => return Ok(Some(e)),
+                };
+                ids.push(id);
+            }
+            if ids.is_empty() {
+                return Ok(Some(err_wrong_args("xack")));
+            }
+            Command::Xack { key, group, ids }
+        }
+        "XPENDING" => {
+            // XPENDING key group [start end count] [consumer] - simplified version
+            let key = try_cmd!(require_key(&mut iter, "xpending"));
+            let group = try_cmd!(require_key(&mut iter, "xpending"));
+            // For now, only support the summary form (no range/consumer filtering)
+            try_cmd!(ensure_no_more_args(&mut iter, "xpending"));
+            Command::Xpending { key, group }
+        }
         "GEOADD" => {
             let key = try_cmd!(require_key(&mut iter, "geoadd"));
             let mut members: Vec<(f64, f64, String)> = Vec::new();
@@ -2069,7 +2329,7 @@ pub async fn read_command(
         "GEOPOS" => {
             let key = try_cmd!(require_key(&mut iter, "geopos"));
             let mut members: Vec<String> = Vec::new();
-            while let Some(member_bytes) = iter.next() {
+            for member_bytes in iter.by_ref() {
                 let member = match parse_bulk_string(member_bytes) {
                     Ok(m) => m,
                     Err(e) => return Ok(Some(e)),
@@ -2105,7 +2365,7 @@ pub async fn read_command(
         "GEOHASH" => {
             let key = try_cmd!(require_key(&mut iter, "geohash"));
             let mut members: Vec<String> = Vec::new();
-            while let Some(member_bytes) = iter.next() {
+            for member_bytes in iter.by_ref() {
                 let member = match parse_bulk_string(member_bytes) {
                     Ok(m) => m,
                     Err(e) => return Ok(Some(e)),

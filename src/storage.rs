@@ -124,10 +124,39 @@ struct StreamEntry {
     fields: Vec<(ByteString, ByteString)>,
 }
 
+/// Pending Entry List (PEL) entry for a consumer group
+#[derive(Debug, Clone)]
+struct PendingEntry {
+    id: StreamId,
+    consumer: String,
+    delivery_time: u64, // Unix timestamp in milliseconds
+    delivery_count: u64,
+}
+
+/// Consumer in a consumer group
+#[derive(Debug, Clone)]
+struct ConsumerInfo {
+    #[allow(dead_code)]
+    name: String,
+    seen_time: u64, // Last time this consumer was active (Unix ms)
+    pending_count: usize,
+}
+
+/// Consumer group for a stream
+#[derive(Debug, Clone)]
+struct ConsumerGroup {
+    #[allow(dead_code)]
+    name: String,
+    last_delivered_id: StreamId,
+    consumers: HashMap<String, ConsumerInfo>,
+    pending: Vec<PendingEntry>, // PEL sorted by ID
+}
+
 #[derive(Debug, Clone)]
 struct StreamInner {
     entries: Vec<StreamEntry>,
     last_id: StreamId,
+    groups: HashMap<String, ConsumerGroup>,
 }
 
 #[derive(Debug, Clone)]
@@ -223,6 +252,11 @@ pub enum StreamError {
     WrongType,
     IdTooSmall,
     Oom,
+    NoSuchKey,
+    GroupAlreadyExists,
+    NoSuchGroup,
+    ConsumerAlreadyExists,
+    NoSuchConsumer,
 }
 
 pub enum LsetError {
@@ -323,6 +357,7 @@ impl Storage {
                         fields,
                     }],
                     last_id: next_id,
+                    groups: HashMap::new(),
                 };
                 v.insert(StorageValue::Stream {
                     value: inner,
@@ -485,6 +520,377 @@ impl Storage {
         }
 
         Ok(out)
+    }
+
+    // ==================== XGROUP Commands ====================
+
+    /// XGROUP CREATE: Create a consumer group
+    /// If mkstream is true and the stream doesn't exist, create an empty stream
+    pub fn xgroup_create(
+        &self,
+        key: &str,
+        group: &str,
+        id: StreamId,
+        mkstream: bool,
+    ) -> Result<(), StreamError> {
+        let now = Instant::now();
+        self.remove_if_expired(key, now);
+
+        match self.data.entry(key.to_string()) {
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                if !mkstream {
+                    return Err(StreamError::NoSuchKey);
+                }
+                // Create empty stream with the group
+                let mut groups = HashMap::new();
+                groups.insert(
+                    group.to_string(),
+                    ConsumerGroup {
+                        name: group.to_string(),
+                        last_delivered_id: id,
+                        consumers: HashMap::new(),
+                        pending: Vec::new(),
+                    },
+                );
+                let inner = StreamInner {
+                    entries: Vec::new(),
+                    last_id: StreamId { ms: 0, seq: 0 },
+                    groups,
+                };
+                v.insert(StorageValue::Stream {
+                    value: inner,
+                    expires_at: None,
+                });
+                self.bump_key_version(key);
+                Ok(())
+            }
+            dashmap::mapref::entry::Entry::Occupied(mut o) => {
+                let StorageValue::Stream { value, .. } = o.get_mut() else {
+                    return Err(StreamError::WrongType);
+                };
+                if value.groups.contains_key(group) {
+                    return Err(StreamError::GroupAlreadyExists);
+                }
+                value.groups.insert(
+                    group.to_string(),
+                    ConsumerGroup {
+                        name: group.to_string(),
+                        last_delivered_id: id,
+                        consumers: HashMap::new(),
+                        pending: Vec::new(),
+                    },
+                );
+                self.bump_key_version(key);
+                Ok(())
+            }
+        }
+    }
+
+    /// XGROUP SETID: Set the last delivered ID for a consumer group
+    pub fn xgroup_setid(
+        &self,
+        key: &str,
+        group: &str,
+        id: StreamId,
+    ) -> Result<(), StreamError> {
+        let now = Instant::now();
+        self.remove_if_expired(key, now);
+
+        let Some(mut entry) = self.data.get_mut(key) else {
+            return Err(StreamError::NoSuchKey);
+        };
+        let StorageValue::Stream { value, .. } = entry.value_mut() else {
+            return Err(StreamError::WrongType);
+        };
+        let Some(cg) = value.groups.get_mut(group) else {
+            return Err(StreamError::NoSuchGroup);
+        };
+        cg.last_delivered_id = id;
+        self.bump_key_version(key);
+        Ok(())
+    }
+
+    /// XGROUP DESTROY: Delete a consumer group
+    pub fn xgroup_destroy(&self, key: &str, group: &str) -> Result<bool, StreamError> {
+        let now = Instant::now();
+        self.remove_if_expired(key, now);
+
+        let Some(mut entry) = self.data.get_mut(key) else {
+            return Err(StreamError::NoSuchKey);
+        };
+        let StorageValue::Stream { value, .. } = entry.value_mut() else {
+            return Err(StreamError::WrongType);
+        };
+        let removed = value.groups.remove(group).is_some();
+        if removed {
+            self.bump_key_version(key);
+        }
+        Ok(removed)
+    }
+
+    /// XGROUP CREATECONSUMER: Create a consumer in a group
+    pub fn xgroup_createconsumer(
+        &self,
+        key: &str,
+        group: &str,
+        consumer: &str,
+    ) -> Result<bool, StreamError> {
+        let now = Instant::now();
+        self.remove_if_expired(key, now);
+
+        let Some(mut entry) = self.data.get_mut(key) else {
+            return Err(StreamError::NoSuchKey);
+        };
+        let StorageValue::Stream { value, .. } = entry.value_mut() else {
+            return Err(StreamError::WrongType);
+        };
+        let Some(cg) = value.groups.get_mut(group) else {
+            return Err(StreamError::NoSuchGroup);
+        };
+        if cg.consumers.contains_key(consumer) {
+            return Ok(false); // Consumer already exists
+        }
+        cg.consumers.insert(
+            consumer.to_string(),
+            ConsumerInfo {
+                name: consumer.to_string(),
+                seen_time: Self::now_millis(),
+                pending_count: 0,
+            },
+        );
+        self.bump_key_version(key);
+        Ok(true)
+    }
+
+    /// XGROUP DELCONSUMER: Delete a consumer from a group
+    /// Returns the number of pending messages that were owned by the consumer
+    pub fn xgroup_delconsumer(
+        &self,
+        key: &str,
+        group: &str,
+        consumer: &str,
+    ) -> Result<usize, StreamError> {
+        let now = Instant::now();
+        self.remove_if_expired(key, now);
+
+        let Some(mut entry) = self.data.get_mut(key) else {
+            return Err(StreamError::NoSuchKey);
+        };
+        let StorageValue::Stream { value, .. } = entry.value_mut() else {
+            return Err(StreamError::WrongType);
+        };
+        let Some(cg) = value.groups.get_mut(group) else {
+            return Err(StreamError::NoSuchGroup);
+        };
+
+        // Count pending messages for this consumer
+        let pending_count = cg
+            .pending
+            .iter()
+            .filter(|p| p.consumer == consumer)
+            .count();
+
+        // Remove pending entries for this consumer
+        cg.pending.retain(|p| p.consumer != consumer);
+
+        // Remove the consumer
+        cg.consumers.remove(consumer);
+
+        self.bump_key_version(key);
+        Ok(pending_count)
+    }
+
+    /// XREADGROUP: Read messages from a stream using a consumer group
+    /// If id is ">" (represented as None), read new messages not yet delivered to any consumer
+    /// Otherwise, read pending messages for this consumer starting from the given ID
+    /// Returns: Vec of (stream_id, fields) tuples
+    /// noack: if true, don't add messages to PEL
+    pub fn xreadgroup(
+        &self,
+        key: &str,
+        group: &str,
+        consumer: &str,
+        id: Option<StreamId>, // None means ">", Some(id) means read from pending
+        count: Option<usize>,
+        noack: bool,
+    ) -> Result<Vec<(StreamId, Vec<(ByteString, ByteString)>)>, StreamError> {
+        let now = Instant::now();
+        self.remove_if_expired(key, now);
+
+        let Some(mut entry) = self.data.get_mut(key) else {
+            return Err(StreamError::NoSuchKey);
+        };
+        let StorageValue::Stream { value, .. } = entry.value_mut() else {
+            return Err(StreamError::WrongType);
+        };
+
+        let Some(cg) = value.groups.get_mut(group) else {
+            return Err(StreamError::NoSuchGroup);
+        };
+
+        let now_ms = Self::now_millis();
+        let limit = count.unwrap_or(usize::MAX);
+        let mut result = Vec::new();
+
+        // Ensure consumer exists (auto-create if not)
+        if !cg.consumers.contains_key(consumer) {
+            cg.consumers.insert(
+                consumer.to_string(),
+                ConsumerInfo {
+                    name: consumer.to_string(),
+                    seen_time: now_ms,
+                    pending_count: 0,
+                },
+            );
+        }
+
+        // Update consumer's seen_time
+        if let Some(ci) = cg.consumers.get_mut(consumer) {
+            ci.seen_time = now_ms;
+        }
+
+        match id {
+            None => {
+                // ">" - read new messages after last_delivered_id
+                for entry in &value.entries {
+                    if entry.id <= cg.last_delivered_id {
+                        continue;
+                    }
+                    result.push((entry.id, entry.fields.clone()));
+
+                    if !noack {
+                        // Add to PEL
+                        cg.pending.push(PendingEntry {
+                            id: entry.id,
+                            consumer: consumer.to_string(),
+                            delivery_time: now_ms,
+                            delivery_count: 1,
+                        });
+                        // Update consumer pending count
+                        if let Some(ci) = cg.consumers.get_mut(consumer) {
+                            ci.pending_count += 1;
+                        }
+                    }
+
+                    // Update last_delivered_id
+                    cg.last_delivered_id = entry.id;
+
+                    if result.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            Some(start_id) => {
+                // Read pending messages for this consumer starting from start_id
+                for pe in &mut cg.pending {
+                    if pe.consumer != consumer {
+                        continue;
+                    }
+                    if pe.id < start_id {
+                        continue;
+                    }
+                    // Find the entry in the stream
+                    if let Some(stream_entry) = value.entries.iter().find(|e| e.id == pe.id) {
+                        result.push((stream_entry.id, stream_entry.fields.clone()));
+                        // Update delivery info
+                        pe.delivery_time = now_ms;
+                        pe.delivery_count += 1;
+                    }
+                    if result.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !result.is_empty() {
+            self.touch_key(key);
+            self.bump_key_version(key);
+        }
+
+        Ok(result)
+    }
+
+    /// XACK: Acknowledge messages, removing them from the consumer's PEL
+    /// Returns the number of messages successfully acknowledged
+    pub fn xack(
+        &self,
+        key: &str,
+        group: &str,
+        ids: &[StreamId],
+    ) -> Result<usize, StreamError> {
+        let now = Instant::now();
+        self.remove_if_expired(key, now);
+
+        let Some(mut entry) = self.data.get_mut(key) else {
+            return Ok(0); // Key doesn't exist, nothing to ack
+        };
+        let StorageValue::Stream { value, .. } = entry.value_mut() else {
+            return Err(StreamError::WrongType);
+        };
+
+        let Some(cg) = value.groups.get_mut(group) else {
+            return Ok(0); // Group doesn't exist, nothing to ack
+        };
+
+        let mut acked = 0usize;
+        for id in ids {
+            // Find and remove from PEL
+            if let Some(pos) = cg.pending.iter().position(|p| p.id == *id) {
+                let pe = cg.pending.remove(pos);
+                // Update consumer pending count
+                if let Some(ci) = cg.consumers.get_mut(&pe.consumer) {
+                    ci.pending_count = ci.pending_count.saturating_sub(1);
+                }
+                acked += 1;
+            }
+        }
+
+        if acked > 0 {
+            self.bump_key_version(key);
+        }
+
+        Ok(acked)
+    }
+
+    /// XPENDING: Get pending messages info for a consumer group
+    /// Returns (total_pending, min_id, max_id, consumers_with_pending)
+    pub fn xpending_summary(
+        &self,
+        key: &str,
+        group: &str,
+    ) -> Result<Option<(usize, Option<StreamId>, Option<StreamId>, Vec<(String, usize)>)>, StreamError> {
+        let now = Instant::now();
+        self.remove_if_expired(key, now);
+
+        let Some(entry) = self.data.get(key) else {
+            // Key doesn't exist - return empty pending like Redis
+            return Err(StreamError::NoSuchKey);
+        };
+        let StorageValue::Stream { value, .. } = entry.value() else {
+            return Err(StreamError::WrongType);
+        };
+
+        let Some(cg) = value.groups.get(group) else {
+            return Err(StreamError::NoSuchGroup);
+        };
+
+        if cg.pending.is_empty() {
+            return Ok(Some((0, None, None, Vec::new())));
+        }
+
+        let min_id = cg.pending.first().map(|p| p.id);
+        let max_id = cg.pending.last().map(|p| p.id);
+
+        // Count pending per consumer
+        let mut consumer_counts: HashMap<String, usize> = HashMap::new();
+        for pe in &cg.pending {
+            *consumer_counts.entry(pe.consumer.clone()).or_insert(0) += 1;
+        }
+        let consumers: Vec<(String, usize)> = consumer_counts.into_iter().collect();
+
+        self.touch_key(key);
+        Ok(Some((cg.pending.len(), min_id, max_id, consumers)))
     }
 
     pub fn flushdb(&self, db: u8) {
