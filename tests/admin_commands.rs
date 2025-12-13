@@ -539,3 +539,97 @@ async fn client_pause_blocks_commands() {
     shutdown.send(()).unwrap();
     handle.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn client_unblock_timeout_mode() {
+    let _guard = set_env("REDUST_DISABLE_PERSISTENCE", "1");
+
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client1 = TestClient::connect(addr).await;
+    let mut client2 = TestClient::connect(addr).await;
+
+    // client1: 获取自己的 client_id
+    client1.send_array(&["CLIENT", "ID"]).await;
+    let line = client1.read_line().await;
+    let client1_id: i64 = line.trim_start_matches(':').trim().parse().unwrap();
+
+    // client1: 发起阻塞命令 BLPOP（超时 10 秒）
+    let blpop_handle = tokio::spawn(async move {
+        client1.send_array(&["BLPOP", "nonexistent_key", "10"]).await;
+        let line = client1.read_line().await;
+        (client1, line)
+    });
+
+    // 等待一小段时间确保 client1 进入阻塞状态
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // client2: 使用 CLIENT UNBLOCK 解除 client1 的阻塞（TIMEOUT 模式）
+    client2
+        .send_array(&["CLIENT", "UNBLOCK", &client1_id.to_string(), "TIMEOUT"])
+        .await;
+    let line = client2.read_line().await;
+    assert!(line.starts_with(":"), "Expected integer response, got: {}", line);
+
+    // 等待 client1 的 BLPOP 返回
+    let (mut client1, blpop_result) = blpop_handle.await.unwrap();
+    // TIMEOUT 模式应该返回 null array
+    assert_eq!(blpop_result, "*-1\r\n", "Expected null array for TIMEOUT unblock");
+
+    // 验证 client1 仍然可以正常工作
+    client1.send_array(&["PING"]).await;
+    let line = client1.read_line().await;
+    assert_eq!(line, "+PONG\r\n");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn client_unblock_error_mode() {
+    let _guard = set_env("REDUST_DISABLE_PERSISTENCE", "1");
+
+    let (addr, shutdown, handle) = spawn_server().await;
+    let mut client1 = TestClient::connect(addr).await;
+    let mut client2 = TestClient::connect(addr).await;
+
+    // client1: 获取自己的 client_id
+    client1.send_array(&["CLIENT", "ID"]).await;
+    let line = client1.read_line().await;
+    let client1_id: i64 = line.trim_start_matches(':').trim().parse().unwrap();
+
+    // client1: 发起阻塞命令 BLPOP（超时 10 秒）
+    let blpop_handle = tokio::spawn(async move {
+        client1.send_array(&["BLPOP", "nonexistent_key", "10"]).await;
+        let line = client1.read_line().await;
+        (client1, line)
+    });
+
+    // 等待一小段时间确保 client1 进入阻塞状态
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // client2: 使用 CLIENT UNBLOCK 解除 client1 的阻塞（ERROR 模式）
+    client2
+        .send_array(&["CLIENT", "UNBLOCK", &client1_id.to_string(), "ERROR"])
+        .await;
+    let line = client2.read_line().await;
+    assert!(line.starts_with(":"), "Expected integer response, got: {}", line);
+
+    // 等待 client1 的 BLPOP 返回
+    let (mut client1, blpop_result) = blpop_handle.await.unwrap();
+    // ERROR 模式应该返回错误
+    assert!(
+        blpop_result.starts_with("-UNBLOCKED"),
+        "Expected UNBLOCKED error, got: {}",
+        blpop_result
+    );
+
+    // 验证 client1 仍然可以正常工作
+    client1.send_array(&["PING"]).await;
+    let line = client1.read_line().await;
+    assert_eq!(line, "+PONG\r\n");
+
+    shutdown.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}

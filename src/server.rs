@@ -32,6 +32,20 @@ static TCP_KEEPALIVE_SECS: AtomicU64 = AtomicU64::new(300);
 // CLIENT PAUSE 截止时间（毫秒 Unix 时间戳），0 表示未暂停
 static CLIENT_PAUSE_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 
+/// CLIENT UNBLOCK 信号类型
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnblockType {
+    Timeout,
+    Error,
+}
+
+/// 阻塞客户端的 unblock 信号注册表
+/// key: client_id, value: UnblockType
+fn blocked_client_unblock() -> &'static DashMap<u64, UnblockType> {
+    static INSTANCE: std::sync::OnceLock<DashMap<u64, UnblockType>> = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(DashMap::new)
+}
+
 struct Metrics {
     start_time: Instant,
     connected_clients: AtomicUsize,
@@ -812,6 +826,7 @@ async fn handle_string_command(
     storage: &Storage,
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
     current_db: u8,
+    client_id: u64,
 ) -> io::Result<()> {
     match cmd {
         Command::Ping => {
@@ -1373,6 +1388,19 @@ async fn handle_string_command(
             let timeout_duration = block_millis.map(Duration::from_millis);
 
             loop {
+                // 检查是否被 CLIENT UNBLOCK 解除阻塞
+                if let Some((_, unblock_type)) = blocked_client_unblock().remove(&client_id) {
+                    match unblock_type {
+                        UnblockType::Timeout => {
+                            writer.write_all(b"*-1\r\n").await?;
+                        }
+                        UnblockType::Error => {
+                            respond_error(writer, "UNBLOCKED client unblocked via CLIENT UNBLOCK").await?;
+                        }
+                    }
+                    return Ok(());
+                }
+
                 match storage.xread(&physical_streams, count) {
                     Ok(items) => {
                         if items.is_empty() {
@@ -1557,6 +1585,19 @@ async fn handle_string_command(
             });
 
             loop {
+                // 检查是否被 CLIENT UNBLOCK 解除阻塞
+                if let Some((_, unblock_type)) = blocked_client_unblock().remove(&client_id) {
+                    match unblock_type {
+                        UnblockType::Timeout => {
+                            respond_null_array(writer).await?;
+                        }
+                        UnblockType::Error => {
+                            respond_error(writer, "UNBLOCKED client unblocked via CLIENT UNBLOCK").await?;
+                        }
+                    }
+                    return Ok(());
+                }
+
                 let mut all_results: Vec<(String, Vec<(crate::command::StreamId, Vec<(Vec<u8>, Vec<u8>)>)>)> = Vec::new();
 
                 for (key, id) in &streams {
@@ -2493,6 +2534,7 @@ async fn handle_list_command(
     storage: &Storage,
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
     current_db: u8,
+    client_id: u64,
 ) -> io::Result<()> {
     match cmd {
         Command::Lpush { key, values } => {
@@ -2717,6 +2759,19 @@ async fn handle_list_command(
             let start = std::time::Instant::now();
 
             loop {
+                // 检查是否被 CLIENT UNBLOCK 解除阻塞
+                if let Some((_, unblock_type)) = blocked_client_unblock().remove(&client_id) {
+                    match unblock_type {
+                        UnblockType::Timeout => {
+                            writer.write_all(b"*-1\r\n").await?;
+                        }
+                        UnblockType::Error => {
+                            respond_error(writer, "UNBLOCKED client unblocked via CLIENT UNBLOCK").await?;
+                        }
+                    }
+                    return Ok(());
+                }
+
                 // 检查是否超时
                 if let Some(timeout_dur) = timeout_duration {
                     if start.elapsed() >= timeout_dur {
@@ -2798,6 +2853,19 @@ async fn handle_list_command(
             let start = std::time::Instant::now();
 
             loop {
+                // 检查是否被 CLIENT UNBLOCK 解除阻塞
+                if let Some((_, unblock_type)) = blocked_client_unblock().remove(&client_id) {
+                    match unblock_type {
+                        UnblockType::Timeout => {
+                            writer.write_all(b"*-1\r\n").await?;
+                        }
+                        UnblockType::Error => {
+                            respond_error(writer, "UNBLOCKED client unblocked via CLIENT UNBLOCK").await?;
+                        }
+                    }
+                    return Ok(());
+                }
+
                 if let Some(timeout_dur) = timeout_duration {
                     if start.elapsed() >= timeout_dur {
                         // BLPOP/BRPOP 超时返回 null array (*-1)，而非 null bulk ($-1)
@@ -4751,7 +4819,7 @@ async fn execute_command_in_transaction(
         | Command::Quit
         | Command::Time
         | Command::Randomkey => {
-            handle_string_command(cmd, storage, writer, current_db).await?;
+            handle_string_command(cmd, storage, writer, current_db, 0).await?;
         }
 
         // list 命令
@@ -4768,7 +4836,7 @@ async fn execute_command_in_transaction(
         | Command::Linsert { .. }
         | Command::Rpoplpush { .. }
         | Command::Lpos { .. } => {
-            handle_list_command(cmd, storage, writer, current_db).await?;
+            handle_list_command(cmd, storage, writer, current_db, 0).await?;
         }
 
         // 阻塞命令在事务中不支持
@@ -4780,7 +4848,7 @@ async fn execute_command_in_transaction(
             if block_millis.is_some() {
                 respond_error(writer, "ERR XREAD BLOCK inside MULTI is not allowed").await?;
             } else {
-                handle_string_command(cmd, storage, writer, current_db).await?;
+                handle_string_command(cmd, storage, writer, current_db, 0).await?;
             }
         }
 
@@ -4788,7 +4856,7 @@ async fn execute_command_in_transaction(
             if block_millis.is_some() {
                 respond_error(writer, "ERR XREADGROUP BLOCK inside MULTI is not allowed").await?;
             } else {
-                handle_string_command(cmd, storage, writer, current_db).await?;
+                handle_string_command(cmd, storage, writer, current_db, 0).await?;
             }
         }
 
@@ -4855,7 +4923,7 @@ async fn execute_command_in_transaction(
 
         // HyperLogLog 命令
         Command::Pfadd { .. } | Command::Pfcount { .. } | Command::Pfmerge { .. } => {
-            handle_string_command(cmd, storage, writer, current_db).await?;
+            handle_string_command(cmd, storage, writer, current_db, 0).await?;
         }
 
         // key meta 命令
@@ -5330,10 +5398,10 @@ async fn handle_connection(
             | Command::Time
             | Command::Randomkey => {
                 // Quit 需要在外面单独处理连接关闭语义
-                handle_string_command(cmd, &storage, &mut write_half, current_db).await?;
+                handle_string_command(cmd, &storage, &mut write_half, current_db, client_id).await?;
             }
             Command::Quit => {
-                handle_string_command(cmd, &storage, &mut write_half, current_db).await?;
+                handle_string_command(cmd, &storage, &mut write_half, current_db, client_id).await?;
                 break;
             }
 
@@ -5353,7 +5421,7 @@ async fn handle_connection(
             | Command::Blpop { .. }
             | Command::Brpop { .. }
             | Command::Lpos { .. } => {
-                handle_list_command(cmd, &storage, &mut write_half, current_db).await?;
+                handle_list_command(cmd, &storage, &mut write_half, current_db, client_id).await?;
             }
 
             // set 命令
@@ -5420,7 +5488,7 @@ async fn handle_connection(
 
             // HyperLogLog 命令
             Command::Pfadd { .. } | Command::Pfcount { .. } | Command::Pfmerge { .. } => {
-                handle_string_command(cmd, &storage, &mut write_half, current_db).await?;
+                handle_string_command(cmd, &storage, &mut write_half, current_db, client_id).await?;
             }
 
             // 持久化控制
@@ -5915,6 +5983,19 @@ async fn handle_connection(
             Command::ClientUnpause => {
                 CLIENT_PAUSE_UNTIL_MS.store(0, Ordering::Relaxed);
                 respond_simple_string(&mut write_half, "OK").await?;
+            }
+            Command::ClientUnblock { client_id: target_id, unblock_error } => {
+                let unblock_type = if unblock_error {
+                    UnblockType::Error
+                } else {
+                    UnblockType::Timeout
+                };
+                // 向目标客户端发送 unblock 信号
+                blocked_client_unblock().insert(target_id, unblock_type);
+                // 返回 1 表示信号已发送（实际是否解除阻塞取决于目标客户端是否在阻塞状态）
+                // Redis 行为：如果客户端不存在或未阻塞，返回 0；否则返回 1
+                // 我们简化处理：总是返回 1，因为我们无法确定客户端是否真的在阻塞
+                respond_integer(&mut write_half, 1).await?;
             }
             Command::SlowlogGet { count } => {
                 let entries = slowlog.get(count);

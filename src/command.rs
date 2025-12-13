@@ -856,6 +856,10 @@ pub enum Command {
         timeout_ms: u64,
     },
     ClientUnpause,
+    ClientUnblock {
+        client_id: u64,
+        unblock_error: bool,
+    },
     SlowlogGet {
         count: Option<usize>,
     },
@@ -5485,6 +5489,37 @@ pub async fn read_command(
                     Command::ClientPause { timeout_ms }
                 }
                 "UNPAUSE" => Command::ClientUnpause,
+                "UNBLOCK" => {
+                    let Some(id_bytes) = iter.next() else {
+                        return Ok(Some(err_wrong_args("client|unblock")));
+                    };
+                    let client_id = match parse_i64_from_bulk(id_bytes) {
+                        Ok(v) if v >= 0 => v as u64,
+                        _ => {
+                            return Ok(Some(Command::Error(
+                                "ERR value is not an integer or out of range".to_string(),
+                            )))
+                        }
+                    };
+                    let unblock_error = if let Some(opt_bytes) = iter.next() {
+                        let opt = match parse_bulk_string(opt_bytes) {
+                            Ok(s) => s.to_uppercase(),
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        match opt.as_str() {
+                            "TIMEOUT" => false,
+                            "ERROR" => true,
+                            _ => {
+                                return Ok(Some(Command::Error(
+                                    "ERR syntax error".to_string(),
+                                )))
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                    Command::ClientUnblock { client_id, unblock_error }
+                }
                 _ => Command::Error(format!(
                     "ERR Unknown subcommand or wrong number of arguments for 'client|{}'",
                     subcmd.to_lowercase()
