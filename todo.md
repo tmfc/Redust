@@ -15,8 +15,10 @@
   - [ ] 命令权限控制
   - [ ] 频道权限控制
 
-- [ ] **TLS 支持**
-  - [ ] 内建 TLS 或 stunnel 方案预研
+- [x] **TLS 支持**
+  - [x] 内建 TLS（tokio-rustls）
+  - [x] 命令行参数 --tls-cert / --tls-key
+  - [x] 环境变量 REDUST_TLS_CERT / REDUST_TLS_KEY
 
 ---
 

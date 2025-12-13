@@ -72,6 +72,37 @@ CLI 参数（在 `cargo run -- ...` 之后传入）：
 
 - `--bind <addr>`：覆盖 `REDUST_ADDR`。
 - `--maxmemory-bytes <value>`：覆盖 `REDUST_MAXMEMORY_BYTES`，支持与环境变量相同的写法；淘汰策略可通过 `REDUST_MAXMEMORY_POLICY` 或运行时 `CONFIG SET maxmemory-policy` 设置；采样大小可通过 `REDUST_MAXMEMORY_SAMPLES` 或 `CONFIG SET maxmemory-samples` 调整。
+- `--tls-cert <path>`：TLS 证书文件路径（PEM 格式）。
+- `--tls-key <path>`：TLS 私钥文件路径（PEM 格式）。
+
+### TLS 支持
+
+Redust 支持内建 TLS 加密连接。启用 TLS 需要同时提供证书和私钥：
+
+```bash
+# 使用命令行参数
+cargo run -- --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
+
+# 或使用环境变量
+REDUST_TLS_CERT=/path/to/cert.pem REDUST_TLS_KEY=/path/to/key.pem cargo run
+```
+
+生成自签名证书用于测试：
+
+```bash
+# 安装 rustls-cert-gen（可选）
+cargo install --locked rustls-cert-gen
+rustls-cert-gen --output certs/ --san localhost
+
+# 或使用 openssl
+openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=localhost"
+```
+
+使用 `redis-cli` 连接 TLS 服务器：
+
+```bash
+redis-cli --tls --cert cert.pem --key key.pem --cacert cert.pem -p 6379
+```
 
 ## 协议示例
 

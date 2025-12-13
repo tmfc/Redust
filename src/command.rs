@@ -1,5 +1,5 @@
 use std::fmt;
-use tokio::io::{self, BufReader};
+use tokio::io::{self, AsyncRead, BufReader};
 
 use crate::resp::read_resp_array;
 
@@ -1173,8 +1173,8 @@ fn parse_zset_options(
     Ok((weights, aggregate, withscores))
 }
 
-pub async fn read_command(
-    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+pub async fn read_command<R: AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
 ) -> Result<Option<Command>, CommandError> {
     let Some(parts) = read_resp_array(reader).await? else {
         return Ok(None);

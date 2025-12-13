@@ -301,7 +301,11 @@
 - [x] CLIENT ID - 获取当前连接 ID
 - [x] CLIENT SETNAME - 设置连接名称
 - [x] CLIENT GETNAME - 获取连接名称
-- [ ] CLIENT PAUSE / UNBLOCK / KILL / REPLY
+- [x] CLIENT PAUSE - 暂停客户端命令处理
+- [x] CLIENT UNPAUSE - 恢复客户端命令处理
+- [x] CLIENT UNBLOCK - 解除阻塞客户端（支持 TIMEOUT/ERROR 模式）
+  - **注意**：与 Redis 行为差异 - 本实现总是返回 1（信号已发送），而 Redis 在目标客户端不存在或未阻塞时返回 0
+- [ ] CLIENT KILL / REPLY
 - [ ] HELLO
 - [ ] SELECT
 - [ ] INFO

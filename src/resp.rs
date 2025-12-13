@@ -1,12 +1,12 @@
-use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{self, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 // Redis's default max bulk string size is 512MB.
 const MAX_BULK_STRING_SIZE: usize = 512 * 1024 * 1024;
 // We'll also limit array sizes to something reasonable, e.g., 1MB elements for an array.
 const MAX_ARRAY_SIZE: usize = 1024 * 1024;
 
-pub async fn read_resp_array(
-    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+pub async fn read_resp_array<R: AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
 ) -> io::Result<Option<Vec<Vec<u8>>>> {
     let mut header = String::new();
     let read = reader.read_line(&mut header).await?;
@@ -90,15 +90,15 @@ pub async fn read_resp_array(
     Ok(Some(parts))
 }
 
-pub async fn respond_bulk_string(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+pub async fn respond_bulk_string<W: AsyncWrite + Unpin>(
+    writer: &mut W,
     value: &str,
 ) -> io::Result<()> {
     respond_bulk_bytes(writer, value.as_bytes()).await
 }
 
-pub async fn respond_bulk_bytes(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+pub async fn respond_bulk_bytes<W: AsyncWrite + Unpin>(
+    writer: &mut W,
     value: &[u8],
 ) -> io::Result<()> {
     let header = format!("${}\r\n", value.len());
@@ -107,35 +107,35 @@ pub async fn respond_bulk_bytes(
     writer.write_all(b"\r\n").await
 }
 
-pub async fn respond_simple_string(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+pub async fn respond_simple_string<W: AsyncWrite + Unpin>(
+    writer: &mut W,
     value: &str,
 ) -> io::Result<()> {
     let response = format!("+{}\r\n", value);
     writer.write_all(response.as_bytes()).await
 }
 
-pub async fn respond_error(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+pub async fn respond_error<W: AsyncWrite + Unpin>(
+    writer: &mut W,
     message: &str,
 ) -> io::Result<()> {
     let response = format!("-{}\r\n", message);
     writer.write_all(response.as_bytes()).await
 }
 
-pub async fn respond_integer(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+pub async fn respond_integer<W: AsyncWrite + Unpin>(
+    writer: &mut W,
     value: i64,
 ) -> io::Result<()> {
     let response = format!(":{}\r\n", value);
     writer.write_all(response.as_bytes()).await
 }
 
-pub async fn respond_null_bulk(writer: &mut tokio::net::tcp::OwnedWriteHalf) -> io::Result<()> {
+pub async fn respond_null_bulk<W: AsyncWrite + Unpin>(writer: &mut W) -> io::Result<()> {
     writer.write_all(b"$-1\r\n").await
 }
 
-pub async fn respond_null_array(writer: &mut tokio::net::tcp::OwnedWriteHalf) -> io::Result<()> {
+pub async fn respond_null_array<W: AsyncWrite + Unpin>(writer: &mut W) -> io::Result<()> {
     writer.write_all(b"*-1\r\n").await
 }
 

@@ -1,8 +1,10 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::env;
+use std::fs::File;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
+use std::io::BufReader as StdBufReader;
 use std::sync::{
     atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
     Arc,
@@ -10,12 +12,17 @@ use std::sync::{
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
-use tokio::io::{self, AsyncWriteExt, BufReader};
+use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{sleep, Duration};
 
-use log::{error, info};
+use log::{error, info, warn};
+
+use rustls_pemfile::{certs, private_key};
+use tokio_rustls::rustls::pki_types::CertificateDer;
+use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::TlsAcceptor;
 
 use crate::command::{read_command, Command, CommandError, GeoUnit, StreamReadId};
 use crate::resp::{
@@ -44,6 +51,37 @@ pub enum UnblockType {
 fn blocked_client_unblock() -> &'static DashMap<u64, UnblockType> {
     static INSTANCE: std::sync::OnceLock<DashMap<u64, UnblockType>> = std::sync::OnceLock::new();
     INSTANCE.get_or_init(DashMap::new)
+}
+
+/// 加载 TLS 证书和私钥
+fn load_tls_config(cert_path: &str, key_path: &str) -> io::Result<ServerConfig> {
+    let cert_file = File::open(cert_path).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Failed to open cert file {}: {}", cert_path, e),
+        )
+    })?;
+    let key_file = File::open(key_path).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Failed to open key file {}: {}", key_path, e),
+        )
+    })?;
+
+    let certs: Vec<CertificateDer<'static>> = certs(&mut StdBufReader::new(cert_file))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid cert: {}", e)))?;
+
+    let key = private_key(&mut StdBufReader::new(key_file))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid key: {}", e)))?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "No private key found"))?;
+
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("TLS config error: {}", e)))?;
+
+    Ok(config)
 }
 
 struct Metrics {
@@ -725,8 +763,8 @@ enum PubSubOverflowStrategy {
     Disconnect,
 }
 
-async fn write_subscribe_event(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+async fn write_subscribe_event<W: AsyncWrite + Unpin>(
+    writer: &mut W,
     kind: &str,
     channel: &str,
     count: usize,
@@ -746,8 +784,8 @@ async fn write_subscribe_event(
         .await
 }
 
-async fn write_message_event(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+async fn write_message_event<W: AsyncWrite + Unpin>(
+    writer: &mut W,
     channel: &str,
     payload: &[u8],
 ) -> io::Result<()> {
@@ -768,8 +806,8 @@ async fn write_message_event(
     writer.write_all(b"\r\n").await
 }
 
-async fn write_pmessage_event(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+async fn write_pmessage_event<W: AsyncWrite + Unpin>(
+    writer: &mut W,
     pattern: &str,
     channel: &str,
     payload: &[u8],
@@ -793,8 +831,8 @@ async fn write_pmessage_event(
     writer.write_all(b"\r\n").await
 }
 
-async fn write_pub_message_event(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+async fn write_pub_message_event<W: AsyncWrite + Unpin>(
+    writer: &mut W,
     message: &PubMessage,
 ) -> io::Result<()> {
     match message {
@@ -810,8 +848,8 @@ async fn write_pub_message_event(
     }
 }
 
-async fn write_pong_event(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+async fn write_pong_event<W: AsyncWrite + Unpin>(
+    writer: &mut W,
     payload: &[u8],
 ) -> io::Result<()> {
     writer
@@ -821,10 +859,10 @@ async fn write_pong_event(
     writer.write_all(b"\r\n").await
 }
 
-async fn handle_string_command(
+async fn handle_string_command<W: AsyncWrite + Unpin>(
     cmd: Command,
     storage: &Storage,
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    writer: &mut W,
     current_db: u8,
     client_id: u64,
 ) -> io::Result<()> {
@@ -2389,10 +2427,10 @@ async fn handle_string_command(
     Ok(())
 }
 
-async fn handle_meta_command(
+async fn handle_meta_command<W: AsyncWrite + Unpin>(
     cmd: Command,
     storage: &Storage,
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    writer: &mut W,
     current_db: u8,
 ) -> io::Result<()> {
     match cmd {
@@ -2529,10 +2567,10 @@ async fn handle_meta_command(
     Ok(())
 }
 
-async fn handle_list_command(
+async fn handle_list_command<W: AsyncWrite + Unpin>(
     cmd: Command,
     storage: &Storage,
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    writer: &mut W,
     current_db: u8,
     client_id: u64,
 ) -> io::Result<()> {
@@ -3130,10 +3168,10 @@ async fn handle_list_command(
     Ok(())
 }
 
-async fn handle_set_command(
+async fn handle_set_command<W: AsyncWrite + Unpin>(
     cmd: Command,
     storage: &Storage,
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    writer: &mut W,
     current_db: u8,
 ) -> io::Result<()> {
     match cmd {
@@ -3506,10 +3544,10 @@ async fn handle_set_command(
     Ok(())
 }
 
-async fn handle_hash_command(
+async fn handle_hash_command<W: AsyncWrite + Unpin>(
     cmd: Command,
     storage: &Storage,
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    writer: &mut W,
     current_db: u8,
 ) -> io::Result<()> {
     match cmd {
@@ -3899,10 +3937,10 @@ fn zlex_bound_to_params(bound: &crate::command::ZLexBound) -> (String, bool, boo
     }
 }
 
-async fn handle_zset_command(
+async fn handle_zset_command<W: AsyncWrite + Unpin>(
     cmd: Command,
     storage: &Storage,
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    writer: &mut W,
     current_db: u8,
 ) -> io::Result<()> {
     // helper to format floating scores similar to Redis (trim trailing zeros)
@@ -4452,10 +4490,10 @@ async fn handle_zset_command(
     Ok(())
 }
 
-async fn handle_persistence_command(
+async fn handle_persistence_command<W: AsyncWrite + Unpin>(
     cmd: Command,
     storage: &Storage,
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    writer: &mut W,
     persistence: Arc<PersistenceState>,
 ) -> io::Result<()> {
     if !persistence.enabled {
@@ -4507,10 +4545,10 @@ async fn handle_persistence_command(
     Ok(())
 }
 
-async fn handle_key_meta_command(
+async fn handle_key_meta_command<W: AsyncWrite + Unpin>(
     cmd: Command,
     storage: &Storage,
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    writer: &mut W,
     current_db: u8,
 ) -> io::Result<()> {
     match cmd {
@@ -4608,10 +4646,10 @@ async fn handle_key_meta_command(
     Ok(())
 }
 
-async fn handle_info_command(
+async fn handle_info_command<W: AsyncWrite + Unpin>(
     storage: &Storage,
     metrics: &Metrics,
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    writer: &mut W,
 ) -> io::Result<()> {
     let uptime = Instant::now().duration_since(metrics.start_time).as_secs();
     let connected = metrics.connected_clients.load(Ordering::Relaxed);
@@ -4754,10 +4792,10 @@ async fn run_metrics_exporter(
 }
 
 /// 在事务中执行单个命令，返回结果写入 writer
-async fn execute_command_in_transaction(
+async fn execute_command_in_transaction<W: AsyncWrite + Unpin>(
     cmd: Command,
     storage: &Storage,
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    writer: &mut W,
     current_db: u8,
     script_cache: &ScriptCache,
 ) -> io::Result<()> {
@@ -5056,14 +5094,44 @@ async fn handle_connection(
     persistence: Arc<PersistenceState>,
     script_cache: Arc<ScriptCache>,
     slowlog: Arc<SlowLog>,
+    client_addr: String,
 ) -> io::Result<()> {
-    let peer_addr = stream.peer_addr().ok();
-    let client_addr = peer_addr.map(|a| a.to_string()).unwrap_or_default();
-    info!("[conn] new connection from {:?}", peer_addr);
+    let (read_half, write_half) = stream.into_split();
+    handle_connection_impl(
+        read_half,
+        write_half,
+        storage,
+        metrics,
+        pubsub,
+        overflow_strategy,
+        persistence,
+        script_cache,
+        slowlog,
+        client_addr,
+    )
+    .await
+}
+
+async fn handle_connection_impl<R, W>(
+    read_half: R,
+    mut write_half: W,
+    storage: Storage,
+    metrics: Arc<Metrics>,
+    pubsub: PubSubHub,
+    overflow_strategy: PubSubOverflowStrategy,
+    persistence: Arc<PersistenceState>,
+    script_cache: Arc<ScriptCache>,
+    slowlog: Arc<SlowLog>,
+    client_addr: String,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
+    info!("[conn] new connection from {}", client_addr);
 
     metrics.connected_clients.fetch_add(1, Ordering::Relaxed);
 
-    let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut current_db: u8 = 0;
 
@@ -5947,9 +6015,7 @@ async fn handle_connection(
                 let info = format!(
                     "id={} addr={} name={} db={}\n",
                     client_id,
-                    peer_addr
-                        .map(|a| a.to_string())
-                        .unwrap_or_else(|| "unknown".to_string()),
+                    if client_addr.is_empty() { "unknown" } else { &client_addr },
                     client_name,
                     current_db
                 );
@@ -6097,6 +6163,15 @@ async fn handle_connection(
 
 pub async fn serve(
     listener: TcpListener,
+    shutdown: impl Future<Output = ()> + Send,
+) -> io::Result<()> {
+    serve_impl(listener, None, shutdown).await
+}
+
+/// 统一的服务实现，支持可选的 TLS
+async fn serve_impl(
+    listener: TcpListener,
+    tls_acceptor: Option<TlsAcceptor>,
     shutdown: impl Future<Output = ()> + Send,
 ) -> io::Result<()> {
     // 初始化 Lua 脚本资源限制
@@ -6294,15 +6369,47 @@ pub async fn serve(
                     },
                     Err(_) => PubSubOverflowStrategy::Drop,
                 };
-                info!("Accepted connection from {}", addr);
                 let persistence_clone = persistence.clone();
                 let script_cache_clone = script_cache.clone();
                 let slowlog_clone = slowlog.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = handle_connection(stream, storage, metrics, pubsub, overflow_strategy, persistence_clone.clone(), script_cache_clone, slowlog_clone).await {
-                        error!("Connection error: {}", err);
-                    }
-                });
+                let client_addr = addr.to_string();
+
+                // 根据是否有 TLS acceptor 选择处理方式
+                if let Some(ref acceptor) = tls_acceptor {
+                    let acceptor = acceptor.clone();
+                    tokio::spawn(async move {
+                        match acceptor.accept(stream).await {
+                            Ok(tls_stream) => {
+                                info!("Accepted TLS connection from {}", client_addr);
+                                let (read_half, write_half) = tokio::io::split(tls_stream);
+                                if let Err(err) = handle_connection_impl(
+                                    read_half,
+                                    write_half,
+                                    storage,
+                                    metrics,
+                                    pubsub,
+                                    overflow_strategy,
+                                    persistence_clone,
+                                    script_cache_clone,
+                                    slowlog_clone,
+                                    client_addr.clone(),
+                                ).await {
+                                    error!("TLS connection error: {}", err);
+                                }
+                            }
+                            Err(e) => {
+                                warn!("TLS handshake failed from {}: {}", client_addr, e);
+                            }
+                        }
+                    });
+                } else {
+                    info!("Accepted connection from {}", addr);
+                    tokio::spawn(async move {
+                        if let Err(err) = handle_connection(stream, storage, metrics, pubsub, overflow_strategy, persistence_clone, script_cache_clone, slowlog_clone, client_addr).await {
+                            error!("Connection error: {}", err);
+                        }
+                    });
+                }
             }
             _ = &mut shutdown => {
                 break;
@@ -6338,6 +6445,24 @@ pub async fn run_server(
     info!("Redust listening on {}", local_addr);
 
     serve(listener, shutdown).await
+}
+
+/// 启动带 TLS 的服务器
+pub async fn run_server_tls(
+    bind_addr: &str,
+    cert_path: &str,
+    key_path: &str,
+    shutdown: impl Future<Output = ()> + Send,
+) -> io::Result<()> {
+    let tls_config = load_tls_config(cert_path, key_path)?;
+    let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+
+    let listener = TcpListener::bind(bind_addr).await?;
+    let local_addr = listener.local_addr()?;
+
+    info!("Redust TLS listening on {}", local_addr);
+
+    serve_impl(listener, Some(acceptor), shutdown).await
 }
 
 // ============================================================================
