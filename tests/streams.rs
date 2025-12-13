@@ -1003,3 +1003,241 @@ async fn test_xpending_nogroup_error() {
 
     let _ = shutdown.send(());
 }
+
+// ==================== XCLAIM Tests ====================
+
+#[tokio::test]
+async fn test_xclaim_basic() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // Create stream and group
+    client
+        .send_command(&["XADD", "mystream", "1-0", "f", "v1"])
+        .await;
+    let _ = client.read_bulk_string().await.unwrap();
+
+    client
+        .send_command(&["XADD", "mystream", "2-0", "f", "v2"])
+        .await;
+    let _ = client.read_bulk_string().await.unwrap();
+
+    client
+        .send_command(&["XGROUP", "CREATE", "mystream", "mygroup", "0-0"])
+        .await;
+    let _ = client.read_simple_string().await;
+
+    // Consumer1 reads messages (adds to PEL)
+    client
+        .send_command(&[
+            "XREADGROUP",
+            "GROUP",
+            "mygroup",
+            "consumer1",
+            "STREAMS",
+            "mystream",
+            ">",
+        ])
+        .await;
+    // Skip response
+    let _ = client.read_array_len().await;
+    let _ = client.read_array_len().await;
+    let _ = client.read_bulk_string().await;
+    let _ = client.read_array_len().await;
+    for _ in 0..2 {
+        let _ = client.read_array_len().await;
+        let _ = client.read_bulk_string().await;
+        let _ = client.read_array_len().await;
+        let _ = client.read_bulk_string().await;
+        let _ = client.read_bulk_string().await;
+    }
+
+    // Wait a bit for idle time
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    // XCLAIM message from consumer1 to consumer2 with min-idle-time 0
+    client
+        .send_command(&["XCLAIM", "mystream", "mygroup", "consumer2", "0", "1-0"])
+        .await;
+    let arr_len = client.read_array_len().await;
+    assert_eq!(arr_len, 1);
+    // Read entry: [id, [fields...]]
+    let _ = client.read_array_len().await;
+    let id = client.read_bulk_string().await.unwrap();
+    assert_eq!(id, "1-0");
+    let fields_len = client.read_array_len().await;
+    assert_eq!(fields_len, 2);
+    let _ = client.read_bulk_string().await; // field
+    let _ = client.read_bulk_string().await; // value
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_xclaim_min_idle_time() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // Create stream and group
+    client
+        .send_command(&["XADD", "mystream", "1-0", "f", "v"])
+        .await;
+    let _ = client.read_bulk_string().await.unwrap();
+
+    client
+        .send_command(&["XGROUP", "CREATE", "mystream", "mygroup", "0-0"])
+        .await;
+    let _ = client.read_simple_string().await;
+
+    // Consumer1 reads message
+    client
+        .send_command(&[
+            "XREADGROUP",
+            "GROUP",
+            "mygroup",
+            "consumer1",
+            "STREAMS",
+            "mystream",
+            ">",
+        ])
+        .await;
+    // Skip response
+    let _ = client.read_array_len().await;
+    let _ = client.read_array_len().await;
+    let _ = client.read_bulk_string().await;
+    let _ = client.read_array_len().await;
+    let _ = client.read_array_len().await;
+    let _ = client.read_bulk_string().await;
+    let _ = client.read_array_len().await;
+    let _ = client.read_bulk_string().await;
+    let _ = client.read_bulk_string().await;
+
+    // XCLAIM with very high min-idle-time should return empty
+    client
+        .send_command(&["XCLAIM", "mystream", "mygroup", "consumer2", "999999999", "1-0"])
+        .await;
+    let arr_len = client.read_array_len().await;
+    assert_eq!(arr_len, 0);
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_xclaim_justid() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // Create stream and group
+    client
+        .send_command(&["XADD", "mystream", "1-0", "f", "v"])
+        .await;
+    let _ = client.read_bulk_string().await.unwrap();
+
+    client
+        .send_command(&["XGROUP", "CREATE", "mystream", "mygroup", "0-0"])
+        .await;
+    let _ = client.read_simple_string().await;
+
+    // Consumer1 reads message
+    client
+        .send_command(&[
+            "XREADGROUP",
+            "GROUP",
+            "mygroup",
+            "consumer1",
+            "STREAMS",
+            "mystream",
+            ">",
+        ])
+        .await;
+    // Skip response
+    let _ = client.read_array_len().await;
+    let _ = client.read_array_len().await;
+    let _ = client.read_bulk_string().await;
+    let _ = client.read_array_len().await;
+    let _ = client.read_array_len().await;
+    let _ = client.read_bulk_string().await;
+    let _ = client.read_array_len().await;
+    let _ = client.read_bulk_string().await;
+    let _ = client.read_bulk_string().await;
+
+    // XCLAIM with JUSTID should return only IDs
+    client
+        .send_command(&["XCLAIM", "mystream", "mygroup", "consumer2", "0", "1-0", "JUSTID"])
+        .await;
+    let arr_len = client.read_array_len().await;
+    assert_eq!(arr_len, 1);
+    let id = client.read_bulk_string().await.unwrap();
+    assert_eq!(id, "1-0");
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_xclaim_force() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // Create stream and group
+    client
+        .send_command(&["XADD", "mystream", "1-0", "f", "v"])
+        .await;
+    let _ = client.read_bulk_string().await.unwrap();
+
+    client
+        .send_command(&["XGROUP", "CREATE", "mystream", "mygroup", "0-0"])
+        .await;
+    let _ = client.read_simple_string().await;
+
+    // XCLAIM without FORCE on message not in PEL should return empty
+    client
+        .send_command(&["XCLAIM", "mystream", "mygroup", "consumer1", "0", "1-0"])
+        .await;
+    let arr_len = client.read_array_len().await;
+    assert_eq!(arr_len, 0);
+
+    // XCLAIM with FORCE should create PEL entry
+    client
+        .send_command(&["XCLAIM", "mystream", "mygroup", "consumer1", "0", "1-0", "FORCE"])
+        .await;
+    let arr_len = client.read_array_len().await;
+    assert_eq!(arr_len, 1);
+    // Skip entry content
+    let _ = client.read_array_len().await;
+    let id = client.read_bulk_string().await.unwrap();
+    assert_eq!(id, "1-0");
+    let _ = client.read_array_len().await;
+    let _ = client.read_bulk_string().await;
+    let _ = client.read_bulk_string().await;
+
+    // Verify message is now in PEL via XPENDING
+    client
+        .send_command(&["XPENDING", "mystream", "mygroup"])
+        .await;
+    let _ = client.read_array_len().await;
+    let total = client.read_integer().await;
+    assert_eq!(total, 1);
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_xclaim_nogroup_error() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // Create stream without group
+    client
+        .send_command(&["XADD", "mystream", "*", "f", "v"])
+        .await;
+    let _ = client.read_bulk_string().await.unwrap();
+
+    // XCLAIM on non-existent group should fail
+    client
+        .send_command(&["XCLAIM", "mystream", "nogroup", "consumer", "0", "1-0"])
+        .await;
+    let err = client.read_error().await;
+    assert!(err.contains("NOGROUP"));
+
+    let _ = shutdown.send(());
+}

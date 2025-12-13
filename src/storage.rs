@@ -33,6 +33,16 @@ pub enum RdbLoadMode {
     Tolerant,
 }
 
+/// Result of a GEOSEARCH query
+#[derive(Debug, Clone)]
+pub struct GeoSearchResult {
+    pub member: String,
+    pub dist: f64,    // distance in meters
+    pub hash: u64,    // raw geohash
+    pub lon: f64,
+    pub lat: f64,
+}
+
 impl RdbLoadMode {
     pub fn from_str(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
@@ -891,6 +901,139 @@ impl Storage {
 
         self.touch_key(key);
         Ok(Some((cg.pending.len(), min_id, max_id, consumers)))
+    }
+
+    /// XCLAIM: Transfer ownership of pending messages to a new consumer
+    /// Returns the claimed messages (id, fields) or just ids if justid=true
+    /// min_idle_time: only claim messages idle for at least this many milliseconds
+    /// idle_ms: set the new idle time (None = reset to 0)
+    /// retry_count: set the retry count (None = increment by 1)
+    /// force: create PEL entry even if message not in PEL (but must exist in stream)
+    /// justid: return only IDs
+    #[allow(clippy::too_many_arguments)]
+    pub fn xclaim(
+        &self,
+        key: &str,
+        group: &str,
+        consumer: &str,
+        min_idle_time: u64,
+        ids: &[StreamId],
+        idle_ms: Option<u64>,
+        retry_count: Option<u64>,
+        force: bool,
+        justid: bool,
+    ) -> Result<Vec<(StreamId, Option<Vec<(ByteString, ByteString)>>)>, StreamError> {
+        let now = Instant::now();
+        self.remove_if_expired(key, now);
+
+        let Some(mut entry) = self.data.get_mut(key) else {
+            return Err(StreamError::NoSuchKey);
+        };
+        let StorageValue::Stream { value, .. } = entry.value_mut() else {
+            return Err(StreamError::WrongType);
+        };
+
+        let Some(cg) = value.groups.get_mut(group) else {
+            return Err(StreamError::NoSuchGroup);
+        };
+
+        let now_ms = Self::now_millis();
+        let mut result = Vec::new();
+
+        // Ensure consumer exists (auto-create if not)
+        if !cg.consumers.contains_key(consumer) {
+            cg.consumers.insert(
+                consumer.to_string(),
+                ConsumerInfo {
+                    name: consumer.to_string(),
+                    seen_time: now_ms,
+                    pending_count: 0,
+                },
+            );
+        }
+
+        for id in ids {
+            // Find the message in PEL
+            let pel_pos = cg.pending.iter().position(|p| p.id == *id);
+
+            // Check if message exists in stream
+            let stream_entry = value.entries.iter().find(|e| e.id == *id);
+
+            match (pel_pos, stream_entry, force) {
+                // Message in PEL and stream - normal claim
+                (Some(pos), Some(se), _) => {
+                    let pe = &mut cg.pending[pos];
+                    let idle_time = now_ms.saturating_sub(pe.delivery_time);
+
+                    // Only claim if idle time >= min_idle_time
+                    if idle_time < min_idle_time {
+                        continue;
+                    }
+
+                    // Update old consumer's pending count
+                    if let Some(old_ci) = cg.consumers.get_mut(&pe.consumer) {
+                        old_ci.pending_count = old_ci.pending_count.saturating_sub(1);
+                    }
+
+                    // Transfer ownership
+                    pe.consumer = consumer.to_string();
+                    pe.delivery_time = now_ms.saturating_sub(idle_ms.unwrap_or(0));
+                    pe.delivery_count = retry_count.unwrap_or(pe.delivery_count + 1);
+
+                    // Update new consumer's pending count
+                    if let Some(new_ci) = cg.consumers.get_mut(consumer) {
+                        new_ci.pending_count += 1;
+                    }
+
+                    if justid {
+                        result.push((*id, None));
+                    } else {
+                        result.push((*id, Some(se.fields.clone())));
+                    }
+                }
+                // Message not in PEL but in stream, with FORCE - create PEL entry
+                (None, Some(se), true) => {
+                    // Create new PEL entry
+                    let new_pe = PendingEntry {
+                        id: *id,
+                        consumer: consumer.to_string(),
+                        delivery_time: now_ms.saturating_sub(idle_ms.unwrap_or(0)),
+                        delivery_count: retry_count.unwrap_or(1),
+                    };
+                    cg.pending.push(new_pe);
+                    // Keep PEL sorted by ID
+                    cg.pending.sort_by_key(|p| p.id);
+
+                    // Update consumer's pending count
+                    if let Some(ci) = cg.consumers.get_mut(consumer) {
+                        ci.pending_count += 1;
+                    }
+
+                    if justid {
+                        result.push((*id, None));
+                    } else {
+                        result.push((*id, Some(se.fields.clone())));
+                    }
+                }
+                // Message in PEL but not in stream - remove from PEL (Redis 7.0 behavior)
+                (Some(pos), None, _) => {
+                    let pe = cg.pending.remove(pos);
+                    if let Some(ci) = cg.consumers.get_mut(&pe.consumer) {
+                        ci.pending_count = ci.pending_count.saturating_sub(1);
+                    }
+                    // Don't add to result
+                }
+                // Message not in PEL and not FORCE, or not in stream - skip
+                _ => {}
+            }
+        }
+
+        if !result.is_empty() {
+            self.touch_key(key);
+            self.bump_key_version(key);
+        }
+
+        Ok(result)
     }
 
     pub fn flushdb(&self, db: u8) {
@@ -6249,6 +6392,89 @@ impl Storage {
             .into_iter()
             .map(|opt_score| opt_score.map(|s| geohash_to_string(s as u64)))
             .collect())
+    }
+
+    /// GEOSEARCH: Search for members within a radius or box
+    /// Returns: Vec of (member, distance_meters, hash, (lon, lat))
+    #[allow(clippy::too_many_arguments)]
+    pub fn geosearch(
+        &self,
+        key: &str,
+        center_lon: f64,
+        center_lat: f64,
+        radius_m: Option<f64>,        // BYRADIUS in meters
+        box_width_m: Option<f64>,     // BYBOX width in meters
+        box_height_m: Option<f64>,    // BYBOX height in meters
+        asc: bool,                    // true = ASC, false = DESC
+        count: Option<usize>,
+        _withcoord: bool,
+        _withdist: bool,
+        _withhash: bool,
+    ) -> Result<Vec<GeoSearchResult>, ()> {
+        let now = Instant::now();
+        self.remove_if_expired(key, now);
+
+        let Some(entry) = self.data.get(key) else {
+            return Ok(Vec::new()); // Key doesn't exist, return empty
+        };
+        let StorageValue::Zset { value, .. } = entry.value() else {
+            return Err(()); // Wrong type
+        };
+
+        let mut results: Vec<GeoSearchResult> = Vec::new();
+
+        // Iterate all members and filter by distance
+        for (member, score) in &value.by_member {
+            let (lon, lat) = geohash_decode(*score as u64);
+            let dist = haversine_distance(center_lat, center_lon, lat, lon);
+
+            let in_range = match (radius_m, box_width_m, box_height_m) {
+                (Some(r), _, _) => dist <= r,
+                (None, Some(w), Some(h)) => {
+                    // Box search: check if within width/height from center
+                    // Approximate: use haversine for lat/lon differences
+                    let lat_dist = haversine_distance(center_lat, center_lon, lat, center_lon);
+                    let lon_dist = haversine_distance(center_lat, center_lon, center_lat, lon);
+                    lat_dist <= h / 2.0 && lon_dist <= w / 2.0
+                }
+                _ => false,
+            };
+
+            if in_range {
+                results.push(GeoSearchResult {
+                    member: member.clone(),
+                    dist,
+                    hash: *score as u64,
+                    lon,
+                    lat,
+                });
+            }
+        }
+
+        // Sort by distance
+        if asc {
+            results.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(std::cmp::Ordering::Equal));
+        } else {
+            results.sort_by(|a, b| b.dist.partial_cmp(&a.dist).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
+        // Apply count limit
+        if let Some(c) = count {
+            results.truncate(c);
+        }
+
+        self.touch_key(key);
+        Ok(results)
+    }
+
+    /// Get position of a member for GEOSEARCH FROMMEMBER
+    pub fn geo_get_member_pos(&self, key: &str, member: &str) -> Result<Option<(f64, f64)>, ()> {
+        let scores = self.zmscore(key, &[member.to_string()])?;
+        Ok(scores
+            .into_iter()
+            .next()
+            .flatten()
+            .map(|s| geohash_decode(s as u64)))
     }
 }
 

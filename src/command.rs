@@ -298,6 +298,17 @@ pub enum Command {
         key: String,
         group: String,
     },
+    Xclaim {
+        key: String,
+        group: String,
+        consumer: String,
+        min_idle_time: u64,
+        ids: Vec<StreamId>,
+        idle_ms: Option<u64>,
+        retry_count: Option<u64>,
+        force: bool,
+        justid: bool,
+    },
     // Geo commands
     Geoadd {
         key: String,
@@ -316,6 +327,19 @@ pub enum Command {
     Geohash {
         key: String,
         members: Vec<String>,
+    },
+    Geosearch {
+        key: String,
+        from_member: Option<String>,
+        from_lonlat: Option<(f64, f64)>,
+        by_radius: Option<(f64, GeoUnit)>,
+        by_box: Option<(f64, f64, GeoUnit)>, // (width, height, unit)
+        asc: bool,
+        count: Option<usize>,
+        count_any: bool,
+        withcoord: bool,
+        withdist: bool,
+        withhash: bool,
     },
     Append {
         key: String,
@@ -2297,6 +2321,103 @@ pub async fn read_command(
             try_cmd!(ensure_no_more_args(&mut iter, "xpending"));
             Command::Xpending { key, group }
         }
+        "XCLAIM" => {
+            // XCLAIM key group consumer min-idle-time id [id ...] [IDLE ms] [TIME ms] [RETRYCOUNT count] [FORCE] [JUSTID]
+            let key = try_cmd!(require_key(&mut iter, "xclaim"));
+            let group = try_cmd!(require_key(&mut iter, "xclaim"));
+            let consumer = try_cmd!(require_key(&mut iter, "xclaim"));
+            let Some(min_idle_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("xclaim")));
+            };
+            let min_idle_time = match parse_u64_from_bulk(min_idle_bytes) {
+                Ok(v) => v,
+                Err(e) => return Ok(Some(e)),
+            };
+
+            let mut ids: Vec<StreamId> = Vec::new();
+            let mut idle_ms: Option<u64> = None;
+            let mut retry_count: Option<u64> = None;
+            let mut force = false;
+            let mut justid = false;
+
+            // Parse IDs and options
+            while let Some(arg_bytes) = iter.next() {
+                let arg_str = match parse_bulk_string(arg_bytes.clone()) {
+                    Ok(s) => s,
+                    Err(e) => return Ok(Some(e)),
+                };
+                let arg_upper = arg_str.to_uppercase();
+
+                match arg_upper.as_str() {
+                    "IDLE" => {
+                        let Some(val_bytes) = iter.next() else {
+                            return Ok(Some(err_wrong_args("xclaim")));
+                        };
+                        idle_ms = Some(match parse_u64_from_bulk(val_bytes) {
+                            Ok(v) => v,
+                            Err(e) => return Ok(Some(e)),
+                        });
+                    }
+                    "TIME" => {
+                        let Some(val_bytes) = iter.next() else {
+                            return Ok(Some(err_wrong_args("xclaim")));
+                        };
+                        // TIME sets absolute unix time, convert to idle
+                        let unix_time = match parse_u64_from_bulk(val_bytes) {
+                            Ok(v) => v,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        idle_ms = Some(now_ms.saturating_sub(unix_time));
+                    }
+                    "RETRYCOUNT" => {
+                        let Some(val_bytes) = iter.next() else {
+                            return Ok(Some(err_wrong_args("xclaim")));
+                        };
+                        retry_count = Some(match parse_u64_from_bulk(val_bytes) {
+                            Ok(v) => v,
+                            Err(e) => return Ok(Some(e)),
+                        });
+                    }
+                    "FORCE" => {
+                        force = true;
+                    }
+                    "JUSTID" => {
+                        justid = true;
+                    }
+                    "LASTID" => {
+                        // Skip LASTID and its value (not implemented)
+                        let _ = iter.next();
+                    }
+                    _ => {
+                        // Try to parse as stream ID
+                        match parse_stream_id(&arg_str) {
+                            Ok(sid) => ids.push(sid),
+                            Err(e) => return Ok(Some(e)),
+                        }
+                    }
+                }
+            }
+
+            if ids.is_empty() {
+                return Ok(Some(err_wrong_args("xclaim")));
+            }
+
+            Command::Xclaim {
+                key,
+                group,
+                consumer,
+                min_idle_time,
+                ids,
+                idle_ms,
+                retry_count,
+                force,
+                justid,
+            }
+        }
         "GEOADD" => {
             let key = try_cmd!(require_key(&mut iter, "geoadd"));
             let mut members: Vec<(f64, f64, String)> = Vec::new();
@@ -2376,6 +2497,157 @@ pub async fn read_command(
                 return Ok(Some(err_wrong_args("geohash")));
             }
             Command::Geohash { key, members }
+        }
+        "GEOSEARCH" => {
+            // GEOSEARCH key <FROMMEMBER member | FROMLONLAT lon lat> <BYRADIUS radius unit | BYBOX width height unit> [ASC|DESC] [COUNT count [ANY]] [WITHCOORD] [WITHDIST] [WITHHASH]
+            let key = try_cmd!(require_key(&mut iter, "geosearch"));
+
+            let mut from_member: Option<String> = None;
+            let mut from_lonlat: Option<(f64, f64)> = None;
+            let mut by_radius: Option<(f64, GeoUnit)> = None;
+            let mut by_box: Option<(f64, f64, GeoUnit)> = None;
+            let mut asc = true; // default ASC
+            let mut count: Option<usize> = None;
+            let mut count_any = false;
+            let mut withcoord = false;
+            let mut withdist = false;
+            let mut withhash = false;
+
+            while let Some(arg_bytes) = iter.next() {
+                let arg_str = match parse_bulk_string(arg_bytes) {
+                    Ok(s) => s,
+                    Err(e) => return Ok(Some(e)),
+                };
+                let arg_upper = arg_str.to_uppercase();
+
+                match arg_upper.as_str() {
+                    "FROMMEMBER" => {
+                        let Some(member_bytes) = iter.next() else {
+                            return Ok(Some(err_wrong_args("geosearch")));
+                        };
+                        from_member = Some(match parse_bulk_string(member_bytes) {
+                            Ok(m) => m,
+                            Err(e) => return Ok(Some(e)),
+                        });
+                    }
+                    "FROMLONLAT" => {
+                        let Some(lon_bytes) = iter.next() else {
+                            return Ok(Some(err_wrong_args("geosearch")));
+                        };
+                        let Some(lat_bytes) = iter.next() else {
+                            return Ok(Some(err_wrong_args("geosearch")));
+                        };
+                        let lon = match parse_f64_from_bulk(lon_bytes) {
+                            Ok(v) => v,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        let lat = match parse_f64_from_bulk(lat_bytes) {
+                            Ok(v) => v,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        from_lonlat = Some((lon, lat));
+                    }
+                    "BYRADIUS" => {
+                        let Some(radius_bytes) = iter.next() else {
+                            return Ok(Some(err_wrong_args("geosearch")));
+                        };
+                        let Some(unit_bytes) = iter.next() else {
+                            return Ok(Some(err_wrong_args("geosearch")));
+                        };
+                        let radius = match parse_f64_from_bulk(radius_bytes) {
+                            Ok(v) => v,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        let unit_str = match parse_bulk_string(unit_bytes) {
+                            Ok(s) => s.to_uppercase(),
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        let unit = match unit_str.as_str() {
+                            "M" => GeoUnit::Meters,
+                            "KM" => GeoUnit::Kilometers,
+                            "MI" => GeoUnit::Miles,
+                            "FT" => GeoUnit::Feet,
+                            _ => return Ok(Some(err_syntax())),
+                        };
+                        by_radius = Some((radius, unit));
+                    }
+                    "BYBOX" => {
+                        let Some(width_bytes) = iter.next() else {
+                            return Ok(Some(err_wrong_args("geosearch")));
+                        };
+                        let Some(height_bytes) = iter.next() else {
+                            return Ok(Some(err_wrong_args("geosearch")));
+                        };
+                        let Some(unit_bytes) = iter.next() else {
+                            return Ok(Some(err_wrong_args("geosearch")));
+                        };
+                        let width = match parse_f64_from_bulk(width_bytes) {
+                            Ok(v) => v,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        let height = match parse_f64_from_bulk(height_bytes) {
+                            Ok(v) => v,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        let unit_str = match parse_bulk_string(unit_bytes) {
+                            Ok(s) => s.to_uppercase(),
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        let unit = match unit_str.as_str() {
+                            "M" => GeoUnit::Meters,
+                            "KM" => GeoUnit::Kilometers,
+                            "MI" => GeoUnit::Miles,
+                            "FT" => GeoUnit::Feet,
+                            _ => return Ok(Some(err_syntax())),
+                        };
+                        by_box = Some((width, height, unit));
+                    }
+                    "ASC" => asc = true,
+                    "DESC" => asc = false,
+                    "COUNT" => {
+                        let Some(count_bytes) = iter.next() else {
+                            return Ok(Some(err_wrong_args("geosearch")));
+                        };
+                        count = Some(match parse_u64_from_bulk(count_bytes) {
+                            Ok(v) => v as usize,
+                            Err(e) => return Ok(Some(e)),
+                        });
+                    }
+                    "ANY" => count_any = true,
+                    "WITHCOORD" => withcoord = true,
+                    "WITHDIST" => withdist = true,
+                    "WITHHASH" => withhash = true,
+                    _ => return Ok(Some(err_syntax())),
+                }
+            }
+
+            // Validate: must have one FROM and one BY
+            if from_member.is_none() && from_lonlat.is_none() {
+                return Ok(Some(Command::Error("ERR exactly one of FROMMEMBER or FROMLONLAT is required".to_string())));
+            }
+            if from_member.is_some() && from_lonlat.is_some() {
+                return Ok(Some(Command::Error("ERR exactly one of FROMMEMBER or FROMLONLAT is required".to_string())));
+            }
+            if by_radius.is_none() && by_box.is_none() {
+                return Ok(Some(Command::Error("ERR exactly one of BYRADIUS or BYBOX is required".to_string())));
+            }
+            if by_radius.is_some() && by_box.is_some() {
+                return Ok(Some(Command::Error("ERR exactly one of BYRADIUS or BYBOX is required".to_string())));
+            }
+
+            Command::Geosearch {
+                key,
+                from_member,
+                from_lonlat,
+                by_radius,
+                by_box,
+                asc,
+                count,
+                count_any,
+                withcoord,
+                withdist,
+                withhash,
+            }
         }
         "APPEND" => {
             let Some(key_bytes) = iter.next() else {

@@ -180,6 +180,46 @@ Redust 当前提供了一版**实验性的 RDB v1 快照格式**，用于在重�
 - `tests/server_basic.rs`：端到端集成测试。
 - `Cargo.toml`：依赖与构建配置。
 
+## Docker 部署
+
+### 使用 Docker Compose（推荐）
+
+```bash
+# 启动服务
+docker-compose up -d
+
+# 查看日志
+docker-compose logs -f
+
+# 停止服务
+docker-compose down
+```
+
+### 使用 Docker
+
+```bash
+# 构建镜像
+docker build -t redust .
+
+# 运行容器
+docker run -d --name redust -p 6379:6379 -v redust-data:/data redust
+
+# 带认证密码运行
+docker run -d --name redust -p 6379:6379 \
+  -e REDUST_AUTH_PASSWORD=mysecret \
+  -v redust-data:/data redust
+```
+
+### 环境变量
+
+Docker 容器支持以下环境变量：
+
+- `REDUST_ADDR`：监听地址（默认 `0.0.0.0:6379`）
+- `REDUST_RDB_PATH`：RDB 文件路径（默认 `/data/redust.rdb`）
+- `REDUST_RDB_AUTO_SAVE_SECS`：自动保存间隔秒数
+- `REDUST_AUTH_PASSWORD`：认证密码
+- `REDUST_MAXMEMORY_BYTES`：内存限制
+
 ## 后续规划
 
 更详细的规划见 `roadmap.md`，当前重点集中在：

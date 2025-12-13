@@ -1,0 +1,41 @@
+[Unit]
+Description=Redust - Redis-compatible server written in Rust
+Documentation=https://github.com/tmfc/Redust
+After=network.target
+
+[Service]
+Type=simple
+User=redust
+Group=redust
+
+# Working directory
+WorkingDirectory=/opt/redust
+
+# Environment variables
+Environment=REDUST_ADDR=0.0.0.0:6379
+Environment=REDUST_RDB_PATH=/var/lib/redust/redust.rdb
+Environment=REDUST_RDB_AUTO_SAVE_SECS=300
+# Uncomment to enable authentication
+# Environment=REDUST_AUTH_PASSWORD=your-secret-password
+# Uncomment to set memory limit
+# Environment=REDUST_MAXMEMORY_BYTES=1GB
+
+# Start command
+ExecStart=/usr/local/bin/redust
+
+# Restart policy
+Restart=always
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/redust
+PrivateTmp=true
+
+# Resource limits
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

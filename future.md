@@ -242,24 +242,25 @@ enum HllRepr {
 
 ## Streams 模块增强（V2）
 
-现状：已实现 Streams 的最小闭环子集：`XADD`/`XRANGE`/`XLEN`/`XREAD`（不含消费者组、不含持久化）。
+现状：已实现 Streams 完整子集：`XADD`/`XRANGE`/`XREVRANGE`/`XLEN`/`XREAD`/`XREADGROUP`/`XGROUP`/`XINFO`/`XACK`/`XPENDING`/`XCLAIM`。
 
 - [ ] **XREAD 改进**
   - 使用 `Notify`/条件变量替代轮询，降低空转 CPU 并提升唤醒精度。
   - 补齐/对齐更多错误消息细节。
   - Redis 7.4 的 `+` 特殊 ID 语义（请求最后一条，且忽略 COUNT）可作为可选增强。
 
-- [ ] **XGROUP / 消费者组**
-  - 核心数据结构：group state、pending entries list（PEL）、consumer state。
-  - 最小支持路径：`XGROUP CREATE` + `XREADGROUP` + `XACK`。
+- [x] **XGROUP / 消费者组**
+  - 已实现：`XGROUP CREATE`/`SETID`/`DESTROY`/`CREATECONSUMER`/`DELCONSUMER`。
+  - 已实现：`XREADGROUP`、`XACK`、`XPENDING`、`XCLAIM`。
 
-- [ ] **XINFO / introspection**
-  - `XINFO STREAM` 输出基础字段（length/last-generated-id/first-entry/last-entry）。
-  - `XINFO GROUPS/CONSUMERS` 依赖消费者组实现。
+- [x] **XINFO / introspection**
+  - 已实现 `XINFO STREAM` 输出基础字段。
 
-- [ ] **XRANGE/XREVRANGE 完整语义**
-  - 当前仅实现 `XRANGE` 并支持 `-`/`+` 与 `COUNT`。
-  - 后续补：`XREVRANGE` 反向遍历、`MINID/MAXLEN` 裁剪策略（与 XADD 选项耦合）。
+- [x] **XRANGE/XREVRANGE 完整语义**
+  - 已实现 `XRANGE` 和 `XREVRANGE`，支持 `-`/`+` 与 `COUNT`。
+
+- [ ] **XAUTOCLAIM**
+  - 自动转移长时间未确认的消息。
 
 - [ ] **XDEL / XTRIM**
   - `XDEL` 删除 entry。
@@ -282,19 +283,48 @@ enum HllRepr {
 
 ## Geo 模块增强（V2）
 
-现状：已实现 Geo 最小子集：`GEOADD`/`GEOPOS`/`GEODIST`/`GEOHASH`（基于 ZSet + 52-bit geohash 编码）。
+现状：已实现 Geo 完整子集：`GEOADD`/`GEOPOS`/`GEODIST`/`GEOHASH`/`GEOSEARCH`（基于 ZSet + 52-bit geohash 编码）。
 
-- [ ] **GEOSEARCH / GEORADIUS**
-  - 实现基于半径或矩形范围的地理位置搜索。
+- [x] **GEOSEARCH**
+  - 已实现基于半径或矩形范围的地理位置搜索。
   - 支持 `BYRADIUS`/`BYBOX`、`ASC`/`DESC` 排序、`COUNT` 限制。
-  - `GEORADIUS`/`GEORADIUSBYMEMBER` 为旧版命令，可选实现。
+  - 支持 `WITHCOORD`/`WITHDIST`/`WITHHASH` 输出选项。
 
 - [ ] **GEOSEARCHSTORE**
   - 将搜索结果存储到新的 ZSet 中。
 
+- [ ] **GEORADIUS / GEORADIUSBYMEMBER**
+  - 旧版命令，已被 GEOSEARCH 取代，可选实现。
+
 - [ ] **精度与兼容性**
   - 当前 geohash 编码与 Redis 略有差异，后续可对齐 Redis 的精确编码算法。
   - 距离计算使用 haversine 公式，与 Redis 一致。
+
+---
+
+## 主从复制（V2）
+
+现状：尚未实现主从复制功能。
+
+- [ ] **REPLICAOF/SLAVEOF 命令**
+  - 实现从库连接主库的命令。
+  - 支持 `REPLICAOF NO ONE` 断开复制。
+
+- [ ] **全量同步（RDB 传输）**
+  - 从库首次连接时，主库发送 RDB 快照。
+  - 从库加载 RDB 并开始接收增量命令。
+
+- [ ] **增量命令流同步**
+  - 主库将写命令实时传播到从库。
+  - 实现复制积压缓冲区（replication backlog）。
+
+- [ ] **只读从库模式**
+  - 从库默认拒绝写命令。
+  - 支持 `replica-read-only` 配置。
+
+- [ ] **INFO replication section**
+  - 在 INFO 命令中添加复制状态信息。
+  - 包括：role、connected_slaves、master_link_status 等。
 
 ---
 

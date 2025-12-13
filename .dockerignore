@@ -1,0 +1,11 @@
+target/
+.git/
+.gitignore
+*.md
+!README.md
+Dockerfile
+docker-compose.yml
+.dockerignore
+tests/
+*.rdb
+*.aof

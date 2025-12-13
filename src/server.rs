@@ -17,7 +17,7 @@ use tokio::time::{sleep, Duration};
 
 use log::{error, info};
 
-use crate::command::{read_command, Command, CommandError, StreamReadId};
+use crate::command::{read_command, Command, CommandError, GeoUnit, StreamReadId};
 use crate::resp::{
     respond_bulk_bytes, respond_bulk_string, respond_error, respond_integer, respond_null_array,
     respond_null_bulk, respond_simple_string,
@@ -1684,6 +1684,47 @@ async fn handle_string_command(
                 }
             }
         }
+        Command::Xclaim { key, group, consumer, min_idle_time, ids, idle_ms, retry_count, force, justid } => {
+            let physical = prefix_key(current_db, &key);
+            match storage.xclaim(&physical, &group, &consumer, min_idle_time, &ids, idle_ms, retry_count, force, justid) {
+                Ok(entries) => {
+                    writer.write_all(format!("*{}\r\n", entries.len()).as_bytes()).await?;
+                    for (id, fields_opt) in entries {
+                        if justid {
+                            // JUSTID: return only the ID as bulk string
+                            let id_s = format!("{}-{}", id.ms, id.seq);
+                            respond_bulk_string(writer, &id_s).await?;
+                        } else {
+                            // Return [id, [field, value, ...]]
+                            writer.write_all(b"*2\r\n").await?;
+                            let id_s = format!("{}-{}", id.ms, id.seq);
+                            respond_bulk_string(writer, &id_s).await?;
+                            if let Some(fields) = fields_opt {
+                                writer.write_all(format!("*{}\r\n", fields.len() * 2).as_bytes()).await?;
+                                for (f, v) in fields {
+                                    respond_bulk_bytes(writer, &f).await?;
+                                    respond_bulk_bytes(writer, &v).await?;
+                                }
+                            } else {
+                                writer.write_all(b"*0\r\n").await?;
+                            }
+                        }
+                    }
+                }
+                Err(crate::storage::StreamError::NoSuchKey) => {
+                    respond_error(writer, "ERR no such key").await?;
+                }
+                Err(crate::storage::StreamError::NoSuchGroup) => {
+                    respond_error(writer, "NOGROUP No such consumer group for key name").await?;
+                }
+                Err(crate::storage::StreamError::WrongType) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+                Err(_) => {
+                    respond_error(writer, "ERR unknown error").await?;
+                }
+            }
+        }
         Command::Geoadd { key, members } => {
             // Validate coordinates first
             for (lon, lat, _) in &members {
@@ -1762,6 +1803,75 @@ async fn handle_string_command(
                             }
                             None => {
                                 respond_null_bulk(writer).await?;
+                            }
+                        }
+                    }
+                }
+                Err(()) => {
+                    respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                }
+            }
+        }
+        Command::Geosearch { key, from_member, from_lonlat, by_radius, by_box, asc, count, count_any: _, withcoord, withdist, withhash } => {
+            let physical = prefix_key(current_db, &key);
+
+            // Resolve center coordinates
+            let center = if let Some(ref member) = from_member {
+                match storage.geo_get_member_pos(&physical, member) {
+                    Ok(Some(pos)) => pos,
+                    Ok(None) => {
+                        respond_error(writer, "ERR could not decode requested zset member").await?;
+                        return Ok(());
+                    }
+                    Err(()) => {
+                        respond_error(writer, "WRONGTYPE Operation against a key holding the wrong kind of value").await?;
+                        return Ok(());
+                    }
+                }
+            } else if let Some((lon, lat)) = from_lonlat {
+                (lon, lat)
+            } else {
+                respond_error(writer, "ERR exactly one of FROMMEMBER or FROMLONLAT is required").await?;
+                return Ok(());
+            };
+
+            // Convert radius/box to meters
+            let radius_m = by_radius.map(|(r, unit)| unit.to_meters(r));
+            let (box_width_m, box_height_m) = if let Some((w, h, unit)) = by_box {
+                (Some(unit.to_meters(w)), Some(unit.to_meters(h)))
+            } else {
+                (None, None)
+            };
+
+            // Get the unit for distance output
+            let output_unit = by_radius.map(|(_, u)| u).or(by_box.map(|(_, _, u)| u)).unwrap_or(GeoUnit::Meters);
+
+            match storage.geosearch(&physical, center.0, center.1, radius_m, box_width_m, box_height_m, asc, count, withcoord, withdist, withhash) {
+                Ok(results) => {
+                    writer.write_all(format!("*{}\r\n", results.len()).as_bytes()).await?;
+                    for r in results {
+                        if !withcoord && !withdist && !withhash {
+                            // Just member names
+                            respond_bulk_string(writer, &r.member).await?;
+                        } else {
+                            // Array: [member, dist?, hash?, [lon, lat]?]
+                            let mut sub_len = 1; // member
+                            if withdist { sub_len += 1; }
+                            if withhash { sub_len += 1; }
+                            if withcoord { sub_len += 1; }
+                            writer.write_all(format!("*{}\r\n", sub_len).as_bytes()).await?;
+                            respond_bulk_string(writer, &r.member).await?;
+                            if withdist {
+                                let dist = output_unit.from_meters(r.dist);
+                                respond_bulk_string(writer, &format!("{:.4}", dist)).await?;
+                            }
+                            if withhash {
+                                respond_integer(writer, r.hash as i64).await?;
+                            }
+                            if withcoord {
+                                writer.write_all(b"*2\r\n").await?;
+                                respond_bulk_string(writer, &format!("{:.6}", r.lon)).await?;
+                                respond_bulk_string(writer, &format!("{:.6}", r.lat)).await?;
                             }
                         }
                     }
@@ -4444,30 +4554,43 @@ async fn handle_info_command(
     let used_memory = storage.approximate_used_memory();
     let used_memory_human = format_bytes(used_memory);
 
+    // Get key count for stats
+    let db_size = storage.dbsize();
+
     let mut info = String::new();
     info.push_str("# Server\r\n");
-    info.push_str(&format!("redust_version:0.1.0\r\n"));
+    info.push_str("redust_version:0.1.0\r\n");
     info.push_str(&format!("tcp_port:{}\r\n", metrics.tcp_port));
     info.push_str(&format!("uptime_in_seconds:{}\r\n", uptime));
+
+    info.push_str("\r\n# Memory\r\n");
+    info.push_str(&format!("used_memory:{}\r\n", used_memory));
+    info.push_str(&format!("used_memory_human:{}\r\n", used_memory_human));
+    info.push_str(&format!("used_memory_peak:{}\r\n", used_memory)); // simplified: same as current
+    info.push_str(&format!("used_memory_peak_human:{}\r\n", used_memory_human));
     info.push_str(&format!("maxmemory:{}\r\n", maxmemory));
     info.push_str(&format!("maxmemory_human:{}\r\n", maxmemory_human));
     info.push_str(&format!("maxmemory_policy:{}\r\n", maxmemory_policy));
-    info.push_str(&format!("used_memory:{}\r\n", used_memory));
-    info.push_str(&format!("used_memory_human:{}\r\n", used_memory_human));
+    // Memory fragmentation ratio (simplified: 1.0 since we don't track allocator overhead)
+    info.push_str("mem_fragmentation_ratio:1.00\r\n");
+
     info.push_str("\r\n# Clients\r\n");
     info.push_str(&format!("connected_clients:{}\r\n", connected));
     info.push_str("\r\n# Stats\r\n");
     info.push_str(&format!("total_commands_processed:{}\r\n", total_cmds));
+    info.push_str(&format!("total_keys:{}\r\n", db_size));
+
+    info.push_str("\r\n# Pubsub\r\n");
     info.push_str(&format!(
-        "pubsub_channel_subscriptions:{}\r\n",
+        "pubsub_channels:{}\r\n",
         metrics.pubsub_channel_subs.load(Ordering::Relaxed)
     ));
     info.push_str(&format!(
-        "pubsub_pattern_subscriptions:{}\r\n",
+        "pubsub_patterns:{}\r\n",
         metrics.pubsub_pattern_subs.load(Ordering::Relaxed)
     ));
     info.push_str(&format!(
-        "pubsub_shard_subscriptions:{}\r\n",
+        "pubsub_shard_channels:{}\r\n",
         metrics.pubsub_shard_subs.load(Ordering::Relaxed)
     ));
     info.push_str(&format!(
@@ -4478,6 +4601,7 @@ async fn handle_info_command(
         "pubsub_messages_dropped:{}\r\n",
         metrics.pubsub_messages_dropped.load(Ordering::Relaxed)
     ));
+
     info.push_str("\r\n# Keyspace\r\n");
 
     let all_keys = storage.keys("*");
@@ -4598,10 +4722,12 @@ async fn execute_command_in_transaction(
         | Command::XgroupDelconsumer { .. }
         | Command::Xack { .. }
         | Command::Xpending { .. }
+        | Command::Xclaim { .. }
         | Command::Geoadd { .. }
         | Command::Geopos { .. }
         | Command::Geodist { .. }
         | Command::Geohash { .. }
+        | Command::Geosearch { .. }
         | Command::Append { .. }
         | Command::Strlen { .. }
         | Command::Getset { .. }
@@ -5175,10 +5301,12 @@ async fn handle_connection(
             | Command::Xreadgroup { .. }
             | Command::Xack { .. }
             | Command::Xpending { .. }
+            | Command::Xclaim { .. }
             | Command::Geoadd { .. }
             | Command::Geopos { .. }
             | Command::Geodist { .. }
             | Command::Geohash { .. }
+            | Command::Geosearch { .. }
             | Command::Append { .. }
             | Command::Strlen { .. }
             | Command::Getset { .. }

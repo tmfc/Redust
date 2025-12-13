@@ -320,3 +320,211 @@ async fn test_geoadd_invalid_coords() {
 
     let _ = shutdown.send(());
 }
+
+// ==================== GEOSEARCH Tests ====================
+
+#[tokio::test]
+async fn test_geosearch_byradius_fromlonlat() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // Add some cities
+    client
+        .send_command(&["GEOADD", "cities", "13.361389", "52.519444", "Berlin"])
+        .await;
+    assert_eq!(client.read_integer().await, 1);
+
+    client
+        .send_command(&["GEOADD", "cities", "2.349014", "48.864716", "Paris"])
+        .await;
+    assert_eq!(client.read_integer().await, 1);
+
+    client
+        .send_command(&["GEOADD", "cities", "-0.127758", "51.507351", "London"])
+        .await;
+    assert_eq!(client.read_integer().await, 1);
+
+    // Search within 500km of Berlin
+    client
+        .send_command(&["GEOSEARCH", "cities", "FROMLONLAT", "13.361389", "52.519444", "BYRADIUS", "500", "KM"])
+        .await;
+    let arr_len = client.read_array_len().await.unwrap();
+    assert_eq!(arr_len, 1); // Only Berlin within 500km of itself
+    // Consume the member name
+    let _ = client.read_bulk_string().await;
+
+    // Search within 1000km of Berlin
+    client
+        .send_command(&["GEOSEARCH", "cities", "FROMLONLAT", "13.361389", "52.519444", "BYRADIUS", "1000", "KM"])
+        .await;
+    let arr_len = client.read_array_len().await.unwrap();
+    assert!(arr_len >= 1); // At least Berlin
+    // Consume all member names
+    for _ in 0..arr_len {
+        let _ = client.read_bulk_string().await;
+    }
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_geosearch_frommember() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // Add some cities
+    client
+        .send_command(&["GEOADD", "cities", "13.361389", "52.519444", "Berlin"])
+        .await;
+    assert_eq!(client.read_integer().await, 1);
+
+    client
+        .send_command(&["GEOADD", "cities", "2.349014", "48.864716", "Paris"])
+        .await;
+    assert_eq!(client.read_integer().await, 1);
+
+    // Search from Berlin
+    client
+        .send_command(&["GEOSEARCH", "cities", "FROMMEMBER", "Berlin", "BYRADIUS", "1500", "KM"])
+        .await;
+    let arr_len = client.read_array_len().await.unwrap();
+    assert!(arr_len >= 1); // At least Berlin itself
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_geosearch_withdist() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // Add a city
+    client
+        .send_command(&["GEOADD", "cities", "13.361389", "52.519444", "Berlin"])
+        .await;
+    assert_eq!(client.read_integer().await, 1);
+
+    // Search with WITHDIST
+    client
+        .send_command(&["GEOSEARCH", "cities", "FROMLONLAT", "13.361389", "52.519444", "BYRADIUS", "100", "KM", "WITHDIST"])
+        .await;
+    let arr_len = client.read_array_len().await.unwrap();
+    assert_eq!(arr_len, 1);
+
+    // Each result is [member, dist]
+    let sub_len = client.read_array_len().await.unwrap();
+    assert_eq!(sub_len, 2);
+    let member = client.read_bulk_string().await.unwrap();
+    assert_eq!(member, "Berlin");
+    let dist = client.read_bulk_string().await.unwrap();
+    // Distance should be very small (near 0)
+    let dist_f: f64 = dist.parse().unwrap();
+    assert!(dist_f < 1.0);
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_geosearch_withcoord() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // Add a city
+    client
+        .send_command(&["GEOADD", "cities", "13.361389", "52.519444", "Berlin"])
+        .await;
+    assert_eq!(client.read_integer().await, 1);
+
+    // Search with WITHCOORD
+    client
+        .send_command(&["GEOSEARCH", "cities", "FROMLONLAT", "13.361389", "52.519444", "BYRADIUS", "100", "KM", "WITHCOORD"])
+        .await;
+    let arr_len = client.read_array_len().await.unwrap();
+    assert_eq!(arr_len, 1);
+
+    // Each result is [member, [lon, lat]]
+    let sub_len = client.read_array_len().await.unwrap();
+    assert_eq!(sub_len, 2);
+    let member = client.read_bulk_string().await.unwrap();
+    assert_eq!(member, "Berlin");
+    let coord_len = client.read_array_len().await.unwrap();
+    assert_eq!(coord_len, 2);
+    let lon = client.read_bulk_string().await.unwrap();
+    let lat = client.read_bulk_string().await.unwrap();
+    let lon_f: f64 = lon.parse().unwrap();
+    let lat_f: f64 = lat.parse().unwrap();
+    // Should be close to original coords
+    assert!((lon_f - 13.361389).abs() < 0.01);
+    assert!((lat_f - 52.519444).abs() < 0.01);
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_geosearch_count() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // Add multiple cities
+    client
+        .send_command(&["GEOADD", "cities", "13.361389", "52.519444", "Berlin"])
+        .await;
+    assert_eq!(client.read_integer().await, 1);
+
+    client
+        .send_command(&["GEOADD", "cities", "2.349014", "48.864716", "Paris"])
+        .await;
+    assert_eq!(client.read_integer().await, 1);
+
+    client
+        .send_command(&["GEOADD", "cities", "-0.127758", "51.507351", "London"])
+        .await;
+    assert_eq!(client.read_integer().await, 1);
+
+    // Search with COUNT 1
+    client
+        .send_command(&["GEOSEARCH", "cities", "FROMLONLAT", "0", "50", "BYRADIUS", "2000", "KM", "COUNT", "1"])
+        .await;
+    let arr_len = client.read_array_len().await.unwrap();
+    assert_eq!(arr_len, 1);
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_geosearch_bybox() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // Add a city
+    client
+        .send_command(&["GEOADD", "cities", "13.361389", "52.519444", "Berlin"])
+        .await;
+    assert_eq!(client.read_integer().await, 1);
+
+    // Search with BYBOX
+    client
+        .send_command(&["GEOSEARCH", "cities", "FROMLONLAT", "13.0", "52.0", "BYBOX", "200", "200", "KM"])
+        .await;
+    let arr_len = client.read_array_len().await.unwrap();
+    assert_eq!(arr_len, 1);
+    let member = client.read_bulk_string().await.unwrap();
+    assert_eq!(member, "Berlin");
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_geosearch_missing_key() {
+    let (addr, shutdown, _handle) = spawn_server().await;
+    let mut client = TestClient::connect(addr).await;
+
+    // Search on non-existent key should return empty array
+    client
+        .send_command(&["GEOSEARCH", "nokey", "FROMLONLAT", "0", "0", "BYRADIUS", "100", "KM"])
+        .await;
+    let arr_len = client.read_array_len().await.unwrap();
+    assert_eq!(arr_len, 0);
+
+    let _ = shutdown.send(());
+}
