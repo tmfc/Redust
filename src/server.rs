@@ -5094,6 +5094,7 @@ async fn handle_connection(
     persistence: Arc<PersistenceState>,
     script_cache: Arc<ScriptCache>,
     slowlog: Arc<SlowLog>,
+    acl_manager: Arc<crate::acl::AclManager>,
     client_addr: String,
 ) -> io::Result<()> {
     let (read_half, write_half) = stream.into_split();
@@ -5107,6 +5108,7 @@ async fn handle_connection(
         persistence,
         script_cache,
         slowlog,
+        acl_manager,
         client_addr,
     )
     .await
@@ -5122,6 +5124,7 @@ async fn handle_connection_impl<R, W>(
     persistence: Arc<PersistenceState>,
     script_cache: Arc<ScriptCache>,
     slowlog: Arc<SlowLog>,
+    acl_manager: Arc<crate::acl::AclManager>,
     client_addr: String,
 ) -> io::Result<()>
 where
@@ -5138,6 +5141,9 @@ where
     // 客户端标识
     let client_id = CLIENT_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut client_name = String::new();
+
+    // 当前用户（默认用户，可通过 AUTH 切换）
+    let current_user = crate::acl::AclUser::default_user();
 
     let auth_password = env::var("REDUST_AUTH_PASSWORD")
         .ok()
@@ -6105,6 +6111,109 @@ where
                 respond_integer(&mut write_half, slowlog.len() as i64).await?;
             }
 
+            // ACL 命令
+            Command::AclList => {
+                let list = acl_manager.list_users();
+                let header = format!("*{}\r\n", list.len());
+                write_half.write_all(header.as_bytes()).await?;
+                for entry in list {
+                    respond_bulk_string(&mut write_half, &entry).await?;
+                }
+            }
+            Command::AclUsers => {
+                let names = acl_manager.user_names();
+                let header = format!("*{}\r\n", names.len());
+                write_half.write_all(header.as_bytes()).await?;
+                for name in names {
+                    respond_bulk_string(&mut write_half, &name).await?;
+                }
+            }
+            Command::AclWhoami => {
+                respond_bulk_string(&mut write_half, &current_user.name).await?;
+            }
+            Command::AclSetuser { username, rules } => {
+                let rule_refs: Vec<&str> = rules.iter().map(|s| s.as_str()).collect();
+                match acl_manager.set_user(&username, &rule_refs) {
+                    Ok(()) => respond_simple_string(&mut write_half, "OK").await?,
+                    Err(e) => respond_error(&mut write_half, &e).await?,
+                }
+            }
+            Command::AclDeluser { usernames } => {
+                let mut count = 0;
+                for name in &usernames {
+                    if acl_manager.del_user(name) {
+                        count += 1;
+                    }
+                }
+                respond_integer(&mut write_half, count).await?;
+            }
+            Command::AclGetuser { username } => {
+                match acl_manager.get_user(&username) {
+                    Some(user) => {
+                        // 返回用户信息作为数组
+                        let mut parts = Vec::new();
+                        parts.push("flags".to_string());
+                        let mut flags = Vec::new();
+                        if user.enabled { flags.push("on"); } else { flags.push("off"); }
+                        if user.nopass { flags.push("nopass"); }
+                        if user.all_keys { flags.push("allkeys"); }
+                        if user.all_channels { flags.push("allchannels"); }
+                        if user.all_commands { flags.push("allcommands"); }
+                        parts.push(flags.join(" "));
+                        parts.push("passwords".to_string());
+                        parts.push(user.passwords.iter().cloned().collect::<Vec<_>>().join(" "));
+                        parts.push("commands".to_string());
+                        let mut cmds = Vec::new();
+                        if user.all_commands { cmds.push("+@all".to_string()); }
+                        for cat in &user.allowed_categories { cmds.push(format!("+@{}", cat)); }
+                        for cat in &user.denied_categories { cmds.push(format!("-@{}", cat)); }
+                        for cmd in &user.allowed_commands { cmds.push(format!("+{}", cmd)); }
+                        for cmd in &user.denied_commands { cmds.push(format!("-{}", cmd)); }
+                        parts.push(cmds.join(" "));
+                        parts.push("keys".to_string());
+                        if user.all_keys {
+                            parts.push("~*".to_string());
+                        } else {
+                            parts.push(user.key_patterns.iter().map(|p| format!("~{}", p)).collect::<Vec<_>>().join(" "));
+                        }
+                        parts.push("channels".to_string());
+                        if user.all_channels {
+                            parts.push("&*".to_string());
+                        } else {
+                            parts.push(user.channel_patterns.iter().map(|p| format!("&{}", p)).collect::<Vec<_>>().join(" "));
+                        }
+                        
+                        let header = format!("*{}\r\n", parts.len());
+                        write_half.write_all(header.as_bytes()).await?;
+                        for part in parts {
+                            respond_bulk_string(&mut write_half, &part).await?;
+                        }
+                    }
+                    None => {
+                        respond_null_array(&mut write_half).await?;
+                    }
+                }
+            }
+            Command::AclCat { category } => {
+                let categories = match category {
+                    None => vec![
+                        "string", "list", "set", "hash", "sortedset", "pubsub",
+                        "transaction", "scripting", "connection", "server",
+                        "keyspace", "dangerous", "admin", "generic",
+                    ],
+                    Some(_) => {
+                        // 返回该类别下的命令（简化实现）
+                        respond_error(&mut write_half, "ERR ACL CAT with category not fully implemented").await?;
+                        continue;
+                    }
+                };
+                let header = format!("*{}\r\n", categories.len());
+                write_half.write_all(header.as_bytes()).await?;
+                for cat in categories {
+                    respond_bulk_string(&mut write_half, cat).await?;
+                }
+            }
+
             // 解析阶段构造的错误命令
             Command::Error(msg) => {
                 respond_error(&mut write_half, &msg).await?;
@@ -6339,6 +6448,7 @@ async fn serve_impl(
     let slowlog = Arc::new(SlowLog::new());
     let pubsub = PubSubHub::new();
     let script_cache = Arc::new(ScriptCache::new());
+    let acl_manager = Arc::new(crate::acl::AclManager::new());
 
     if let Ok(metrics_addr) = env::var("REDUST_METRICS_ADDR") {
         if !metrics_addr.is_empty() {
@@ -6372,6 +6482,7 @@ async fn serve_impl(
                 let persistence_clone = persistence.clone();
                 let script_cache_clone = script_cache.clone();
                 let slowlog_clone = slowlog.clone();
+                let acl_manager_clone = acl_manager.clone();
                 let client_addr = addr.to_string();
 
                 // 根据是否有 TLS acceptor 选择处理方式
@@ -6392,6 +6503,7 @@ async fn serve_impl(
                                     persistence_clone,
                                     script_cache_clone,
                                     slowlog_clone,
+                                    acl_manager_clone,
                                     client_addr.clone(),
                                 ).await {
                                     error!("TLS connection error: {}", err);
@@ -6405,7 +6517,7 @@ async fn serve_impl(
                 } else {
                     info!("Accepted connection from {}", addr);
                     tokio::spawn(async move {
-                        if let Err(err) = handle_connection(stream, storage, metrics, pubsub, overflow_strategy, persistence_clone, script_cache_clone, slowlog_clone, client_addr).await {
+                        if let Err(err) = handle_connection(stream, storage, metrics, pubsub, overflow_strategy, persistence_clone, script_cache_clone, slowlog_clone, acl_manager_clone, client_addr).await {
                             error!("Connection error: {}", err);
                         }
                     });

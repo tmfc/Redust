@@ -860,6 +860,23 @@ pub enum Command {
         client_id: u64,
         unblock_error: bool,
     },
+    // ACL 命令
+    AclList,
+    AclUsers,
+    AclWhoami,
+    AclSetuser {
+        username: String,
+        rules: Vec<String>,
+    },
+    AclDeluser {
+        usernames: Vec<String>,
+    },
+    AclGetuser {
+        username: String,
+    },
+    AclCat {
+        category: Option<String>,
+    },
     SlowlogGet {
         count: Option<usize>,
     },
@@ -5522,6 +5539,77 @@ pub async fn read_command<R: AsyncRead + Unpin>(
                 }
                 _ => Command::Error(format!(
                     "ERR Unknown subcommand or wrong number of arguments for 'client|{}'",
+                    subcmd.to_lowercase()
+                )),
+            }
+        }
+        "ACL" => {
+            let Some(subcmd_bytes) = iter.next() else {
+                return Ok(Some(err_wrong_args("acl")));
+            };
+            let subcmd = match parse_bulk_string(subcmd_bytes) {
+                Ok(s) => s.to_uppercase(),
+                Err(e) => return Ok(Some(e)),
+            };
+            match subcmd.as_str() {
+                "LIST" => Command::AclList,
+                "USERS" => Command::AclUsers,
+                "WHOAMI" => Command::AclWhoami,
+                "SETUSER" => {
+                    let Some(username_bytes) = iter.next() else {
+                        return Ok(Some(err_wrong_args("acl|setuser")));
+                    };
+                    let username = match parse_bulk_string(username_bytes) {
+                        Ok(s) => s,
+                        Err(e) => return Ok(Some(e)),
+                    };
+                    let mut rules = Vec::new();
+                    for rule_bytes in iter {
+                        let rule = match parse_bulk_string(rule_bytes) {
+                            Ok(s) => s,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        rules.push(rule);
+                    }
+                    Command::AclSetuser { username, rules }
+                }
+                "DELUSER" => {
+                    let mut usernames = Vec::new();
+                    for name_bytes in iter {
+                        let name = match parse_bulk_string(name_bytes) {
+                            Ok(s) => s,
+                            Err(e) => return Ok(Some(e)),
+                        };
+                        usernames.push(name);
+                    }
+                    if usernames.is_empty() {
+                        return Ok(Some(err_wrong_args("acl|deluser")));
+                    }
+                    Command::AclDeluser { usernames }
+                }
+                "GETUSER" => {
+                    let Some(username_bytes) = iter.next() else {
+                        return Ok(Some(err_wrong_args("acl|getuser")));
+                    };
+                    let username = match parse_bulk_string(username_bytes) {
+                        Ok(s) => s,
+                        Err(e) => return Ok(Some(e)),
+                    };
+                    Command::AclGetuser { username }
+                }
+                "CAT" => {
+                    let category = if let Some(cat_bytes) = iter.next() {
+                        Some(match parse_bulk_string(cat_bytes) {
+                            Ok(s) => s.to_lowercase(),
+                            Err(e) => return Ok(Some(e)),
+                        })
+                    } else {
+                        None
+                    };
+                    Command::AclCat { category }
+                }
+                _ => Command::Error(format!(
+                    "ERR Unknown subcommand or wrong number of arguments for 'acl|{}'",
                     subcmd.to_lowercase()
                 )),
             }

@@ -306,6 +306,13 @@
 - [x] CLIENT UNBLOCK - 解除阻塞客户端（支持 TIMEOUT/ERROR 模式）
   - **注意**：与 Redis 行为差异 - 本实现总是返回 1（信号已发送），而 Redis 在目标客户端不存在或未阻塞时返回 0
 - [ ] CLIENT KILL / REPLY
+- [x] ACL LIST - 列出所有用户及其权限
+- [x] ACL USERS - 列出所有用户名
+- [x] ACL WHOAMI - 返回当前用户名
+- [x] ACL SETUSER - 创建或修改用户（支持 on/off、>password、+/-命令、+/-@类别、~key、&channel）
+- [x] ACL DELUSER - 删除用户（不能删除 default 用户）
+- [x] ACL GETUSER - 获取用户详细信息
+- [x] ACL CAT - 列出命令类别（仅支持无参数模式，`ACL CAT <category>` 未实现）
 - [ ] HELLO
 - [ ] SELECT
 - [ ] INFO

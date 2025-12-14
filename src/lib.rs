@@ -1,3 +1,4 @@
+pub mod acl;
 pub mod command;
 pub mod hyperloglog;
 pub mod resp;

@@ -10,10 +10,11 @@
 
 ## 安全增强
 
-- [ ] **ACL 访问控制**
-  - [ ] 用户管理（ACL SETUSER/DELUSER/LIST）
-  - [ ] 命令权限控制
-  - [ ] 频道权限控制
+- [x] **ACL 访问控制**
+  - [x] 用户管理（ACL SETUSER/DELUSER/LIST/USERS/WHOAMI/GETUSER/CAT）
+  - [x] 命令权限控制（+/-命令、+/-@类别）
+  - [x] Key 权限控制（~pattern）
+  - [x] 频道权限控制（&pattern）
 
 - [x] **TLS 支持**
   - [x] 内建 TLS（tokio-rustls）
