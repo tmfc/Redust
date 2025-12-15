@@ -14,7 +14,7 @@
 
 - [x] `go-redis`：基础命令 + pipeline（含 `TxPipeline`）
 - [x] `go-redis`：事务（`WATCH` + `TxPipelined`）
-- [ ] `go-redis`：阻塞命令（如 `BLPOP`）超时/取消
+- [x] `go-redis`：阻塞命令（如 `BLPOP`）超时/取消
 
 - [ ] `Jedis`：基础命令 + pipeline
 - [ ] `Lettuce`：异步 API（future）+ 连接复用

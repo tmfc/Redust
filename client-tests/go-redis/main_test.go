@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
 	"testing"
 	"time"
@@ -15,7 +16,7 @@ func newClient(t *testing.T) *redis.Client {
 	if addr == "" {
 		addr = "127.0.0.1:6379"
 	}
-	c := redis.NewClient(&redis.Options{Addr: addr})
+	c := redis.NewClient(&redis.Options{Addr: addr, ContextTimeoutEnabled: true})
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := c.Ping(ctx).Err(); err != nil {
@@ -147,7 +148,7 @@ func TestWatchTxPipelined(t *testing.T) {
 	}
 
 	// 场景 1：并发修改 watched key -> TxFailedErr
-	other := redis.NewClient(&redis.Options{Addr: c.Options().Addr})
+	other := redis.NewClient(&redis.Options{Addr: c.Options().Addr, ContextTimeoutEnabled: true})
 	defer other.Close()
 
 	ready := make(chan struct{})
@@ -209,4 +210,38 @@ func TestWatchTxPipelined(t *testing.T) {
 	if got != "v2" {
 		t.Fatalf("unexpected valKey: %q", got)
 	}
+}
+
+func TestBLPopTimeoutAndCancel(t *testing.T) {
+	c := newClient(t)
+	defer c.Close()
+
+	key := "go:blpop:key"
+	defer c.Del(context.Background(), key)
+
+	// 场景 1：空列表 + BLPOP 超时 -> redis.Nil
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel1()
+
+	res, err := c.BLPop(ctx1, 1*time.Second, key).Result()
+	if err != redis.Nil {
+		t.Fatalf("expected redis.Nil on BLPOP timeout, got res=%v err=%v", res, err)
+	}
+
+	// 场景 2：context 取消（deadline < block） -> context deadline exceeded
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel2()
+
+	_, err = c.BLPop(ctx2, 5*time.Second, key).Result()
+	if err == nil {
+		t.Fatalf("expected error on BLPOP context cancel, got nil")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return
+	}
+	t.Fatalf("expected context.DeadlineExceeded or timeout, got: %v", err)
 }
