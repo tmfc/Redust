@@ -369,6 +369,34 @@ enum HllRepr {
   - 基于当前 redis-rs 测试经验，补充 `redis-cli` 脚本和 Go `go-redis` 小程序，覆盖 string/list/set/hash/expire 等常用命令。
   - 在 CI 或本地脚本中统一执行这些兼容性测试，并记录所有与官方 Redis 行为差异的案例。
 
+- [ ] **redis-rs 兼容性测试扩展点**
+  - 错误类型覆盖：`-ERR`/`-WRONGTYPE`/`-NOSCRIPT`/`-EXECABORT` 等在 redis-rs 侧的解码与错误信息一致性。
+  - Null array 覆盖：`BLPOP` timeout、`XREAD` 空读、`EXEC` aborted（nil）等返回形态。
+  - 二进制安全更多场景：key/value 含 `\0`、非 UTF-8 的 hash field、list/set 元素等 roundtrip。
+  - 阻塞命令与取消：`BLPOP/BRPOP` 的超时与取消（配合 tokio timeout），以及连接关闭后的资源回收。
+  - Pub/Sub 模式：订阅后普通命令的行为对齐（是否返回错误/是否允许），以及 `SUBSCRIBE/UNSUBSCRIBE` 返回帧结构断言。
+
+- [ ] **go-redis 回归测试最小落地（建议）**
+  - 现状：仓库当前没有 `go.mod` / `*.go`，因此无法直接在现有测试体系里运行 go-redis 客户端回归。
+  - 建议落地方式（最小闭环）：
+    - 在仓库新增独立目录（例如 `client-tests/go-redis/`），包含：
+      - `go.mod`（module 名可用 `redust-client-tests`）
+      - `main_test.go`（使用 `github.com/redis/go-redis/v9`）
+      - 测试逻辑通过环境变量读取地址（例如 `REDUST_ADDR=127.0.0.1:6379`），避免测试内启动 Rust server。
+    - 先覆盖最小用例：
+      - 基础：`PING`/`SET`/`GET`/`INCR`
+      - Pipeline：`Pipelined` 与 `TxPipeline`（只验证返回类型/顺序/错误不 panic）
+      - 超时/取消：针对 `BLPOP` 等阻塞命令用 `context.WithTimeout`
+    - CI 策略：
+      - 分两步：先启动 `redust`（后台进程/独立 job），再运行 `go test ./...`。
+      - 若 CI 不方便引入 Go，可先提供本地脚本（Makefile/justfile）用于开发者手动回归。
+
+  - 运行注意事项（本地/CI）：
+    - 需要在 `client-tests/go-redis/` 目录执行 `go test ./...`（该目录包含 `go.mod`）。
+    - 需要先启动 Redust 并设置地址，例如：`cargo run --bin redust -- --bind 127.0.0.1:6380`。
+    - 测试通过 `REDUST_ADDR=127.0.0.1:6380` 连接外部 Redust，不在 Go 测试内启动 Rust server。
+    - 首次执行如遇到网络问题，可设置 `GOPROXY=direct` 或使用可用代理（或配置 `http_proxy/https_proxy`）后再跑 `go mod tidy` / `go test`。
+
 - [ ] **不兼容行为登记与跟踪**
   - 为每一条不兼容行为记录：使用的客户端/版本、触发命令及参数、Redis 实际返回 vs Redust 返回。
   - 将这些差异条目集中登记在本文件或独立文档中，并在 PR/issue 中引用，作为后续修复/取舍决策的依据。

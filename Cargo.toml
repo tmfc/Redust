@@ -24,3 +24,4 @@ rustls-pemfile = "2"
 [dev-dependencies]
 redis = { version = "0.25", features = ["tokio-comp"] }
 serial_test = "3"
+futures-util = "0.3"
