@@ -945,19 +945,14 @@ async fn info_basic_fields() {
 
     write_half.write_all(b"*1\r\n$4\r\nINFO\r\n").await.unwrap();
 
-    let mut buf = String::new();
-    // 读取若干行，直到 EOF 或已经包含我们关心的 Keyspace 行
-    for _ in 0..32 {
-        let mut line = String::new();
-        let n = reader.read_line(&mut line).await.unwrap();
-        if n == 0 {
-            break;
-        }
-        buf.push_str(&line);
-        if line.starts_with("db0:keys=") {
-            break;
-        }
-    }
+    // 读取 bulk string 格式：$<len>\r\n<content>\r\n
+    let mut len_line = String::new();
+    reader.read_line(&mut len_line).await.unwrap();
+    let len: usize = len_line.trim_start_matches('$').trim().parse().unwrap();
+    
+    let mut content = vec![0u8; len + 2]; // +2 for trailing \r\n
+    tokio::io::AsyncReadExt::read_exact(&mut reader, &mut content).await.unwrap();
+    let buf = String::from_utf8_lossy(&content[..len]).to_string();
 
     assert!(buf.contains("# Server"));
     assert!(buf.contains("redust_version:"));

@@ -61,7 +61,8 @@ async fn auth_not_enabled_but_command_sent() {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    // AUTH 在未启用密码时应返回错误
+    // AUTH 在 ACL 模式下，默认用户是 nopass，所以任何密码都会成功
+    // （这是 ACL 集成后的新行为）
     write_half
         .write_all(
             b"*2\r
@@ -77,7 +78,7 @@ foo\r
     reader.read_line(&mut line).await.unwrap();
     assert_eq!(
         line,
-        "-ERR AUTH not enabled\r
+        "+OK\r
 "
     );
 

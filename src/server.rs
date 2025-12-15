@@ -87,6 +87,7 @@ fn load_tls_config(cert_path: &str, key_path: &str) -> io::Result<ServerConfig> 
 struct Metrics {
     start_time: Instant,
     connected_clients: AtomicUsize,
+    total_connections: AtomicU64,
     total_commands: AtomicU64,
     tcp_port: u16,
     pubsub_channel_subs: AtomicU64,
@@ -4649,6 +4650,7 @@ async fn handle_key_meta_command<W: AsyncWrite + Unpin>(
 async fn handle_info_command<W: AsyncWrite + Unpin>(
     storage: &Storage,
     metrics: &Metrics,
+    section: Option<&str>,
     writer: &mut W,
 ) -> io::Result<()> {
     let uptime = Instant::now().duration_since(metrics.start_time).as_secs();
@@ -4659,80 +4661,134 @@ async fn handle_info_command<W: AsyncWrite + Unpin>(
     let maxmemory_policy = storage.maxmemory_policy().as_str();
     let used_memory = storage.approximate_used_memory();
     let used_memory_human = format_bytes(used_memory);
-
-    // Get key count for stats
     let db_size = storage.dbsize();
 
     let mut info = String::new();
-    info.push_str("# Server\r\n");
-    info.push_str("redust_version:0.1.0\r\n");
-    info.push_str(&format!("tcp_port:{}\r\n", metrics.tcp_port));
-    info.push_str(&format!("uptime_in_seconds:{}\r\n", uptime));
 
-    info.push_str("\r\n# Memory\r\n");
-    info.push_str(&format!("used_memory:{}\r\n", used_memory));
-    info.push_str(&format!("used_memory_human:{}\r\n", used_memory_human));
-    info.push_str(&format!("used_memory_peak:{}\r\n", used_memory)); // simplified: same as current
-    info.push_str(&format!("used_memory_peak_human:{}\r\n", used_memory_human));
-    info.push_str(&format!("maxmemory:{}\r\n", maxmemory));
-    info.push_str(&format!("maxmemory_human:{}\r\n", maxmemory_human));
-    info.push_str(&format!("maxmemory_policy:{}\r\n", maxmemory_policy));
-    // Memory fragmentation ratio (simplified: 1.0 since we don't track allocator overhead)
-    info.push_str("mem_fragmentation_ratio:1.00\r\n");
+    // 判断是否需要输出某个 section
+    let show_all = section.is_none();
+    let section = section.unwrap_or("");
 
-    info.push_str("\r\n# Clients\r\n");
-    info.push_str(&format!("connected_clients:{}\r\n", connected));
-    info.push_str("\r\n# Stats\r\n");
-    info.push_str(&format!("total_commands_processed:{}\r\n", total_cmds));
-    info.push_str(&format!("total_keys:{}\r\n", db_size));
+    // Server section
+    if show_all || section == "server" || section == "all" || section == "default" {
+        info.push_str("# Server\r\n");
+        info.push_str("redust_version:0.1.0\r\n");
+        info.push_str(&format!("tcp_port:{}\r\n", metrics.tcp_port));
+        info.push_str(&format!("uptime_in_seconds:{}\r\n", uptime));
+        info.push_str(&format!("uptime_in_days:{}\r\n", uptime / 86400));
+        info.push_str("os:rust\r\n");
+        info.push_str("arch_bits:64\r\n");
+        info.push_str("process_id:1\r\n");
+        info.push_str("\r\n");
+    }
 
-    info.push_str("\r\n# Pubsub\r\n");
-    info.push_str(&format!(
-        "pubsub_channels:{}\r\n",
-        metrics.pubsub_channel_subs.load(Ordering::Relaxed)
-    ));
-    info.push_str(&format!(
-        "pubsub_patterns:{}\r\n",
-        metrics.pubsub_pattern_subs.load(Ordering::Relaxed)
-    ));
-    info.push_str(&format!(
-        "pubsub_shard_channels:{}\r\n",
-        metrics.pubsub_shard_subs.load(Ordering::Relaxed)
-    ));
-    info.push_str(&format!(
-        "pubsub_messages_delivered:{}\r\n",
-        metrics.pubsub_messages_delivered.load(Ordering::Relaxed)
-    ));
-    info.push_str(&format!(
-        "pubsub_messages_dropped:{}\r\n",
-        metrics.pubsub_messages_dropped.load(Ordering::Relaxed)
-    ));
+    // Memory section
+    if show_all || section == "memory" || section == "all" || section == "default" {
+        info.push_str("# Memory\r\n");
+        info.push_str(&format!("used_memory:{}\r\n", used_memory));
+        info.push_str(&format!("used_memory_human:{}\r\n", used_memory_human));
+        info.push_str(&format!("used_memory_peak:{}\r\n", used_memory));
+        info.push_str(&format!("used_memory_peak_human:{}\r\n", used_memory_human));
+        info.push_str(&format!("maxmemory:{}\r\n", maxmemory));
+        info.push_str(&format!("maxmemory_human:{}\r\n", maxmemory_human));
+        info.push_str(&format!("maxmemory_policy:{}\r\n", maxmemory_policy));
+        info.push_str("mem_fragmentation_ratio:1.00\r\n");
+        info.push_str("\r\n");
+    }
 
-    info.push_str("\r\n# Keyspace\r\n");
+    // Clients section
+    if show_all || section == "clients" || section == "all" || section == "default" {
+        info.push_str("# Clients\r\n");
+        info.push_str(&format!("connected_clients:{}\r\n", connected));
+        info.push_str("blocked_clients:0\r\n");
+        info.push_str("\r\n");
+    }
 
-    let all_keys = storage.keys("*");
-    let mut db_counts = [0usize; 16];
-    for k in all_keys {
-        if let Some((db_part, _rest)) = k.split_once(':') {
-            if let Ok(idx) = db_part.parse::<usize>() {
-                if idx < db_counts.len() {
-                    db_counts[idx] += 1;
+    // Stats section
+    if show_all || section == "stats" || section == "all" || section == "default" {
+        info.push_str("# Stats\r\n");
+        info.push_str(&format!("total_connections_received:{}\r\n", metrics.total_connections.load(Ordering::Relaxed)));
+        info.push_str(&format!("total_commands_processed:{}\r\n", total_cmds));
+        info.push_str(&format!("total_keys:{}\r\n", db_size));
+        info.push_str("instantaneous_ops_per_sec:0\r\n");
+        info.push_str("\r\n");
+    }
+
+    // Persistence section
+    if show_all || section == "persistence" || section == "all" || section == "default" {
+        info.push_str("# Persistence\r\n");
+        info.push_str("loading:0\r\n");
+        info.push_str("rdb_changes_since_last_save:0\r\n");
+        info.push_str("rdb_bgsave_in_progress:0\r\n");
+        info.push_str("rdb_last_save_time:0\r\n");
+        info.push_str("rdb_last_bgsave_status:ok\r\n");
+        info.push_str("aof_enabled:0\r\n");
+        info.push_str("aof_rewrite_in_progress:0\r\n");
+        info.push_str("\r\n");
+    }
+
+    // Replication section
+    if show_all || section == "replication" || section == "all" || section == "default" {
+        info.push_str("# Replication\r\n");
+        info.push_str("role:master\r\n");
+        info.push_str("connected_slaves:0\r\n");
+        info.push_str("\r\n");
+    }
+
+    // Pubsub section
+    if show_all || section == "pubsub" || section == "all" {
+        info.push_str("# Pubsub\r\n");
+        info.push_str(&format!(
+            "pubsub_channels:{}\r\n",
+            metrics.pubsub_channel_subs.load(Ordering::Relaxed)
+        ));
+        info.push_str(&format!(
+            "pubsub_patterns:{}\r\n",
+            metrics.pubsub_pattern_subs.load(Ordering::Relaxed)
+        ));
+        info.push_str(&format!(
+            "pubsub_shard_channels:{}\r\n",
+            metrics.pubsub_shard_subs.load(Ordering::Relaxed)
+        ));
+        info.push_str(&format!(
+            "pubsub_messages_delivered:{}\r\n",
+            metrics.pubsub_messages_delivered.load(Ordering::Relaxed)
+        ));
+        info.push_str(&format!(
+            "pubsub_messages_dropped:{}\r\n",
+            metrics.pubsub_messages_dropped.load(Ordering::Relaxed)
+        ));
+        info.push_str("\r\n");
+    }
+
+    // Keyspace section
+    if show_all || section == "keyspace" || section == "all" || section == "default" {
+        info.push_str("# Keyspace\r\n");
+
+        let all_keys = storage.keys("*");
+        let mut db_counts = [0usize; 16];
+        for k in all_keys {
+            if let Some((db_part, _rest)) = k.split_once(':') {
+                if let Ok(idx) = db_part.parse::<usize>() {
+                    if idx < db_counts.len() {
+                        db_counts[idx] += 1;
+                    }
                 }
             }
         }
-    }
 
-    // db0 始终输出（即便为 0），保证 INFO 总有一行 db0:keys=...
-    info.push_str(&format!("db0:keys={}\r\n", db_counts[0]));
+        // db0 始终输出
+        info.push_str(&format!("db0:keys={},expires=0,avg_ttl=0\r\n", db_counts[0]));
 
-    // 其他 DB 仅在有 key 时输出
-    for idx in 1..db_counts.len() {
-        let count = db_counts[idx];
-        if count > 0 {
-            info.push_str(&format!("db{}:keys={}\r\n", idx, count));
+        // 其他 DB 仅在有 key 时输出
+        for idx in 1..db_counts.len() {
+            let count = db_counts[idx];
+            if count > 0 {
+                info.push_str(&format!("db{}:keys={},expires=0,avg_ttl=0\r\n", idx, count));
+            }
         }
+        info.push_str("\r\n");
     }
-    info.push_str("\r\n");
 
     respond_bulk_string(writer, &info).await
 }
@@ -5134,6 +5190,7 @@ where
     info!("[conn] new connection from {}", client_addr);
 
     metrics.connected_clients.fetch_add(1, Ordering::Relaxed);
+    metrics.total_connections.fetch_add(1, Ordering::Relaxed);
 
     let mut reader = BufReader::new(read_half);
     let mut current_db: u8 = 0;
@@ -5143,12 +5200,21 @@ where
     let mut client_name = String::new();
 
     // 当前用户（默认用户，可通过 AUTH 切换）
-    let current_user = crate::acl::AclUser::default_user();
+    let mut current_user = crate::acl::AclUser::default_user();
 
-    let auth_password = env::var("REDUST_AUTH_PASSWORD")
+    // 认证模式：
+    // 1. 如果设置了 REDUST_AUTH_PASSWORD，使用传统单密码模式（向后兼容）
+    // 2. 否则检查 ACL 中 default 用户是否需要密码
+    let legacy_auth_password = env::var("REDUST_AUTH_PASSWORD")
         .ok()
         .filter(|s| !s.is_empty());
-    let mut authenticated = auth_password.is_none();
+    
+    // 判断是否需要认证：
+    // - 如果设置了 legacy password，需要认证
+    // - 如果 default 用户不是 nopass，需要认证
+    let default_user = acl_manager.get_user("default");
+    let default_needs_auth = default_user.as_ref().map(|u| !u.nopass).unwrap_or(false);
+    let mut authenticated = legacy_auth_password.is_none() && !default_needs_auth;
     let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<PubMessage>();
     let mut channel_subscriptions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut pattern_subscriptions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
@@ -5236,35 +5302,89 @@ where
         }
 
         // AUTH 处理与权限检查
-        if let Some(ref pwd) = auth_password {
-            match cmd {
-                Command::Auth { ref password } => {
-                    if password == pwd {
-                        authenticated = true;
-                        respond_simple_string(&mut write_half, "OK").await?;
-                    } else {
-                        respond_error(
-                            &mut write_half,
-                            "WRONGPASS invalid username-password pair or user is disabled",
-                        )
-                        .await?;
-                    }
-                    continue;
+        if let Command::Auth { ref username, ref password } = cmd {
+            // 处理 AUTH 命令
+            if let Some(ref legacy_pwd) = legacy_auth_password {
+                // 传统单密码模式（向后兼容）
+                // 在此模式下，忽略 username，只检查 password
+                if password == legacy_pwd {
+                    authenticated = true;
+                    current_user = crate::acl::AclUser::default_user();
+                    respond_simple_string(&mut write_half, "OK").await?;
+                } else {
+                    respond_error(
+                        &mut write_half,
+                        "WRONGPASS invalid username-password pair or user is disabled",
+                    )
+                    .await?;
                 }
+            } else {
+                // ACL 模式：使用 AclManager 进行认证
+                let target_username = username.as_deref().unwrap_or("default");
+                match acl_manager.authenticate(target_username, password) {
+                    Ok(user) => {
+                        authenticated = true;
+                        current_user = user;
+                        respond_simple_string(&mut write_half, "OK").await?;
+                    }
+                    Err(e) => {
+                        respond_error(&mut write_half, &e).await?;
+                    }
+                }
+            }
+            continue;
+        }
+        
+        // 未认证时的命令限制
+        if !authenticated {
+            match cmd {
                 Command::Ping | Command::PingWithPayload(_) | Command::Echo(_) | Command::Quit => {
                     // 这些命令在未认证时仍然允许
                 }
                 _ => {
-                    if !authenticated {
-                        respond_error(&mut write_half, "NOAUTH Authentication required").await?;
-                        continue;
-                    }
+                    respond_error(&mut write_half, "NOAUTH Authentication required").await?;
+                    continue;
                 }
             }
-        } else if let Command::Auth { .. } = cmd {
-            // 未启用 AUTH，但客户端仍然发送 AUTH
-            respond_error(&mut write_half, "ERR AUTH not enabled").await?;
-            continue;
+        }
+
+        // ACL 权限检查（仅在非传统密码模式下生效）
+        if legacy_auth_password.is_none() && authenticated {
+            // 检查命令权限
+            if !current_user.can_execute_command(cmd.name()) {
+                respond_error(
+                    &mut write_half,
+                    &format!(
+                        "NOPERM this user has no permissions to run the '{}' command",
+                        cmd.name()
+                    ),
+                )
+                .await?;
+                continue;
+            }
+
+            // 检查 key 权限
+            let keys = cmd.keys();
+            if !keys.is_empty() {
+                let mut denied_key = None;
+                for key in &keys {
+                    if !current_user.can_access_key(key) {
+                        denied_key = Some(*key);
+                        break;
+                    }
+                }
+                if let Some(key) = denied_key {
+                    respond_error(
+                        &mut write_half,
+                        &format!(
+                            "NOPERM this user has no permissions to access the '{}' key",
+                            key
+                        ),
+                    )
+                    .await?;
+                    continue;
+                }
+            }
         }
 
         if subscribed_mode {
@@ -5593,8 +5713,8 @@ where
             }
 
             // info
-            Command::Info => {
-                handle_info_command(&storage, &metrics, &mut write_half).await?;
+            Command::Info { section } => {
+                handle_info_command(&storage, &metrics, section.as_deref(), &mut write_half).await?;
             }
 
             // 多 DB：SELECT
@@ -6213,6 +6333,28 @@ where
                     respond_bulk_string(&mut write_half, cat).await?;
                 }
             }
+            Command::AclSave => {
+                let acl_path = env::var("REDUST_ACL_FILE").unwrap_or_else(|_| "./redust.acl".to_string());
+                match acl_manager.save(&acl_path) {
+                    Ok(()) => {
+                        respond_simple_string(&mut write_half, "OK").await?;
+                    }
+                    Err(e) => {
+                        respond_error(&mut write_half, &format!("ERR saving ACL file: {}", e)).await?;
+                    }
+                }
+            }
+            Command::AclLoad => {
+                let acl_path = env::var("REDUST_ACL_FILE").unwrap_or_else(|_| "./redust.acl".to_string());
+                match acl_manager.load(&acl_path) {
+                    Ok(count) => {
+                        respond_simple_string(&mut write_half, &format!("OK, {} users loaded", count)).await?;
+                    }
+                    Err(e) => {
+                        respond_error(&mut write_half, &format!("ERR loading ACL file: {}", e)).await?;
+                    }
+                }
+            }
 
             // 解析阶段构造的错误命令
             Command::Error(msg) => {
@@ -6436,6 +6578,7 @@ async fn serve_impl(
     let metrics = Arc::new(Metrics {
         start_time: Instant::now(),
         connected_clients: AtomicUsize::new(0),
+        total_connections: AtomicU64::new(0),
         total_commands: AtomicU64::new(0),
         tcp_port: port,
         pubsub_channel_subs: AtomicU64::new(0),

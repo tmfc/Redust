@@ -1,5 +1,8 @@
 //! ACL 命令集成测试
 
+mod env_guard;
+
+use env_guard::set_env;
 use std::future;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -228,4 +231,181 @@ async fn acl_cat_returns_categories() {
     assert!(result.contains(&"hash".to_string()));
     assert!(result.contains(&"sortedset".to_string()));
     assert!(result.contains(&"pubsub".to_string()));
+}
+
+#[tokio::test]
+async fn auth_with_acl_user() {
+    let port = spawn_server().await;
+    let mut client = TestClient::connect(port).await;
+
+    // 创建一个需要密码的用户
+    client
+        .send("*6\r\n$3\r\nACL\r\n$7\r\nSETUSER\r\n$5\r\nalice\r\n$2\r\non\r\n$7\r\n>secret\r\n$5\r\n+@all\r\n")
+        .await;
+    let result = client.read_line().await;
+    assert!(result.starts_with("+OK"));
+
+    // 使用 AUTH username password 格式认证
+    client
+        .send("*3\r\n$4\r\nAUTH\r\n$5\r\nalice\r\n$6\r\nsecret\r\n")
+        .await;
+    let result = client.read_line().await;
+    assert!(result.starts_with("+OK"));
+
+    // 验证当前用户已切换
+    client.send("*2\r\n$3\r\nACL\r\n$6\r\nWHOAMI\r\n").await;
+    let result = client.read_bulk().await;
+    assert_eq!(result, "alice");
+}
+
+#[tokio::test]
+async fn auth_with_wrong_password() {
+    let port = spawn_server().await;
+    let mut client = TestClient::connect(port).await;
+
+    // 创建一个需要密码的用户
+    client
+        .send("*6\r\n$3\r\nACL\r\n$7\r\nSETUSER\r\n$3\r\nbob\r\n$2\r\non\r\n$8\r\n>mypass\r\n$5\r\n+@all\r\n")
+        .await;
+    let _ = client.read_line().await;
+
+    // 需要用新连接来测试认证（ACL 是全局共享的）
+    let mut client2 = TestClient::connect(port).await;
+    
+    // 使用错误密码认证
+    client2
+        .send("*3\r\n$4\r\nAUTH\r\n$3\r\nbob\r\n$5\r\nwrong\r\n")
+        .await;
+    let result = client2.read_line().await;
+    assert!(result.contains("WRONGPASS") || result.contains("invalid"));
+}
+
+#[tokio::test]
+async fn auth_single_password_format() {
+    let port = spawn_server().await;
+    let mut client = TestClient::connect(port).await;
+
+    // 默认用户是 nopass，所以单密码格式的 AUTH 应该成功
+    // AUTH password 格式（使用 default 用户）
+    client
+        .send("*2\r\n$4\r\nAUTH\r\n$8\r\nanything\r\n")
+        .await;
+    let result = client.read_line().await;
+    // 默认用户是 nopass，任何密码都应该成功
+    assert!(result.starts_with("+OK"));
+
+    // 验证当前用户是 default
+    client.send("*2\r\n$3\r\nACL\r\n$6\r\nWHOAMI\r\n").await;
+    let result = client.read_bulk().await;
+    assert_eq!(result, "default");
+}
+
+#[tokio::test]
+async fn acl_command_permission_check() {
+    let port = spawn_server().await;
+    let mut client = TestClient::connect(port).await;
+
+    // 创建一个只允许 GET 命令的用户
+    client
+        .send("*7\r\n$3\r\nACL\r\n$7\r\nSETUSER\r\n$8\r\nreadonly\r\n$2\r\non\r\n$6\r\nnopass\r\n$4\r\n+get\r\n$5\r\n~foo*\r\n")
+        .await;
+    let _ = client.read_line().await;
+
+    // 用新连接以 readonly 用户登录
+    let mut client2 = TestClient::connect(port).await;
+    client2
+        .send("*3\r\n$4\r\nAUTH\r\n$8\r\nreadonly\r\n$3\r\nany\r\n")
+        .await;
+    let result = client2.read_line().await;
+    assert!(result.starts_with("+OK"));
+
+    // GET 命令应该被允许（在允许的 key 上）
+    // 先用 default 用户设置一个 key
+    client.send("*3\r\n$3\r\nSET\r\n$4\r\nfoo1\r\n$3\r\nbar\r\n").await;
+    let _ = client.read_line().await;
+
+    client2.send("*2\r\n$3\r\nGET\r\n$4\r\nfoo1\r\n").await;
+    let _ = client2.read_line().await; // $3
+    let result = client2.read_line().await;
+    assert_eq!(result.trim(), "bar");
+
+    // SET 命令应该被拒绝
+    client2.send("*3\r\n$3\r\nSET\r\n$4\r\nfoo2\r\n$3\r\nbaz\r\n").await;
+    let result = client2.read_line().await;
+    assert!(result.contains("NOPERM"));
+}
+
+#[tokio::test]
+async fn acl_key_permission_check() {
+    let port = spawn_server().await;
+    let mut client = TestClient::connect(port).await;
+
+    // 创建一个只允许访问 user:* 模式 key 的用户
+    client
+        .send("*7\r\n$3\r\nACL\r\n$7\r\nSETUSER\r\n$8\r\nuseronly\r\n$2\r\non\r\n$6\r\nnopass\r\n$5\r\n+@all\r\n$7\r\n~user:*\r\n")
+        .await;
+    let _ = client.read_line().await;
+
+    // 用新连接以 useronly 用户登录
+    let mut client2 = TestClient::connect(port).await;
+    client2
+        .send("*3\r\n$4\r\nAUTH\r\n$8\r\nuseronly\r\n$3\r\nany\r\n")
+        .await;
+    let result = client2.read_line().await;
+    assert!(result.starts_with("+OK"));
+
+    // 访问 user:123 应该被允许
+    client2.send("*3\r\n$3\r\nSET\r\n$8\r\nuser:123\r\n$5\r\nhello\r\n").await;
+    let result = client2.read_line().await;
+    assert!(result.starts_with("+OK"));
+
+    // 访问 admin:123 应该被拒绝
+    client2.send("*3\r\n$3\r\nSET\r\n$9\r\nadmin:123\r\n$5\r\nworld\r\n").await;
+    let result = client2.read_line().await;
+    assert!(result.contains("NOPERM"));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn acl_save_and_load() {
+    // 使用临时文件路径，避免污染项目根目录
+    let temp_dir = std::env::temp_dir();
+    let acl_file = temp_dir.join(format!("redust_test_{}.acl", std::process::id()));
+    let _guard = set_env("REDUST_ACL_FILE", acl_file.to_str().unwrap());
+    
+    let port = spawn_server().await;
+    let mut client = TestClient::connect(port).await;
+
+    // 创建一个测试用户
+    client
+        .send("*6\r\n$3\r\nACL\r\n$7\r\nSETUSER\r\n$8\r\ntestuser\r\n$2\r\non\r\n$6\r\nnopass\r\n$5\r\n+@all\r\n")
+        .await;
+    let _ = client.read_line().await;
+
+    // ACL SAVE 应该成功
+    client.send("*2\r\n$3\r\nACL\r\n$4\r\nSAVE\r\n").await;
+    let result = client.read_line().await;
+    assert!(result.starts_with("+OK"));
+
+    // 删除用户
+    client.send("*3\r\n$3\r\nACL\r\n$7\r\nDELUSER\r\n$8\r\ntestuser\r\n").await;
+    let _ = client.read_line().await;
+
+    // 验证用户已删除
+    client.send("*2\r\n$3\r\nACL\r\n$5\r\nUSERS\r\n").await;
+    let users = client.read_array().await;
+    assert!(!users.contains(&"testuser".to_string()));
+
+    // ACL LOAD 应该恢复用户
+    client.send("*2\r\n$3\r\nACL\r\n$4\r\nLOAD\r\n").await;
+    let result = client.read_line().await;
+    assert!(result.starts_with("+OK"));
+
+    // 验证用户已恢复
+    client.send("*2\r\n$3\r\nACL\r\n$5\r\nUSERS\r\n").await;
+    let users = client.read_array().await;
+    assert!(users.contains(&"testuser".to_string()));
+    
+    // 清理临时文件
+    let _ = std::fs::remove_file(&acl_file);
 }

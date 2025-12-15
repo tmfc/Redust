@@ -628,8 +628,11 @@ pub enum Command {
     Persist {
         key: String,
     },
-    Info,
+    Info {
+        section: Option<String>,
+    },
     Auth {
+        username: Option<String>,
         password: String,
     },
     Select {
@@ -877,6 +880,8 @@ pub enum Command {
     AclCat {
         category: Option<String>,
     },
+    AclSave,
+    AclLoad,
     SlowlogGet {
         count: Option<usize>,
     },
@@ -885,6 +890,381 @@ pub enum Command {
     Unknown(Vec<Binary>),
     /// Represents an error that should be sent back to the client.
     Error(String),
+}
+
+impl Command {
+    /// 获取命令名称（小写）
+    pub fn name(&self) -> &'static str {
+        match self {
+            Command::Ping | Command::PingWithPayload(_) => "ping",
+            Command::Echo(_) => "echo",
+            Command::Quit => "quit",
+            Command::Time => "time",
+            Command::Randomkey => "randomkey",
+            Command::Set { .. } => "set",
+            Command::Get { .. } => "get",
+            Command::Getdel { .. } => "getdel",
+            Command::Getex { .. } => "getex",
+            Command::Getrange { .. } => "getrange",
+            Command::Setrange { .. } => "setrange",
+            Command::Setbit { .. } => "setbit",
+            Command::Getbit { .. } => "getbit",
+            Command::Bitcount { .. } => "bitcount",
+            Command::Bitop { .. } => "bitop",
+            Command::Bitpos { .. } => "bitpos",
+            Command::Bitfield { .. } => "bitfield",
+            Command::BitfieldRo { .. } => "bitfield_ro",
+            Command::Del { .. } => "del",
+            Command::Unlink { .. } => "unlink",
+            Command::Touch { .. } => "touch",
+            Command::Exists { .. } => "exists",
+            Command::Incr { .. } => "incr",
+            Command::Decr { .. } => "decr",
+            Command::Incrby { .. } => "incrby",
+            Command::Decrby { .. } => "decrby",
+            Command::Incrbyfloat { .. } => "incrbyfloat",
+            Command::Append { .. } => "append",
+            Command::Strlen { .. } => "strlen",
+            Command::Lpush { .. } => "lpush",
+            Command::Rpush { .. } => "rpush",
+            Command::Lpop { .. } => "lpop",
+            Command::Rpop { .. } => "rpop",
+            Command::Lrange { .. } => "lrange",
+            Command::Llen { .. } => "llen",
+            Command::Lindex { .. } => "lindex",
+            Command::Lset { .. } => "lset",
+            Command::Lrem { .. } => "lrem",
+            Command::Ltrim { .. } => "ltrim",
+            Command::Linsert { .. } => "linsert",
+            Command::Rpoplpush { .. } => "rpoplpush",
+            Command::Lpos { .. } => "lpos",
+            Command::Blpop { .. } => "blpop",
+            Command::Brpop { .. } => "brpop",
+            Command::Sadd { .. } => "sadd",
+            Command::Srem { .. } => "srem",
+            Command::Smembers { .. } => "smembers",
+            Command::Scard { .. } => "scard",
+            Command::Sismember { .. } => "sismember",
+            Command::Sinter { .. } => "sinter",
+            Command::Sunion { .. } => "sunion",
+            Command::Sdiff { .. } => "sdiff",
+            Command::Sinterstore { .. } => "sinterstore",
+            Command::Sunionstore { .. } => "sunionstore",
+            Command::Sdiffstore { .. } => "sdiffstore",
+            Command::Spop { .. } => "spop",
+            Command::Srandmember { .. } => "srandmember",
+            Command::Smove { .. } => "smove",
+            Command::Sscan { .. } => "sscan",
+            Command::Hset { .. } => "hset",
+            Command::Hget { .. } => "hget",
+            Command::Hmset { .. } => "hmset",
+            Command::Hmget { .. } => "hmget",
+            Command::Hgetall { .. } => "hgetall",
+            Command::Hdel { .. } => "hdel",
+            Command::Hexists { .. } => "hexists",
+            Command::Hlen { .. } => "hlen",
+            Command::Hkeys { .. } => "hkeys",
+            Command::Hvals { .. } => "hvals",
+            Command::Hincrby { .. } => "hincrby",
+            Command::Hincrbyfloat { .. } => "hincrbyfloat",
+            Command::Hsetnx { .. } => "hsetnx",
+            Command::Hstrlen { .. } => "hstrlen",
+            Command::Hscan { .. } => "hscan",
+            Command::Zadd { .. } => "zadd",
+            Command::Zrem { .. } => "zrem",
+            Command::Zscore { .. } => "zscore",
+            Command::Zmscore { .. } => "zmscore",
+            Command::Zrank { .. } => "zrank",
+            Command::Zrevrank { .. } => "zrevrank",
+            Command::Zrange { .. } => "zrange",
+            Command::Zcard { .. } => "zcard",
+            Command::Zcount { .. } => "zcount",
+            Command::Zincrby { .. } => "zincrby",
+            Command::Zinter { .. } => "zinter",
+            Command::Zunion { .. } => "zunion",
+            Command::Zdiff { .. } => "zdiff",
+            Command::Zinterstore { .. } => "zinterstore",
+            Command::Zunionstore { .. } => "zunionstore",
+            Command::Zdiffstore { .. } => "zdiffstore",
+            Command::Zpopmin { .. } => "zpopmin",
+            Command::Zpopmax { .. } => "zpopmax",
+            Command::Zlexcount { .. } => "zlexcount",
+            Command::Zscan { .. } => "zscan",
+            Command::Pfadd { .. } => "pfadd",
+            Command::Pfcount { .. } => "pfcount",
+            Command::Pfmerge { .. } => "pfmerge",
+            Command::Geoadd { .. } => "geoadd",
+            Command::Geopos { .. } => "geopos",
+            Command::Geodist { .. } => "geodist",
+            Command::Geohash { .. } => "geohash",
+            Command::Geosearch { .. } => "geosearch",
+            Command::Xadd { .. } => "xadd",
+            Command::Xlen { .. } => "xlen",
+            Command::Xrange { .. } => "xrange",
+            Command::Xread { .. } => "xread",
+            Command::XinfoStream { .. } => "xinfo",
+            Command::XgroupCreate { .. } => "xgroup",
+            Command::XgroupSetid { .. } => "xgroup",
+            Command::XgroupDestroy { .. } => "xgroup",
+            Command::XgroupCreateconsumer { .. } => "xgroup",
+            Command::XgroupDelconsumer { .. } => "xgroup",
+            Command::Xreadgroup { .. } => "xreadgroup",
+            Command::Xack { .. } => "xack",
+            Command::Xpending { .. } => "xpending",
+            Command::Xclaim { .. } => "xclaim",
+            Command::Type { .. } => "type",
+            Command::Keys { .. } => "keys",
+            Command::Scan { .. } => "scan",
+            Command::Dbsize => "dbsize",
+            Command::Flushdb => "flushdb",
+            Command::Flushall => "flushall",
+            Command::Save => "save",
+            Command::Bgsave => "bgsave",
+            Command::Lastsave => "lastsave",
+            Command::Expire { .. } => "expire",
+            Command::Pexpire { .. } => "pexpire",
+            Command::Expireat { .. } => "expireat",
+            Command::Pexpireat { .. } => "pexpireat",
+            Command::Ttl { .. } => "ttl",
+            Command::Pttl { .. } => "pttl",
+            Command::Expiretime { .. } => "expiretime",
+            Command::Pexpiretime { .. } => "pexpiretime",
+            Command::Persist { .. } => "persist",
+            Command::Info { .. } => "info",
+            Command::Auth { .. } => "auth",
+            Command::Select { .. } => "select",
+            Command::Mget { .. } => "mget",
+            Command::Mset { .. } => "mset",
+            Command::Msetnx { .. } => "msetnx",
+            Command::Rename { .. } => "rename",
+            Command::Renamenx { .. } => "renamenx",
+            Command::Copy { .. } => "copy",
+            Command::ObjectEncoding { .. } => "object",
+            Command::Setnx { .. } => "setnx",
+            Command::Setex { .. } => "setex",
+            Command::Psetex { .. } => "psetex",
+            Command::Getset { .. } => "getset",
+            Command::Multi => "multi",
+            Command::Exec => "exec",
+            Command::Discard => "discard",
+            Command::Watch { .. } => "watch",
+            Command::Unwatch => "unwatch",
+            Command::Publish { .. } => "publish",
+            Command::Subscribe { .. } => "subscribe",
+            Command::Unsubscribe { .. } => "unsubscribe",
+            Command::Psubscribe { .. } => "psubscribe",
+            Command::Punsubscribe { .. } => "punsubscribe",
+            Command::Spublish { .. } => "spublish",
+            Command::Ssubscribe { .. } => "ssubscribe",
+            Command::Sunsubscribe { .. } => "sunsubscribe",
+            Command::PubsubChannels { .. } => "pubsub",
+            Command::PubsubNumsub { .. } => "pubsub",
+            Command::PubsubNumpat => "pubsub",
+            Command::PubsubShardchannels { .. } => "pubsub",
+            Command::PubsubShardnumsub { .. } => "pubsub",
+            Command::PubsubHelp => "pubsub",
+            Command::Eval { .. } => "eval",
+            Command::Evalsha { .. } => "evalsha",
+            Command::ScriptLoad { .. } => "script",
+            Command::ScriptExists { .. } => "script",
+            Command::ScriptFlush => "script",
+            Command::ConfigGet { .. } => "config",
+            Command::ConfigSet { .. } => "config",
+            Command::ClientList => "client",
+            Command::ClientId => "client",
+            Command::ClientSetname { .. } => "client",
+            Command::ClientGetname => "client",
+            Command::ClientPause { .. } => "client",
+            Command::ClientUnpause => "client",
+            Command::ClientUnblock { .. } => "client",
+            Command::AclList => "acl",
+            Command::AclUsers => "acl",
+            Command::AclWhoami => "acl",
+            Command::AclSetuser { .. } => "acl",
+            Command::AclDeluser { .. } => "acl",
+            Command::AclGetuser { .. } => "acl",
+            Command::AclCat { .. } => "acl",
+            Command::AclSave => "acl",
+            Command::AclLoad => "acl",
+            Command::SlowlogGet { .. } => "slowlog",
+            Command::SlowlogReset => "slowlog",
+            Command::SlowlogLen => "slowlog",
+            Command::Unknown(_) => "unknown",
+            Command::Error(_) => "error",
+        }
+    }
+
+    /// 获取命令涉及的 key（如果有）
+    pub fn keys(&self) -> Vec<&str> {
+        match self {
+            Command::Set { key, .. } => vec![key.as_str()],
+            Command::Get { key } => vec![key.as_str()],
+            Command::Getdel { key } => vec![key.as_str()],
+            Command::Getex { key, .. } => vec![key.as_str()],
+            Command::Getrange { key, .. } => vec![key.as_str()],
+            Command::Setrange { key, .. } => vec![key.as_str()],
+            Command::Setbit { key, .. } => vec![key.as_str()],
+            Command::Getbit { key, .. } => vec![key.as_str()],
+            Command::Bitcount { key, .. } => vec![key.as_str()],
+            Command::Bitpos { key, .. } => vec![key.as_str()],
+            Command::Bitfield { key, .. } => vec![key.as_str()],
+            Command::BitfieldRo { key, .. } => vec![key.as_str()],
+            Command::Del { keys } => keys.iter().map(|k| k.as_str()).collect(),
+            Command::Unlink { keys } => keys.iter().map(|k| k.as_str()).collect(),
+            Command::Touch { keys } => keys.iter().map(|k| k.as_str()).collect(),
+            Command::Exists { keys } => keys.iter().map(|k| k.as_str()).collect(),
+            Command::Incr { key } => vec![key.as_str()],
+            Command::Decr { key } => vec![key.as_str()],
+            Command::Incrby { key, .. } => vec![key.as_str()],
+            Command::Decrby { key, .. } => vec![key.as_str()],
+            Command::Incrbyfloat { key, .. } => vec![key.as_str()],
+            Command::Append { key, .. } => vec![key.as_str()],
+            Command::Strlen { key } => vec![key.as_str()],
+            Command::Lpush { key, .. } => vec![key.as_str()],
+            Command::Rpush { key, .. } => vec![key.as_str()],
+            Command::Lpop { key, .. } => vec![key.as_str()],
+            Command::Rpop { key, .. } => vec![key.as_str()],
+            Command::Lrange { key, .. } => vec![key.as_str()],
+            Command::Llen { key } => vec![key.as_str()],
+            Command::Lindex { key, .. } => vec![key.as_str()],
+            Command::Lset { key, .. } => vec![key.as_str()],
+            Command::Lrem { key, .. } => vec![key.as_str()],
+            Command::Ltrim { key, .. } => vec![key.as_str()],
+            Command::Linsert { key, .. } => vec![key.as_str()],
+            Command::Rpoplpush { source, destination } => vec![source.as_str(), destination.as_str()],
+            Command::Lpos { key, .. } => vec![key.as_str()],
+            Command::Blpop { keys, .. } => keys.iter().map(|k| k.as_str()).collect(),
+            Command::Brpop { keys, .. } => keys.iter().map(|k| k.as_str()).collect(),
+            Command::Sadd { key, .. } => vec![key.as_str()],
+            Command::Srem { key, .. } => vec![key.as_str()],
+            Command::Smembers { key } => vec![key.as_str()],
+            Command::Scard { key } => vec![key.as_str()],
+            Command::Sismember { key, .. } => vec![key.as_str()],
+            Command::Sinter { keys } => keys.iter().map(|k| k.as_str()).collect(),
+            Command::Sunion { keys } => keys.iter().map(|k| k.as_str()).collect(),
+            Command::Sdiff { keys } => keys.iter().map(|k| k.as_str()).collect(),
+            Command::Sinterstore { dest, keys } => {
+                let mut result = vec![dest.as_str()];
+                result.extend(keys.iter().map(|k| k.as_str()));
+                result
+            }
+            Command::Sunionstore { dest, keys } => {
+                let mut result = vec![dest.as_str()];
+                result.extend(keys.iter().map(|k| k.as_str()));
+                result
+            }
+            Command::Sdiffstore { dest, keys } => {
+                let mut result = vec![dest.as_str()];
+                result.extend(keys.iter().map(|k| k.as_str()));
+                result
+            }
+            Command::Spop { key, .. } => vec![key.as_str()],
+            Command::Srandmember { key, .. } => vec![key.as_str()],
+            Command::Smove { source, destination, .. } => vec![source.as_str(), destination.as_str()],
+            Command::Sscan { key, .. } => vec![key.as_str()],
+            Command::Hset { key, .. } => vec![key.as_str()],
+            Command::Hget { key, .. } => vec![key.as_str()],
+            Command::Hmset { key, .. } => vec![key.as_str()],
+            Command::Hmget { key, .. } => vec![key.as_str()],
+            Command::Hgetall { key } => vec![key.as_str()],
+            Command::Hdel { key, .. } => vec![key.as_str()],
+            Command::Hexists { key, .. } => vec![key.as_str()],
+            Command::Hlen { key } => vec![key.as_str()],
+            Command::Hkeys { key } => vec![key.as_str()],
+            Command::Hvals { key } => vec![key.as_str()],
+            Command::Hincrby { key, .. } => vec![key.as_str()],
+            Command::Hincrbyfloat { key, .. } => vec![key.as_str()],
+            Command::Hsetnx { key, .. } => vec![key.as_str()],
+            Command::Hstrlen { key, .. } => vec![key.as_str()],
+            Command::Hscan { key, .. } => vec![key.as_str()],
+            Command::Zadd { key, .. } => vec![key.as_str()],
+            Command::Zrem { key, .. } => vec![key.as_str()],
+            Command::Zscore { key, .. } => vec![key.as_str()],
+            Command::Zmscore { key, .. } => vec![key.as_str()],
+            Command::Zrank { key, .. } => vec![key.as_str()],
+            Command::Zrevrank { key, .. } => vec![key.as_str()],
+            Command::Zrange { key, .. } => vec![key.as_str()],
+            Command::Zcard { key } => vec![key.as_str()],
+            Command::Zcount { key, .. } => vec![key.as_str()],
+            Command::Zincrby { key, .. } => vec![key.as_str()],
+            Command::Zinter { keys, .. } => keys.iter().map(|k| k.as_str()).collect(),
+            Command::Zunion { keys, .. } => keys.iter().map(|k| k.as_str()).collect(),
+            Command::Zdiff { keys, .. } => keys.iter().map(|k| k.as_str()).collect(),
+            Command::Zinterstore { destination, keys, .. } => {
+                let mut result = vec![destination.as_str()];
+                result.extend(keys.iter().map(|k| k.as_str()));
+                result
+            }
+            Command::Zunionstore { destination, keys, .. } => {
+                let mut result = vec![destination.as_str()];
+                result.extend(keys.iter().map(|k| k.as_str()));
+                result
+            }
+            Command::Zdiffstore { destination, keys } => {
+                let mut result = vec![destination.as_str()];
+                result.extend(keys.iter().map(|k| k.as_str()));
+                result
+            }
+            Command::Zpopmin { key, .. } => vec![key.as_str()],
+            Command::Zpopmax { key, .. } => vec![key.as_str()],
+            Command::Zlexcount { key, .. } => vec![key.as_str()],
+            Command::Zscan { key, .. } => vec![key.as_str()],
+            Command::Pfadd { key, .. } => vec![key.as_str()],
+            Command::Pfcount { keys } => keys.iter().map(|k| k.as_str()).collect(),
+            Command::Pfmerge { destkey, sourcekeys } => {
+                let mut result = vec![destkey.as_str()];
+                result.extend(sourcekeys.iter().map(|k| k.as_str()));
+                result
+            }
+            Command::Geoadd { key, .. } => vec![key.as_str()],
+            Command::Geopos { key, .. } => vec![key.as_str()],
+            Command::Geodist { key, .. } => vec![key.as_str()],
+            Command::Geohash { key, .. } => vec![key.as_str()],
+            Command::Geosearch { key, .. } => vec![key.as_str()],
+            Command::Xadd { key, .. } => vec![key.as_str()],
+            Command::Xlen { key } => vec![key.as_str()],
+            Command::Xrange { key, .. } => vec![key.as_str()],
+            Command::Xread { streams, .. } => streams.iter().map(|(k, _)| k.as_str()).collect(),
+            Command::XinfoStream { key } => vec![key.as_str()],
+            Command::XgroupCreate { key, .. } => vec![key.as_str()],
+            Command::XgroupSetid { key, .. } => vec![key.as_str()],
+            Command::XgroupDestroy { key, .. } => vec![key.as_str()],
+            Command::XgroupCreateconsumer { key, .. } => vec![key.as_str()],
+            Command::XgroupDelconsumer { key, .. } => vec![key.as_str()],
+            Command::Xreadgroup { streams, .. } => streams.iter().map(|(k, _)| k.as_str()).collect(),
+            Command::Xack { key, .. } => vec![key.as_str()],
+            Command::Xpending { key, .. } => vec![key.as_str()],
+            Command::Xclaim { key, .. } => vec![key.as_str()],
+            Command::Type { key } => vec![key.as_str()],
+            Command::Expire { key, .. } => vec![key.as_str()],
+            Command::Pexpire { key, .. } => vec![key.as_str()],
+            Command::Expireat { key, .. } => vec![key.as_str()],
+            Command::Pexpireat { key, .. } => vec![key.as_str()],
+            Command::Ttl { key } => vec![key.as_str()],
+            Command::Pttl { key } => vec![key.as_str()],
+            Command::Expiretime { key } => vec![key.as_str()],
+            Command::Pexpiretime { key } => vec![key.as_str()],
+            Command::Persist { key } => vec![key.as_str()],
+            Command::Mget { keys } => keys.iter().map(|k| k.as_str()).collect(),
+            Command::Mset { pairs } => pairs.iter().map(|(k, _)| k.as_str()).collect(),
+            Command::Msetnx { pairs } => pairs.iter().map(|(k, _)| k.as_str()).collect(),
+            Command::Rename { key, newkey } => vec![key.as_str(), newkey.as_str()],
+            Command::Renamenx { key, newkey } => vec![key.as_str(), newkey.as_str()],
+            Command::Copy { source, destination, .. } => vec![source.as_str(), destination.as_str()],
+            Command::Setnx { key, .. } => vec![key.as_str()],
+            Command::Setex { key, .. } => vec![key.as_str()],
+            Command::Psetex { key, .. } => vec![key.as_str()],
+            Command::Getset { key, .. } => vec![key.as_str()],
+            Command::Watch { keys } => keys.iter().map(|k| k.as_str()).collect(),
+            Command::Bitop { destkey, keys, .. } => {
+                let mut result = vec![destkey.as_str()];
+                result.extend(keys.iter().map(|k| k.as_str()));
+                result
+            }
+            // 以下命令不涉及特定 key
+            _ => vec![],
+        }
+    }
 }
 
 fn err_wrong_args(cmd: &str) -> Command {
@@ -4890,23 +5270,49 @@ pub async fn read_command<R: AsyncRead + Unpin>(
             Command::Persist { key }
         }
         "INFO" => {
+            let section = if let Some(section_bytes) = iter.next() {
+                Some(match parse_bulk_string(section_bytes) {
+                    Ok(s) => s.to_lowercase(),
+                    Err(e) => return Ok(Some(e)),
+                })
+            } else {
+                None
+            };
             if iter.next().is_some() {
                 return Ok(Some(err_wrong_args("info")));
             }
-            Command::Info
+            Command::Info { section }
         }
         "AUTH" => {
-            let Some(password_bytes) = iter.next() else {
+            let Some(first_bytes) = iter.next() else {
                 return Ok(Some(err_wrong_args("auth")));
             };
-            let password = match parse_bulk_string(password_bytes) {
+            let first = match parse_bulk_string(first_bytes) {
                 Ok(p) => p,
                 Err(e) => return Ok(Some(e)),
             };
-            if iter.next().is_some() {
-                return Ok(Some(err_wrong_args("auth")));
+            // AUTH 支持两种格式：
+            // AUTH password - 使用 default 用户
+            // AUTH username password - 指定用户名
+            match iter.next() {
+                Some(second_bytes) => {
+                    let second = match parse_bulk_string(second_bytes) {
+                        Ok(p) => p,
+                        Err(e) => return Ok(Some(e)),
+                    };
+                    if iter.next().is_some() {
+                        return Ok(Some(err_wrong_args("auth")));
+                    }
+                    Command::Auth {
+                        username: Some(first),
+                        password: second,
+                    }
+                }
+                None => Command::Auth {
+                    username: None,
+                    password: first,
+                },
             }
-            Command::Auth { password }
         }
         "SELECT" => {
             let Some(db_bytes) = iter.next() else {
@@ -5607,6 +6013,18 @@ pub async fn read_command<R: AsyncRead + Unpin>(
                         None
                     };
                     Command::AclCat { category }
+                }
+                "SAVE" => {
+                    if iter.next().is_some() {
+                        return Ok(Some(err_wrong_args("acl|save")));
+                    }
+                    Command::AclSave
+                }
+                "LOAD" => {
+                    if iter.next().is_some() {
+                        return Ok(Some(err_wrong_args("acl|load")));
+                    }
+                    Command::AclLoad
                 }
                 _ => Command::Error(format!(
                     "ERR Unknown subcommand or wrong number of arguments for 'acl|{}'",

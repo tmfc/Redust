@@ -1,3 +1,4 @@
 /target
 *.rdb*
+*.acl
 tmux*.log

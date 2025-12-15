@@ -68,10 +68,11 @@ async fn auth_not_enabled_behaviour() {
     let (addr, shutdown, handle) = spawn_server().await;
     let mut client = TestClient::connect(addr).await;
 
-    // AUTH 在未启用时应返回 ERR AUTH not enabled
+    // ACL 模式下，默认用户是 nopass，所以 AUTH 会成功
+    // （这是 ACL 集成后的新行为）
     client.send_array(&["AUTH", "secret"]).await;
     let line = client.read_line().await;
-    assert!(line.starts_with("-ERR AUTH not enabled"));
+    assert_eq!(line, "+OK\r\n");
 
     // 其他命令不受影响
     client.send_array(&["SET", "k", "v"]).await;

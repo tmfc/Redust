@@ -405,6 +405,88 @@ impl AclManager {
         
         Ok(user.clone())
     }
+
+    /// 保存 ACL 配置到文件
+    pub fn save(&self, path: &str) -> std::io::Result<()> {
+        use std::fs::File;
+        use std::io::Write;
+        
+        let mut file = File::create(path)?;
+        
+        for entry in self.users.iter() {
+            let user = entry.value();
+            writeln!(file, "{}", user.to_acl_string())?;
+        }
+        
+        Ok(())
+    }
+
+    /// 从文件加载 ACL 配置（替换语义：清空现有用户，按文件内容重建）
+    pub fn load(&self, path: &str) -> std::io::Result<usize> {
+        use std::fs::File;
+        use std::io::{BufRead, BufReader, Error, ErrorKind};
+        
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        
+        // 先解析所有用户到临时 map，确保文件格式正确后再替换
+        let mut new_users: std::collections::HashMap<String, AclUser> = std::collections::HashMap::new();
+        let mut line_num = 0;
+        
+        for line in reader.lines() {
+            line_num += 1;
+            let line = line?;
+            let line = line.trim();
+            
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            
+            // 解析 ACL 行格式: user <username> <rules...>
+            if let Some(rest) = line.strip_prefix("user ") {
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                if parts.is_empty() {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!("line {}: missing username after 'user'", line_num),
+                    ));
+                }
+                
+                let username = parts[0];
+                let rules: Vec<&str> = parts[1..].to_vec();
+                
+                let mut user = AclUser::new(username);
+                for rule in &rules {
+                    if let Err(e) = user.apply_rule(rule) {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            format!("line {}: invalid rule '{}': {}", line_num, rule, e),
+                        ));
+                    }
+                }
+                new_users.insert(username.to_string(), user);
+            } else {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("line {}: expected 'user <username> ...'", line_num),
+                ));
+            }
+        }
+        
+        // 确保 default 用户存在
+        if !new_users.contains_key("default") {
+            new_users.insert("default".to_string(), AclUser::default_user());
+        }
+        
+        // 替换内存中的用户（原子操作）
+        let count = new_users.len();
+        self.users.clear();
+        for (name, user) in new_users {
+            self.users.insert(name, user);
+        }
+        
+        Ok(count)
+    }
 }
 
 impl Default for AclManager {
