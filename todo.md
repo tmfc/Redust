@@ -17,9 +17,9 @@
 - [x] `go-redis`：阻塞命令（如 `BLPOP`）超时/取消
 
 - [ ] `Jedis`：基础命令 + pipeline
-- [ ] `Lettuce`：异步 API（future）+ 连接复用
+- [x] `Lettuce`：异步 API（future）+ 连接复用
 
-- [ ] `node-redis`：基础命令 + pipeline
+- [x] `node-redis`：基础命令 + pipeline
 - [ ] `ioredis`：`cluster` 模式下的单节点兼容（不做集群，只验证客户端握手/常见选项不报错）
 
 ## 连接与会话行为（网络/协议层）

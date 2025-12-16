@@ -2,3 +2,6 @@
 *.rdb*
 *.acl
 tmux*.log
+
+client-tests/**/node_modules/
+client-tests/**/target/

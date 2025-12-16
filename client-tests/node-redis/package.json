@@ -1,0 +1,12 @@
+{
+  "name": "redust-client-tests-node-redis",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "test": "node ./test.mjs"
+  },
+  "dependencies": {
+    "redis": "^4.7.0"
+  }
+}

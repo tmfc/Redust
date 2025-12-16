@@ -397,6 +397,18 @@ enum HllRepr {
     - 测试通过 `REDUST_ADDR=127.0.0.1:6380` 连接外部 Redust，不在 Go 测试内启动 Rust server。
     - 首次执行如遇到网络问题，可设置 `GOPROXY=direct` 或使用可用代理（或配置 `http_proxy/https_proxy`）后再跑 `go mod tidy` / `go test`。
 
+- [ ] **lettuce 回归测试最小落地（建议）**
+  - 目录：`client-tests/lettuce/`（Maven 工程）
+  - 运行：在该目录执行 `REDUST_ADDR=127.0.0.1:6380 mvn test`
+  - 认证：若开启 `REDUST_AUTH_PASSWORD`，需额外设置 `REDUST_PASSWORD=...`
+  - 协议：lettuce 默认可能使用 `HELLO`，建议强制使用 RESP2（当前测试工程已在客户端侧设置 RESP2）
+
+- [ ] **node-redis 回归测试最小落地（建议）**
+  - 目录：`client-tests/node-redis/`（Node 工程，ESM）
+  - 安装：首次执行需要 `npm install`
+  - 运行：`REDUST_ADDR=127.0.0.1:6380 npm test`
+  - pipeline：使用 `multi().exec(true)`（execAsPipeline），注意不同版本/配置返回结构可能不同，建议断言时做归一化处理。
+
 - [ ] **不兼容行为登记与跟踪**
   - 为每一条不兼容行为记录：使用的客户端/版本、触发命令及参数、Redis 实际返回 vs Redust 返回。
   - 将这些差异条目集中登记在本文件或独立文档中，并在 PR/issue 中引用，作为后续修复/取舍决策的依据。
